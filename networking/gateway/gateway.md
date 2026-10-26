@@ -69,20 +69,111 @@ All of them do the same things under the hood. Each step below lists more than o
 
 - **Two NICs minimum**: one WAN, one LAN. Intel NICs (i210/i225/i226) are the safe choice.
 - **Managed switch** that supports 802.1Q VLANs, if you want segmentation (strongly recommended).
-- **Access points**: dedicated APs (OpenWrt-capable, UniFi, Omada...) are far better than a Wi-Fi card in the gateway. Most PCIe/USB Wi-Fi cards have poor AP-mode support. Section 9 covers both methods.
+- **Access points**: dedicated APs (OpenWrt-capable, UniFi, Omada...) are far better than a Wi-Fi card in the gateway. Most PCIe/USB Wi-Fi cards have poor AP-mode support. Section 10 covers both methods.
 - CPU: any modern x86 or ARM64 board routes 1 Gbit/s with nftables without trouble.
 
 OS: any Debian/Ubuntu server works. Install the packages:
 
 ```bash
-sudo apt install nftables dnsmasq hostapd iproute2 conntrack tcpdump   # swap nftables for iptables-persistent if using Method 2 in section 6
+sudo apt install nftables dnsmasq hostapd iproute2 conntrack tcpdump   # swap nftables for iptables-persistent if using Method 2 in section 7
 sudo systemctl enable --now systemd-networkd nftables
 # Disable anything else managing interfaces (NetworkManager, ifupdown, netplan renderers)
 ```
 
 ---
 
-## 4. Interfaces and VLANs
+## 4. Quick start: everything by hand
+
+Before writing any config file, you can build the whole gateway live with plain commands (as root). It's the best way to understand each piece, and handy for testing. **Nothing survives a reboot**: sections 5 to 8 make it permanent.
+
+```bash
+# --- WAN ---
+ip link set eth0 up
+dhcpcd eth0                                    # or: dhclient eth0
+# Static WAN instead of DHCP:
+# ip addr add 203.0.113.10/24 dev eth0
+# ip route add default via 203.0.113.1
+
+# --- LAN: one VLAN + one bridge per network ---
+ip link set eth1 up
+for net in "10 lan" "20 iot" "30 guest"; do
+    set -- $net                                # $1 = VLAN id, $2 = name
+    ip link add link eth1 name eth1.$1 type vlan id $1
+    ip link add name br-$2 type bridge
+    ip link set eth1.$1 master br-$2
+    ip addr add 192.168.$1.1/24 dev br-$2
+    ip link set eth1.$1 up
+    ip link set br-$2 up
+done
+
+# --- Routing ---
+sysctl -w net.ipv4.ip_forward=1
+
+# --- Firewall + NAT ---
+iptables -A INPUT -i eth0 -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT
+iptables -A INPUT -i eth0 -j DROP                       # router unreachable from the internet
+iptables -A FORWARD -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT
+iptables -A FORWARD -i br-+ -o eth0 -j ACCEPT           # all networks -> internet
+iptables -A FORWARD -i br-lan -o br-iot -j ACCEPT       # LAN -> IoT
+iptables -P FORWARD DROP                                # anything else between networks: blocked
+iptables -t nat -A POSTROUTING -o eth0 -j MASQUERADE
+
+# --- DHCP + DNS (foreground, Ctrl+C to stop; stop the dnsmasq service first) ---
+dnsmasq --no-daemon --bind-dynamic \
+    --interface=br-lan --interface=br-iot --interface=br-guest \
+    --dhcp-range=192.168.10.100,192.168.10.250,12h \
+    --dhcp-range=192.168.20.100,192.168.20.250,12h \
+    --dhcp-range=192.168.30.100,192.168.30.250,2h
+```
+
+Check what you built:
+
+```bash
+ip -br addr                 # interfaces and their IPs
+ip route                    # routing table: default route via the WAN
+ip route get 1.1.1.1        # which interface and gateway the kernel picks for a destination
+ip -d link show eth1.10     # VLAN details (id, parent)
+bridge link                 # which ports belong to which bridge
+bridge fdb show br br-lan   # MAC addresses learned by the bridge
+ip neigh                    # ARP / neighbor table
+iptables -L -v -n           # firewall rules with packet counters
+iptables -t nat -L -v -n    # NAT rules
+```
+
+More routing with `ip route` / `ip rule`:
+
+```bash
+# Static route: reach another network through a router on the LAN (e.g. a VPN box)
+ip route add 10.8.0.0/24 via 192.168.10.5
+ip route del 10.8.0.0/24
+
+# Policy routing (dual WAN): send IoT traffic out of a second uplink eth2 (also add a MASQUERADE on eth2)
+ip route add default via 198.51.100.1 dev eth2 table 100
+ip rule add from 192.168.20.0/24 table 100
+```
+
+### Old commands vs `ip`
+
+`ifconfig`, `route`, `brctl`, `vconfig`, `arp` and `netstat` come from deprecated packages (`net-tools`, `bridge-utils`, `vlan`) that are often not installed anymore. You'll still meet them in old tutorials and on embedded boards (BusyBox):
+
+| Task | Old way | Modern (`iproute2`) |
+|---|---|---|
+| Show interfaces | `ifconfig -a` | `ip addr` / `ip -br a` |
+| Set IP and bring up | `ifconfig br-lan 192.168.10.1 netmask 255.255.255.0 up` | `ip addr add 192.168.10.1/24 dev br-lan` + `ip link set br-lan up` |
+| Show routes | `route -n` / `netstat -rn` | `ip route` |
+| Default route | `route add default gw 203.0.113.1` | `ip route add default via 203.0.113.1` |
+| Create VLAN | `vconfig add eth1 10` | `ip link add link eth1 name eth1.10 type vlan id 10` |
+| Create bridge | `brctl addbr br-lan` | `ip link add name br-lan type bridge` |
+| Add port to bridge | `brctl addif br-lan eth1.10` | `ip link set eth1.10 master br-lan` |
+| Show bridges | `brctl show` | `bridge link` |
+| ARP table | `arp -n` | `ip neigh` |
+| Listening ports | `netstat -tulpn` | `ss -tulpn` |
+
+`ifconfig` and `route` can't do multiple IPs per interface cleanly, policy routing (`ip rule`) or routing tables, so stick to `ip` for anything new.
+
+---
+
+## 5. Interfaces and VLANs
 
 Layout: `eth0` = WAN, `eth1` = trunk to the switch. Each VLAN goes into its own bridge (`br-lan`, `br-iot`, `br-guest`), so a local Wi-Fi interface can join the same network later.
 
@@ -113,7 +204,7 @@ PrefixDelegationHint=::/56   # ask the ISP for a /56 (ISP-dependent, /60 or /64 
 UseDNS=no
 ```
 
-> **PPPoE**: many fiber/DSL ISPs require PPPoE. Use `pppd` with the `rp-pppoe` plugin on top of `eth0` (often on a VLAN like `eth0.835` for some ISPs) and treat `ppp0` as the WAN in the firewall. Remember the MSS clamping rule in section 6.
+> **PPPoE**: many fiber/DSL ISPs require PPPoE. Use `pppd` with the `rp-pppoe` plugin on top of `eth0` (often on a VLAN like `eth0.835` for some ISPs) and treat `ppp0` as the WAN in the firewall. Remember the MSS clamping rule in section 7.
 
 #### LAN trunk and VLANs
 
@@ -222,7 +313,7 @@ Apply with `sudo systemctl restart networking`.
 
 ---
 
-## 5. Kernel settings
+## 6. Kernel settings
 
 `/etc/sysctl.d/90-gateway.conf`
 
@@ -256,7 +347,7 @@ sudo sysctl --system
 
 ---
 
-## 6. Firewall and NAT
+## 7. Firewall and NAT
 
 All methods below drive the same kernel firewall (netfilter). Pick **one** and don't mix them.
 
@@ -464,14 +555,14 @@ sudo firewall-cmd --reload
 ### Notes on the rules
 
 - **IPv6 has no NAT here, and that's fine.** LAN devices get public IPv6 addresses, but the forward chain only lets in replies (`established,related`). Unsolicited inbound IPv6 is dropped by the policy. This is what protects you, not NAT.
-- **Guest client isolation** (guests not seeing each other) happens on the access point (`ap_isolate`, see section 9), because traffic between two guests on the same SSID never reaches the gateway.
+- **Guest client isolation** (guests not seeing each other) happens on the access point (`ap_isolate`, see section 10), because traffic between two guests on the same SSID never reaches the gateway.
 - **Don't expose SSH or the admin UI on the WAN.** Use a VPN (WireGuard) for remote access instead of port forwards.
 - **UPnP/NAT-PMP**: leave it off. If a game console needs it, run `miniupnpd` restricted to that console's IP only.
 - **Hairpin NAT** (reaching your public IP from inside): easier to solve with local DNS (`nas.home.arpa` → private IP) than with extra NAT rules.
 
 ---
 
-## 7. DHCP and DNS (dnsmasq)
+## 8. DHCP and DNS (dnsmasq)
 
 `/etc/dnsmasq.d/gateway.conf`
 
@@ -522,7 +613,7 @@ IPv6 addressing on the LAN uses SLAAC from the RAs sent by systemd-networkd, so 
 
 ---
 
-## 8. Switch configuration
+## 9. Switch configuration
 
 On the managed switch:
 
@@ -537,7 +628,7 @@ Move the switch's own management IP into VLAN 10, and change its default admin p
 
 ---
 
-## 9. Access points
+## 10. Access points
 
 ### Method 1: dedicated APs (recommended)
 
@@ -614,7 +705,7 @@ journalctl -u hostapd -f
 
 ---
 
-## 10. Hardening checklist
+## 11. Hardening checklist
 
 - [ ] SSH: key-only auth (`PasswordAuthentication no`), `PermitRootLogin no`, listen on the LAN IP only.
 - [ ] No service listening on the WAN: `sudo ss -lntup` and check every line.
@@ -627,7 +718,7 @@ journalctl -u hostapd -f
 
 ---
 
-## 11. Verification
+## 12. Verification
 
 From the gateway:
 
@@ -663,7 +754,7 @@ For the last one, scan your public IPs from outside (e.g. `nmap -Pn <wan-ip>` fr
 
 ---
 
-## 12. Troubleshooting
+## 13. Troubleshooting
 
 | Symptom | Likely cause |
 |---|---|

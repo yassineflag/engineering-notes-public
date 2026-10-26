@@ -632,7 +632,9 @@ Move the switch's own management IP into VLAN 10, and change its default admin p
 
 ### Method 1: dedicated APs (recommended)
 
-Run the APs as "dumb APs": they bridge Wi-Fi to the wired network, and the gateway does all the routing, DHCP and firewalling.
+Separate access points plugged into the switch with a cable. Each AP only broadcasts the Wi-Fi and passes clients onto the wired network, like a wireless switch port. Routing, DHCP, DNS and the firewall stay on the gateway. Many products call this **"access point mode"** or **"bridge mode"**.
+
+If you leave the AP in its default router mode, it hands out its own IP addresses and does its own NAT. Wi-Fi clients then end up in a separate network behind a second NAT (double NAT), invisible to the gateway's firewall and DHCP.
 
 On each AP:
 
@@ -642,7 +644,7 @@ On each AP:
 
 | SSID | VLAN | Security | Extras |
 |---|---|---|---|
-| `Home` | 10 | WPA2/WPA3 (SAE mixed) | 802.11r/k/v for roaming |
+| `Home` | 10 | WPA2/WPA3 mixed mode | 802.11r/k/v (fast handover between APs) |
 | `Home-IoT` | 20 | WPA2-PSK (many IoT devices don't support WPA3) | 2.4 GHz only is fine |
 | `Home-Guest` | 30 | WPA2/WPA3 | **Client isolation on** |
 

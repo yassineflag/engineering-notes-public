@@ -1,6 +1,6 @@
 # Building a Home Gateway on Linux
 
-How to turn a small Linux box (mini-PC, Raspberry Pi with a USB NIC, or an old x86 machine) into a full home gateway: routing, NAT, firewall, DHCP, DNS, IPv6, network segmentation, and Wi-Fi access points.
+How to turn a small Linux box (mini-PC, Raspberry Pi with a USB NIC, or an old x86 machine) into a full home gateway: routing, NAT, firewall, DHCP, DNS, IPv6, network segmentation, Wi-Fi access point, and backup uplinks (Wi-Fi, LTE, satellite).
 
 The goal is to reproduce everything a consumer ISP box does, but in a way you can understand, audit and extend.
 
@@ -17,7 +17,7 @@ The goal is to reproduce everything a consumer ISP box does, but in a way you ca
 | DNS resolver / cache | Resolve names for clients, plus local names like `nas.home.arpa` | dnsmasq |
 | IPv6 | Get a delegated prefix from the ISP, advertise it on the LAN | systemd-networkd |
 | Segmentation | Separate trusted devices, IoT and guests into VLANs | 802.1Q VLANs + bridges |
-| Wi-Fi | Access points broadcasting one SSID per network | hostapd or dedicated APs |
+| Wi-Fi | Access point broadcasting one SSID per network | hostapd |
 
 ### Ways to build one
 
@@ -41,8 +41,10 @@ All of them do the same things under the hood. Each step below lists more than o
              │  ISP modem  │  (bridge mode / ONT if possible)
              └──────┬──────┘
                     │ eth0 (WAN): public IP via DHCP or PPPoE
+                    │ (or Wi-Fi, LTE, Starlink: section 11)
              ┌──────┴──────┐
              │   Gateway   │  Linux: routing, NAT, firewall, DHCP, DNS
+             │             │)))  wlan0 (hostapd): one SSID per network
              └──────┬──────┘
                     │ eth1 (LAN trunk): VLAN 10/20/30 tagged
              ┌──────┴──────┐
@@ -50,7 +52,7 @@ All of them do the same things under the hood. Each step below lists more than o
              │ switch      │
              └─┬────┬────┬─┘
                │    │    │
-            PC/NAS  AP1  AP2   (APs get a trunk port and map one SSID per VLAN)
+            PC/NAS  TV  printer
 ```
 
 ### Networks
@@ -69,7 +71,7 @@ All of them do the same things under the hood. Each step below lists more than o
 
 - **Two NICs minimum**: one WAN, one LAN. Intel NICs (i210/i225/i226) are the safe choice.
 - **Managed switch** that supports 802.1Q VLANs, if you want segmentation (strongly recommended).
-- **Access points**: dedicated APs (OpenWrt-capable, UniFi, Omada...) are far better than a Wi-Fi card in the gateway. Most PCIe/USB Wi-Fi cards have poor AP-mode support. Section 10 covers both methods.
+- **Wi-Fi card** with good AP-mode support (see section 10), plus a second one for 2.4 GHz IoT if needed.
 - CPU: any modern x86 or ARM64 board routes 1 Gbit/s with nftables without trouble.
 
 OS: any Debian/Ubuntu server works. Install the packages:
@@ -195,6 +197,7 @@ IPv6AcceptRA=yes
 
 [DHCPv4]
 UseDNS=no            # we run our own resolver
+RouteMetric=100      # main WAN; backup uplinks use 200 (section 11)
 
 [DHCPv6]
 UseDNS=no
@@ -555,7 +558,7 @@ sudo firewall-cmd --reload
 ### Notes on the rules
 
 - **IPv6 has no NAT here, and that's fine.** LAN devices get public IPv6 addresses, but the forward chain only lets in replies (`established,related`). Unsolicited inbound IPv6 is dropped by the policy. This is what protects you, not NAT.
-- **Guest client isolation** (guests not seeing each other) happens on the access point (`ap_isolate`, see section 10), because traffic between two guests on the same SSID never reaches the gateway.
+- **Guest client isolation** (guests not seeing each other) happens in hostapd (`ap_isolate`, see section 10), because the Wi-Fi driver delivers traffic between two clients on the same SSID directly, before the firewall sees it.
 - **Don't expose SSH or the admin UI on the WAN.** Use a VPN (WireGuard) for remote access instead of port forwards.
 - **UPnP/NAT-PMP**: leave it off. If a game console needs it, run `miniupnpd` restricted to that console's IP only.
 - **Hairpin NAT** (reaching your public IP from inside): easier to solve with local DNS (`nas.home.arpa` → private IP) than with extra NAT rules.
@@ -620,7 +623,6 @@ On the managed switch:
 | Port | Mode | VLANs |
 |---|---|---|
 | Uplink to gateway `eth1` | Trunk | 10, 20, 30 tagged |
-| Access points | Trunk | 10, 20, 30 tagged (or 10 untagged for AP management) |
 | PC / NAS | Access | 10 untagged |
 | Smart TV, wired IoT | Access | 20 untagged |
 
@@ -628,29 +630,17 @@ Move the switch's own management IP into VLAN 10, and change its default admin p
 
 ---
 
-## 10. Access points
+## 10. Wi-Fi access point (hostapd)
 
-### Method 1: dedicated APs (recommended)
+The gateway's own Wi-Fi card broadcasts one SSID per network, and `hostapd` attaches each SSID to the matching bridge (`br-lan`, `br-guest`...). Wi-Fi clients then land on the same networks as wired ones.
 
-Separate access points plugged into the switch with a cable. Each AP only broadcasts the Wi-Fi and passes clients onto the wired network, like a wireless switch port. Routing, DHCP, DNS and the firewall stay on the gateway. Many products call this **"access point mode"** or **"bridge mode"**.
+Check the card first: `iw list` → "Supported interface modes" must contain `AP`. Mediatek MT7921/MT7922 and Atheros chips work well, while most Intel cards are limited to 2.4 GHz in AP mode.
 
-If you leave the AP in its default router mode, it hands out its own IP addresses and does its own NAT. Wi-Fi clients then end up in a separate network behind a second NAT (double NAT), invisible to the gateway's firewall and DHCP.
-
-On each AP:
-
-1. **Disable** its DHCP server, firewall and NAT (on OpenWrt: delete the `wan` interface, disable `dnsmasq` and `firewall`).
-2. Give it a static management IP in VLAN 10 (e.g. `192.168.10.2`, `.3`, ...) with the gateway as its gateway/DNS.
-3. Create one bridge per VLAN on the uplink port and map each SSID to one:
-
-| SSID | VLAN | Security | Extras |
-|---|---|---|---|
-| `Home` | 10 | WPA2/WPA3 mixed mode | 802.11r/k/v (fast handover between APs) |
-| `Home-IoT` | 20 | WPA2-PSK (many IoT devices don't support WPA3) | 2.4 GHz only is fine |
-| `Home-Guest` | 30 | WPA2/WPA3 | **Client isolation on** |
-
-### Method 2: Wi-Fi card in the gateway (hostapd)
-
-Only if your card supports AP mode well (`iw list` → "Supported interface modes" contains `AP`). Mediatek MT7921/MT7922 and some Atheros chips work, while most Intel cards are limited to 2.4 GHz in AP mode.
+| SSID | Bridge | Security |
+|---|---|---|
+| `Home` | `br-lan` | WPA2/WPA3 mixed mode |
+| `Home-Guest` | `br-guest` | WPA2/WPA3, clients isolated |
+| `Home-IoT` | `br-iot` | WPA2 only (many IoT devices don't support WPA3), 2.4 GHz |
 
 `/etc/hostapd/hostapd.conf`
 
@@ -697,30 +687,140 @@ sudo systemctl enable --now hostapd
 journalctl -u hostapd -f
 ```
 
+**IoT on 2.4 GHz:** one radio works on one band. Most IoT devices are 2.4 GHz only, so give `Home-IoT` a second radio (e.g. `wlan2`) with its own file, `/etc/hostapd/wlan2.conf`: `interface=wlan2`, `bridge=br-iot`, `hw_mode=g`, `channel=6`, `wpa_key_mgmt=WPA-PSK`. Start it with `sudo systemctl enable --now hostapd@wlan2`.
+
 ### Wi-Fi planning tips
 
 - **2.4 GHz**: only channels 1, 6 or 11, 20 MHz wide. Wider channels on 2.4 GHz only cause interference.
 - **5 GHz**: 80 MHz wide. Channels 36-48 avoid DFS; DFS channels (52-144) are less crowded but the AP must go quiet briefly on radar detection.
-- **Multiple APs**: same SSID and password on all, different non-overlapping channels, **wired backhaul** whenever possible.
-- **Don't max out transmit power.** Medium power with more APs gives better roaming than one loud AP.
+- **Placement**: put the gateway (or its antennas) central and high. Walls and floors cost more signal than distance.
 - Use a Wi-Fi analyzer app to check neighboring networks before picking channels.
 
 ---
 
-## 11. Hardening checklist
+## 11. Other WAN uplinks and backup
+
+Ethernet to an ISP modem is the usual WAN, but any interface that reaches the internet can play that role, either **instead of** `eth0` or **next to it as a backup**.
+
+| Uplink | Interface | Good for | Watch out |
+|---|---|---|---|
+| Ethernet | `eth0` | Main connection | |
+| Wi-Fi station | `wlan1` | Campsite, hotel, phone hotspot | Needs a second Wi-Fi radio |
+| Cellular (Quectel EC25) | `wwan0` | Backup, rural sites, vehicles | CGNAT (no port forwards), data caps |
+| Satellite (Starlink) | `eth0` | Rural without fiber/DSL | CGNAT on IPv4, higher latency |
+
+The firewall must treat the new interface as a WAN:
+
+- **nftables**: turn the define into a set, `define WAN = { "eth0", "wwan0" }`. Every `$WAN` rule, masquerade included, then covers both.
+- **iptables**: duplicate each `-i eth0` / `-o eth0` rule for the new interface.
+- **firewalld**: `firewall-cmd --permanent --zone=external --add-interface=wwan0`.
+
+### Method 1: Wi-Fi station (client)
+
+Use a **second** Wi-Fi adapter (`wlan1`). A single radio can't follow the upstream network's channel and serve your own AP at the same time.
+
+`/etc/wpa_supplicant/wpa_supplicant-wlan1.conf`
+
+```ini
+ctrl_interface=/run/wpa_supplicant
+country=FR
+
+network={
+    ssid="Upstream-WiFi"
+    psk="upstream-passphrase"
+}
+```
+
+`/etc/systemd/network/11-wan-wifi.network`
+
+```ini
+[Match]
+Name=wlan1
+
+[Network]
+DHCP=yes
+
+[DHCPv4]
+RouteMetric=200      # backup: used only when eth0 has no route
+```
+
+```bash
+sudo systemctl enable --now wpa_supplicant@wlan1
+sudo networkctl reload
+# By hand: wpa_supplicant -B -i wlan1 -c /etc/wpa_supplicant/wpa_supplicant-wlan1.conf && dhcpcd wlan1
+```
+
+### Method 2: Cellular modem (Quectel EC25)
+
+The EC25 (mini-PCIe card or USB dongle) shows up as `/dev/cdc-wdm0` (QMI control), `wwan0` (data interface) and `/dev/ttyUSB0-3` (AT commands on `ttyUSB2`).
+
+```bash
+lsusb | grep 2c7c                                  # Quectel vendor ID (EC25 = 2c7c:0125)
+sudo apt install modemmanager libqmi-utils
+mmcli -L                                           # list modems
+mmcli -m 0                                         # SIM state, operator, signal, bearer path
+sudo mmcli -m 0 --simple-connect="apn=internet"    # your carrier's APN
+mmcli -b 0                                         # bearer: IP address, prefix, DNS
+
+sudo ip link set wwan0 up
+sudo ip addr add <ip>/<prefix> dev wwan0           # values from mmcli -b 0
+sudo ip route add default dev wwan0 metric 200     # backup route
+```
+
+ModemManager alone doesn't reconnect after a drop. For an unattended link, Quectel's `quectel-CM` tool (from Quectel support) connects, configures `wwan0` and reconnects automatically.
+
+Quick checks with AT commands (`picocom /dev/ttyUSB2`, stop ModemManager first since it uses the same port):
+
+| Command | Meaning |
+|---|---|
+| `AT+CPIN?` | `READY` = SIM unlocked |
+| `AT+CSQ` | Signal 0-31 (above ~15 is fine, 99 = unknown) |
+| `AT+COPS?` | Registered operator |
+| `AT+CGDCONT=1,"IP","internet"` | Set the APN |
+
+### Method 3: Satellite (Starlink)
+
+To the gateway, Starlink is just an Ethernet WAN. Enable **bypass mode** on the Starlink router (in the Starlink app), which turns off its Wi-Fi and routing, and connect its Ethernet port (Ethernet adapter on Gen 2 routers) to `eth0`. On most plans you get:
+
+- **IPv4 by DHCP in `100.64.0.0/10`**: that's CGNAT, so inbound port forwards won't work over IPv4. For remote access, use IPv6 or a tunnel through a VPS (WireGuard, Tailscale).
+- **An IPv6 /56 by prefix delegation**: the section 5 config works as is.
+
+### Failover
+
+With `RouteMetric=100` on `eth0` and `200` on the backup, the kernel uses the lowest-metric default route. If `eth0` loses its link, its route disappears and traffic moves to the backup by itself (open connections restart).
+
+That doesn't cover "cable up, but the ISP is down". For that, a small watchdog checks the internet **through `eth0`** and pushes a preferred route via the backup while it fails:
+
+```sh
+#!/bin/sh
+# /usr/local/bin/wan-watchdog: prefer wwan0 while eth0 can't reach the internet
+while sleep 10; do
+    if ping -I eth0 -c 3 -W 2 9.9.9.9 >/dev/null 2>&1; then
+        ip route del default dev wwan0 metric 50 2>/dev/null     # eth0 OK: back to normal
+    else
+        ip route replace default dev wwan0 metric 50             # eth0 down: backup wins
+    fi
+done
+```
+
+`wwan0` is point-to-point, so it needs no gateway address. For a `wlan1` backup, write `default via <its gateway> dev wlan1 metric 50`. Run the script as a systemd service (`Restart=always`). On OpenWrt, `mwan3` does the same with a UI.
+
+---
+
+## 12. Hardening checklist
 
 - [ ] SSH: key-only auth (`PasswordAuthentication no`), `PermitRootLogin no`, listen on the LAN IP only.
 - [ ] No service listening on the WAN: `sudo ss -lntup` and check every line.
 - [ ] Automatic security updates (`unattended-upgrades`).
 - [ ] Time sync (`systemd-timesyncd` or `chrony`). TLS and logs depend on it.
-- [ ] Default passwords changed on the switch, the APs and the ISP modem.
+- [ ] Default passwords changed on the switch and the ISP modem.
 - [ ] Back up `/etc/systemd/network`, the firewall rules (`/etc/nftables.conf` or `/etc/iptables/`), `/etc/dnsmasq.d`, `/etc/hostapd` (ideally in a private git repo).
 - [ ] Remote access through WireGuard, not port forwards.
-- [ ] Firmware updates on APs and switch.
+- [ ] Firmware updates on the switch (and the LTE modem, if any).
 
 ---
 
-## 12. Verification
+## 13. Verification
 
 From the gateway:
 
@@ -749,14 +849,14 @@ Segmentation tests:
 | LAN | IoT device | ✅ works |
 | IoT | LAN device | ❌ blocked |
 | Guest | LAN / IoT device | ❌ blocked |
-| Guest | another guest | ❌ blocked (AP isolation) |
+| Guest | another guest | ❌ blocked (`ap_isolate`) |
 | Internet | any LAN IP (IPv4 or IPv6) | ❌ blocked |
 
 For the last one, scan your public IPs from outside (e.g. `nmap -Pn <wan-ip>` from a VPS, or an online IPv6 port scanner). Nothing should answer except your explicit port forwards.
 
 ---
 
-## 13. Troubleshooting
+## 14. Troubleshooting
 
 | Symptom | Likely cause |
 |---|---|
@@ -765,7 +865,8 @@ For the last one, scan your public IPs from outside (e.g. `nmap -Pn <wan-ip>` fr
 | Internet by IP but not by name | DNS port 53 not allowed in `input`, dnsmasq has no upstream (`no-resolv` without `server=`) |
 | Some websites hang (IPv4) | MTU/MSS issue with PPPoE: check the MSS clamping rule |
 | IPv6 doesn't work | ICMPv6 blocked, ISP doesn't delegate a prefix (check `networkctl status eth0`), wrong `PrefixDelegationHint` |
-| Wi-Fi clients on wrong network | SSID mapped to the wrong VLAN, or AP port not a trunk |
+| Wi-Fi clients on wrong network | Wrong `bridge=` for that SSID in the hostapd config |
+| Backup WAN never takes over | Same route metric on both WANs, or the backup interface is missing from the firewall's WAN rules |
 
 Handy capture commands:
 

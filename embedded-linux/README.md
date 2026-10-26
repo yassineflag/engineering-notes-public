@@ -4,4 +4,14 @@ Notes on building and running Linux on embedded targets: bootloaders, kernel, ro
 
 ## Notes
 
-_Coming soon._
+### Fundamentals
+
+- [Cross-compilation toolchain](fundamentals/cross-compilation-toolchain/)
+- [Bootloader](fundamentals/bootloader/)
+- [Kernel](fundamentals/kernel/)
+- [Root filesystem](fundamentals/rootfs/)
+
+### Linux build systems
+
+- [Yocto](linux-build-systems/yocto/)
+- [Buildroot](linux-build-systems/buildroot/)

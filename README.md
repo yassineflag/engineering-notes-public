@@ -7,7 +7,9 @@ Every note aims to be practical, so you'll find configs and commands you can reu
 
 | Folder | What's inside |
 |---|---|
-| [embedded-linux/](embedded-linux/) | Board bring-up, Yocto/Buildroot, kernel and bootloader notes |
+| [linux-general-usage/](linux-general-usage/) | Day-to-day Linux: shell, files, users, packages, services |
+| [embedded-linux/](embedded-linux/) | [Fundamentals](embedded-linux/fundamentals/) (toolchain, bootloader, kernel, rootfs) and [build systems](embedded-linux/linux-build-systems/) (Yocto, Buildroot) |
+| [linux-kernel-device-driver-development/](linux-kernel-device-driver-development/) | Kernel modules, character/platform drivers, device tree |
 | [networking/](networking/) | Routing, firewalls, Wi-Fi, home and lab network setups |
 | [wireless-protocols-and-connectivity/](wireless-protocols-and-connectivity/) | [Wi-Fi](wireless-protocols-and-connectivity/wifi/), [Bluetooth](wireless-protocols-and-connectivity/bluetooth/), [Cellular](wireless-protocols-and-connectivity/cellular/), [NTN](wireless-protocols-and-connectivity/ntn/) (satellite / non-terrestrial networks) |
 | [linux-systems-programming/](linux-systems-programming/) | System calls, processes, threads, IPC, file and socket I/O |

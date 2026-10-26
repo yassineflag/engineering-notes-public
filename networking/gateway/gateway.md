@@ -4,6 +4,38 @@ How to turn a small Linux box (mini-PC, Raspberry Pi with a USB NIC, or an old x
 
 The goal is to reproduce everything a consumer ISP box does, but in a way you can understand, audit and extend.
 
+## Table of contents
+
+- [1. What a home gateway actually does](#1-what-a-home-gateway-actually-does)
+   - [Ways to build one](#ways-to-build-one)
+- [2. Target topology](#2-target-topology)
+   - [Networks](#networks)
+- [3. Hardware checklist](#3-hardware-checklist)
+- [4. Quick start: everything by hand](#4-quick-start-everything-by-hand)
+   - [Old commands vs ip](#old-commands-vs-ip)
+- [5. Interfaces and VLANs](#5-interfaces-and-vlans)
+   - [Method 1: systemd-networkd (recommended)](#method-1-systemd-networkd-recommended)
+   - [Method 2: ifupdown (classic Debian)](#method-2-ifupdown-classic-debian)
+- [6. Kernel settings](#6-kernel-settings)
+- [7. Firewall and NAT](#7-firewall-and-nat)
+   - [Method 1: nftables (recommended)](#method-1-nftables-recommended)
+   - [Method 2: iptables (classic)](#method-2-iptables-classic)
+   - [Method 3: firewalld (zones)](#method-3-firewalld-zones)
+   - [Notes on the rules](#notes-on-the-rules)
+- [8. DHCP and DNS (dnsmasq)](#8-dhcp-and-dns-dnsmasq)
+- [9. Switch configuration](#9-switch-configuration)
+- [10. Wi-Fi access point (hostapd)](#10-wi-fi-access-point-hostapd)
+   - [Wi-Fi planning tips](#wi-fi-planning-tips)
+- [11. Other WAN uplinks and backup](#11-other-wan-uplinks-and-backup)
+   - [Method 1: Wi-Fi station (client)](#method-1-wi-fi-station-client)
+   - [Method 2: Cellular modem (Quectel EC25)](#method-2-cellular-modem-quectel-ec25)
+   - [Method 3: Satellite (Starlink)](#method-3-satellite-starlink)
+   - [Failover](#failover)
+- [12. Hardening checklist](#12-hardening-checklist)
+- [13. Verification](#13-verification)
+- [14. Troubleshooting](#14-troubleshooting)
+- [References](#references)
+
 ---
 
 ## 1. What a home gateway actually does

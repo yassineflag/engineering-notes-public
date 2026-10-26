@@ -9,6 +9,9 @@ Every note aims to be practical, so you'll find configs and commands you can reu
 |---|---|
 | [embedded-linux/](embedded-linux/) | Board bring-up, Yocto/Buildroot, kernel and bootloader notes |
 | [networking/](networking/) | Routing, firewalls, Wi-Fi, home and lab network setups |
+| [linux-systems-programming/](linux-systems-programming/) | System calls, processes, threads, IPC, file and socket I/O |
+| [software/](software/) | Language notes: [C](software/c/), [Bash](software/bash/) |
+| [hardware/](hardware/) | Electronics, boards, buses and peripherals |
 
 ## Latest notes
 

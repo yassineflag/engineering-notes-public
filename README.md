@@ -10,6 +10,10 @@ Every note aims to be practical, so you'll find configs and commands you can reu
 | [embedded-linux/](embedded-linux/) | Board bring-up, Yocto/Buildroot, kernel and bootloader notes |
 | [networking/](networking/) | Routing, firewalls, Wi-Fi, home and lab network setups |
 
+## Latest notes
+
+- [Building a Home Gateway on Linux](networking/gateway/home-gateway-setup.md)
+
 ## Conventions
 
 - One topic per folder, one note per Markdown file.

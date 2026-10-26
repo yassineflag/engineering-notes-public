@@ -19,6 +19,17 @@ The goal is to reproduce everything a consumer ISP box does, but in a way you ca
 | Segmentation | Separate trusted devices, IoT and guests into VLANs | 802.1Q VLANs + bridges |
 | Wi-Fi | Access points broadcasting one SSID per network | hostapd or dedicated APs |
 
+### Ways to build one
+
+| Approach | Examples | When to pick it |
+|---|---|---|
+| **DIY Linux** (this note) | Debian/Ubuntu + nftables/iptables + dnsmasq | You want to learn and control every piece |
+| **Router OS (Linux)** | OpenWrt, VyOS | Same building blocks, packaged with a UI/CLI. OpenWrt also runs on consumer routers |
+| **Router OS (BSD)** | OPNsense, pfSense | Web UI, firewall is `pf` instead of netfilter, many plugins |
+| **ISP box / consumer router** | The box you already have | Zero effort, little control |
+
+All of them do the same things under the hood. Each step below lists more than one method when there's a real choice.
+
 ---
 
 ## 2. Target topology
@@ -58,24 +69,28 @@ The goal is to reproduce everything a consumer ISP box does, but in a way you ca
 
 - **Two NICs minimum**: one WAN, one LAN. Intel NICs (i210/i225/i226) are the safe choice.
 - **Managed switch** that supports 802.1Q VLANs, if you want segmentation (strongly recommended).
-- **Access points**: dedicated APs (OpenWrt-capable, UniFi, Omada...) are far better than a Wi-Fi card in the gateway. Most PCIe/USB Wi-Fi cards have poor AP-mode support. Section 9 covers both options.
+- **Access points**: dedicated APs (OpenWrt-capable, UniFi, Omada...) are far better than a Wi-Fi card in the gateway. Most PCIe/USB Wi-Fi cards have poor AP-mode support. Section 9 covers both methods.
 - CPU: any modern x86 or ARM64 board routes 1 Gbit/s with nftables without trouble.
 
 OS: any Debian/Ubuntu server works. Install the packages:
 
 ```bash
-sudo apt install nftables dnsmasq hostapd iproute2 conntrack tcpdump
+sudo apt install nftables dnsmasq hostapd iproute2 conntrack tcpdump   # swap nftables for iptables-persistent if using Method 2 in section 6
 sudo systemctl enable --now systemd-networkd nftables
 # Disable anything else managing interfaces (NetworkManager, ifupdown, netplan renderers)
 ```
 
 ---
 
-## 4. Interfaces and VLANs (systemd-networkd)
+## 4. Interfaces and VLANs
 
 Layout: `eth0` = WAN, `eth1` = trunk to the switch. Each VLAN goes into its own bridge (`br-lan`, `br-iot`, `br-guest`), so a local Wi-Fi interface can join the same network later.
 
-### WAN
+### Method 1: systemd-networkd (recommended)
+
+Handles VLANs, bridges, DHCP client and IPv6 prefix delegation in one tool.
+
+#### WAN
 
 `/etc/systemd/network/10-wan.network`
 
@@ -100,7 +115,7 @@ UseDNS=no
 
 > **PPPoE**: many fiber/DSL ISPs require PPPoE. Use `pppd` with the `rp-pppoe` plugin on top of `eth0` (often on a VLAN like `eth0.835` for some ISPs) and treat `ppp0` as the WAN in the firewall. Remember the MSS clamping rule in section 6.
 
-### LAN trunk and VLANs
+#### LAN trunk and VLANs
 
 `/etc/systemd/network/20-lan-trunk.network`
 
@@ -181,6 +196,30 @@ ip -br addr
 
 > `DHCPPrefixDelegation=` requires systemd ≥ 253 (Debian 13, Ubuntu 24.04). On older versions, use `dhcpcd` or `wide-dhcpv6-client` for prefix delegation.
 
+### Method 2: ifupdown (classic Debian)
+
+The traditional `/etc/network/interfaces` way. Needs `apt install vlan bridge-utils`. IPv6 prefix delegation isn't built in, so add `dhcpcd` for it.
+
+```
+auto eth0
+iface eth0 inet dhcp
+
+auto eth1.10
+iface eth1.10 inet manual
+
+auto br-lan
+iface br-lan inet static
+    address 192.168.10.1/24
+    bridge_ports eth1.10
+    bridge_stp off
+
+# Repeat eth1.20 -> br-iot and eth1.30 -> br-guest
+```
+
+Apply with `sudo systemctl restart networking`.
+
+> Ubuntu's **netplan** is a third option. It writes systemd-networkd config for you, so Method 1 is the same thing without the YAML layer.
+
 ---
 
 ## 5. Kernel settings
@@ -217,7 +256,15 @@ sudo sysctl --system
 
 ---
 
-## 6. Firewall and NAT (nftables)
+## 6. Firewall and NAT
+
+All methods below drive the same kernel firewall (netfilter). Pick **one** and don't mix them.
+
+| Method | Status | Notes |
+|---|---|---|
+| 1. nftables | Modern default (Debian 10+, Ubuntu 20.04+) | One file, IPv4 + IPv6 together, sets and maps |
+| 2. iptables | Classic, still everywhere | Separate rules for IPv4 (`iptables`) and IPv6 (`ip6tables`) |
+| 3. firewalld / ufw | Frontends | Generate nftables/iptables rules from zones/commands |
 
 These are the rules every gateway should have:
 
@@ -231,6 +278,8 @@ These are the rules every gateway should have:
 8. **NAT/masquerade** IPv4 out of the WAN.
 9. **Port forwards** only where needed, explicitly.
 10. **MSS clamping** when the WAN MTU is below 1500 (PPPoE, tunnels).
+
+### Method 1: nftables (recommended)
 
 `/etc/nftables.conf`
 
@@ -334,9 +383,87 @@ sudo systemctl restart nftables
 sudo nft list ruleset
 ```
 
+### Method 2: iptables (classic)
+
+Same policy, written for iptables. Install `iptables-persistent`, which loads these files at boot. `br-+` matches every interface starting with `br-`.
+
+`/etc/iptables/rules.v4`
+
+```
+*filter
+:INPUT DROP [0:0]
+:FORWARD DROP [0:0]
+:OUTPUT ACCEPT [0:0]
+
+-A INPUT -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT
+-A INPUT -m conntrack --ctstate INVALID -j DROP
+-A INPUT -i lo -j ACCEPT
+-A INPUT -p icmp --icmp-type echo-request -m limit --limit 10/second -j ACCEPT
+-A INPUT -i eth0 -p udp --sport 67 --dport 68 -j ACCEPT
+-A INPUT -i br-+ -p udp --dport 67 -j ACCEPT
+-A INPUT -i br-+ -p udp --dport 53 -j ACCEPT
+-A INPUT -i br-+ -p tcp --dport 53 -j ACCEPT
+-A INPUT -i br-lan -p tcp --dport 22 -j ACCEPT
+-A INPUT -m limit --limit 5/min -j LOG --log-prefix "ipt input drop: "
+
+-A FORWARD -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu
+-A FORWARD -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT
+-A FORWARD -m conntrack --ctstate INVALID -j DROP
+-A FORWARD -i br-+ -o eth0 -j ACCEPT
+-A FORWARD -i br-lan -o br-iot -j ACCEPT
+-A FORWARD -i eth0 -m conntrack --ctstate DNAT -j ACCEPT
+-A FORWARD -m limit --limit 5/min -j LOG --log-prefix "ipt forward drop: "
+COMMIT
+
+*nat
+:PREROUTING ACCEPT [0:0]
+:INPUT ACCEPT [0:0]
+:OUTPUT ACCEPT [0:0]
+:POSTROUTING ACCEPT [0:0]
+# Port forward example: public 8443 -> NAS HTTPS
+# -A PREROUTING -i eth0 -p tcp --dport 8443 -j DNAT --to-destination 192.168.10.10:443
+-A POSTROUTING -o eth0 -j MASQUERADE
+COMMIT
+```
+
+`/etc/iptables/rules.v6`: the same `*filter` table with three changes. It has no `*nat` table. ICMPv6 must be accepted (`-A INPUT -p ipv6-icmp -j ACCEPT`, and the same in `FORWARD`). The DHCP client rule becomes `-A INPUT -i eth0 -s fe80::/10 -p udp --sport 547 --dport 546 -j ACCEPT`.
+
+```bash
+sudo iptables-restore --test < /etc/iptables/rules.v4   # syntax check
+sudo netfilter-persistent reload
+sudo iptables -S && sudo iptables -t nat -S
+```
+
+> On current distros, the `iptables` command is usually **iptables-nft**: it accepts the old syntax but stores rules in nftables (`iptables -V` shows `nf_tables`). To convert old rules, use `iptables-restore-translate -f rules.v4`.
+
+### Method 3: firewalld (zones)
+
+Good if you prefer commands over rule files (default on Fedora/RHEL). Each interface goes into a zone, and **policies** control traffic between zones (firewalld ≥ 0.9).
+
+```bash
+sudo firewall-cmd --permanent --zone=external --change-interface=eth0     # external zone = masquerade on
+sudo firewall-cmd --permanent --zone=internal --change-interface=br-lan   # DNS/DHCP/SSH allowed
+sudo firewall-cmd --permanent --new-zone=iot
+sudo firewall-cmd --permanent --zone=iot --change-interface=br-iot
+sudo firewall-cmd --permanent --zone=iot --add-service={dns,dhcp}
+
+# Allow internal -> internet (add another ingress zone for iot, guest, ...)
+sudo firewall-cmd --permanent --new-policy=lan-out
+sudo firewall-cmd --permanent --policy=lan-out --add-ingress-zone=internal --add-ingress-zone=iot
+sudo firewall-cmd --permanent --policy=lan-out --add-egress-zone=external
+sudo firewall-cmd --permanent --policy=lan-out --set-target=ACCEPT
+
+# Port forward
+# sudo firewall-cmd --permanent --zone=external --add-forward-port=port=8443:proto=tcp:toport=443:toaddr=192.168.10.10
+
+sudo firewall-cmd --reload
+```
+
+> **ufw** also works, but routing and NAT have to be added by hand in `/etc/ufw/before.rules`, so it fits a server better than a router.
+
 ### Notes on the rules
 
-- **IPv6 has no NAT here, and that's fine.** LAN devices get public IPv6 addresses, but the `forward` chain only lets in replies (`established,related`). Unsolicited inbound IPv6 is dropped by the policy. This is what protects you, not NAT.
+- **IPv6 has no NAT here, and that's fine.** LAN devices get public IPv6 addresses, but the forward chain only lets in replies (`established,related`). Unsolicited inbound IPv6 is dropped by the policy. This is what protects you, not NAT.
 - **Guest client isolation** (guests not seeing each other) happens on the access point (`ap_isolate`, see section 9), because traffic between two guests on the same SSID never reaches the gateway.
 - **Don't expose SSH or the admin UI on the WAN.** Use a VPN (WireGuard) for remote access instead of port forwards.
 - **UPnP/NAT-PMP**: leave it off. If a game console needs it, run `miniupnpd` restricted to that console's IP only.
@@ -391,6 +518,8 @@ journalctl -u dnsmasq -f
 
 IPv6 addressing on the LAN uses SLAAC from the RAs sent by systemd-networkd, so no DHCPv6 server is needed. Clients still use the gateway's IPv4 address for DNS.
 
+> **Alternatives:** dnsmasq covers a home network well. For bigger setups, split the roles: **Kea** for DHCP (successor of the now end-of-life ISC `dhcpd`) and **Unbound** as a validating DNS resolver. **Pi-hole** / **AdGuard Home** add ad-blocking on top.
+
 ---
 
 ## 8. Switch configuration
@@ -410,7 +539,7 @@ Move the switch's own management IP into VLAN 10, and change its default admin p
 
 ## 9. Access points
 
-### Option A: dedicated APs (recommended)
+### Method 1: dedicated APs (recommended)
 
 Run the APs as "dumb APs": they bridge Wi-Fi to the wired network, and the gateway does all the routing, DHCP and firewalling.
 
@@ -426,7 +555,7 @@ On each AP:
 | `Home-IoT` | 20 | WPA2-PSK (many IoT devices don't support WPA3) | 2.4 GHz only is fine |
 | `Home-Guest` | 30 | WPA2/WPA3 | **Client isolation on** |
 
-### Option B: Wi-Fi card in the gateway (hostapd)
+### Method 2: Wi-Fi card in the gateway (hostapd)
 
 Only if your card supports AP mode well (`iw list` → "Supported interface modes" contains `AP`). Mediatek MT7921/MT7922 and some Atheros chips work, while most Intel cards are limited to 2.4 GHz in AP mode.
 
@@ -492,7 +621,7 @@ journalctl -u hostapd -f
 - [ ] Automatic security updates (`unattended-upgrades`).
 - [ ] Time sync (`systemd-timesyncd` or `chrony`). TLS and logs depend on it.
 - [ ] Default passwords changed on the switch, the APs and the ISP modem.
-- [ ] Back up `/etc/systemd/network`, `/etc/nftables.conf`, `/etc/dnsmasq.d`, `/etc/hostapd` (ideally in a private git repo).
+- [ ] Back up `/etc/systemd/network`, the firewall rules (`/etc/nftables.conf` or `/etc/iptables/`), `/etc/dnsmasq.d`, `/etc/hostapd` (ideally in a private git repo).
 - [ ] Remote access through WireGuard, not port forwards.
 - [ ] Firmware updates on APs and switch.
 
@@ -505,9 +634,9 @@ From the gateway:
 ```bash
 ip -br addr                       # all bridges up with the right IPs
 ip -6 route                       # delegated prefix routes on each bridge
-sudo nft list ruleset             # rules loaded
+sudo nft list ruleset             # rules loaded (iptables: sudo iptables -S)
 sudo conntrack -L | head          # NAT and connection tracking in action
-journalctl -k | grep "nft "       # dropped packets (from the log rules)
+journalctl -k | grep -E "nft |ipt "   # dropped packets (from the log rules)
 ```
 
 From a client on each network:
@@ -558,6 +687,8 @@ sudo tcpdump -ni eth0 -e vlan                  # verify VLAN tags
 ## References
 
 - nftables wiki: <https://wiki.nftables.org>
+- iptables: `man iptables`, `man iptables-extensions`
+- firewalld policies: <https://firewalld.org/documentation/man-pages/firewalld.policy.html>
 - systemd-networkd: `man systemd.network`, `man systemd.netdev`
 - dnsmasq manual: <https://thekelleys.org.uk/dnsmasq/docs/dnsmasq-man.html>
 - hostapd example config: <https://w1.fi/cgit/hostap/plain/hostapd/hostapd.conf>

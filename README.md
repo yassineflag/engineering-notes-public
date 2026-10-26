@@ -12,7 +12,7 @@ Every note aims to be practical, so you'll find configs and commands you can reu
 
 ## Latest notes
 
-- [Building a Home Gateway on Linux](networking/gateway/home-gateway-setup.md)
+- [Building a Home Gateway on Linux](networking/gateway/gateway.md)
 
 ## Conventions
 

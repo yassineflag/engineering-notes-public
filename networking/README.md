@@ -6,4 +6,4 @@ Notes on routing, firewalling, Wi-Fi and network services, with a focus on setup
 
 ### Gateway
 
-- [Building a Home Gateway on Linux](gateway/home-gateway-setup.md): routing, NAT, nftables firewall, DHCP/DNS, IPv6, VLANs and Wi-Fi access points.
+- [Building a Home Gateway on Linux](gateway/gateway.md): routing, NAT, nftables firewall, DHCP/DNS, IPv6, VLANs and Wi-Fi access points.

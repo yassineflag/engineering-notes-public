@@ -4,10 +4,17 @@ How to turn a small Linux box (mini-PC, Raspberry Pi with a USB NIC, or an old x
 
 The goal is to reproduce everything a consumer ISP box does, but in a way you can understand, audit and extend.
 
+**Assumptions:** Debian 13 / Ubuntu 24.04 (systemd ≥ 253), `eth0` = WAN, `eth1` = LAN trunk to a managed switch, `wlan0` = Wi-Fi AP. Your interface names will differ: check with `ip -br link`.
+
+**How to read it:**
+- **To learn:** sections 1-3 (what and why), 4 (build it live by hand), then 5-10 (make it permanent), 11 (extra uplinks).
+- **To debug:** the packet path in section 7, then 13 (verification) and 14 (troubleshooting).
+
 ## Table of contents
 
 - [1. What a home gateway actually does](#1-what-a-home-gateway-actually-does)
    - [Ways to build one](#ways-to-build-one)
+   - [Who does what on the gateway](#who-does-what-on-the-gateway)
 - [2. Target topology](#2-target-topology)
    - [Networks](#networks)
 - [3. Hardware checklist](#3-hardware-checklist)
@@ -18,6 +25,7 @@ The goal is to reproduce everything a consumer ISP box does, but in a way you ca
    - [Method 2: ifupdown (classic Debian)](#method-2-ifupdown-classic-debian)
 - [6. Kernel settings](#6-kernel-settings)
 - [7. Firewall and NAT](#7-firewall-and-nat)
+   - [How a packet crosses the gateway](#how-a-packet-crosses-the-gateway)
    - [Method 1: nftables (recommended)](#method-1-nftables-recommended)
    - [Method 2: iptables (classic)](#method-2-iptables-classic)
    - [Method 3: firewalld (zones)](#method-3-firewalld-zones)
@@ -60,7 +68,22 @@ The goal is to reproduce everything a consumer ISP box does, but in a way you ca
 | **Router OS (BSD)** | OPNsense, pfSense | Web UI, firewall is `pf` instead of netfilter, many plugins |
 | **ISP box / consumer router** | The box you already have | Zero effort, little control |
 
-All of them do the same things under the hood. Each step below lists more than one method when there's a real choice.
+They all provide the same functions, but not with the same internals: BSD systems use a different network stack and firewall (`pf`), so Linux commands and debugging habits don't carry over 1:1. Each step below lists more than one method when there's a real choice.
+
+### Who does what on the gateway
+
+Each piece of configuration should have **one owner**. Most integration bugs come from two tools fighting over the same thing: two DHCP clients installing default routes, a modem manager rewriting `/etc/resolv.conf` behind dnsmasq, NetworkManager and systemd-networkd both managing `eth0`.
+
+| Component | Owns |
+|---|---|
+| Kernel | Network devices, IP stack, bridging, routing, forwarding, netfilter |
+| `iproute2` (`ip`, `bridge`) | Inspecting and changing all of the above by hand (not persistent) |
+| systemd-networkd | Persistent interfaces, VLANs, bridges, addresses, WAN DHCP client, IPv6 RA and prefix delegation |
+| nftables | Firewall and NAT policy |
+| dnsmasq | DHCP server and DNS forwarder for the LANs |
+| hostapd | Wi-Fi access point |
+| ModemManager / modem tool | Cellular modem control and data session (section 11) |
+| systemd | Starting, ordering and restarting all the services above |
 
 ---
 
@@ -95,6 +118,14 @@ All of them do the same things under the hood. Each step below lists more than o
 | 20 | IoT | 192.168.20.0/24 | 192.168.20.1 | TVs, cameras, smart plugs | Internet only |
 | 30 | Guest | 192.168.30.0/24 | 192.168.30.1 | Visitors | Internet only, clients isolated |
 
+**VLAN, bridge and subnet are three different things**, mapped 1:1:1 here by choice:
+
+- **VLAN**: a separate Layer 2 broadcast domain, identified by an 802.1Q tag on trunk links.
+- **Bridge**: a software switch in the gateway that forwards Ethernet frames between its member ports (`vlan10`, `wlan0`...).
+- **Subnet**: the Layer 3 address range (`192.168.10.0/24`) whose gateway IP lives on the bridge.
+
+Where tags exist: **tagged** on the `eth1` ↔ switch trunk. **Untagged** inside the gateway after `vlan10`/`vlan20`/`vlan30` strip them, on switch access ports, and on Wi-Fi. When debugging, `tcpdump -e -ni eth1` shows tags, `tcpdump -ni br-lan` doesn't.
+
 > If the ISP modem can't be put in bridge mode, you'll have double NAT. It still works, but forward the modem's DMZ to the gateway's WAN IP so that port forwards keep working.
 
 ---
@@ -104,7 +135,7 @@ All of them do the same things under the hood. Each step below lists more than o
 - **Two NICs minimum**: one WAN, one LAN. Intel NICs (i210/i225/i226) are the safe choice.
 - **Managed switch** that supports 802.1Q VLANs, if you want segmentation (strongly recommended).
 - **Wi-Fi card** with good AP-mode support (see section 10), plus a second one for 2.4 GHz IoT if needed.
-- CPU: any modern x86 or ARM64 board routes 1 Gbit/s with nftables without trouble.
+- **CPU**: a recent x86 mini-PC usually routes and NATs 1 Gbit/s with a ruleset like this one. Small ARM boards vary a lot (NIC driver, USB NICs, interrupts, conntrack load). Measure instead of assuming: run `iperf3 -s` on a WAN-side machine and `iperf3 -c <server> -t 30` (add `-R` for the other direction) from a LAN client, and watch the gateway's CPU with `top` during the test.
 
 OS: any Debian/Ubuntu server works. Install the packages:
 
@@ -120,6 +151,8 @@ sudo systemctl enable --now systemd-networkd nftables
 
 Before writing any config file, you can build the whole gateway live with plain commands (as root). It's the best way to understand each piece, and handy for testing. **Nothing survives a reboot**: sections 5 to 8 make it permanent.
 
+> **Lab only.** Run this on a test machine, from its console or from `br-lan` (the `DROP` policy cuts SSH from anywhere else). IPv4 gets a complete policy. IPv6 is simply closed: nothing is forwarded, and the gateway only answers ICMPv6. The firewall uses `iptables` here on purpose, one readable command per rule. The permanent setup in section 7 uses nftables.
+
 ```bash
 # --- WAN ---
 ip link set eth0 up
@@ -132,25 +165,41 @@ dhcpcd eth0                                    # or: dhclient eth0
 ip link set eth1 up
 for net in "10 lan" "20 iot" "30 guest"; do
     set -- $net                                # $1 = VLAN id, $2 = name
-    ip link add link eth1 name eth1.$1 type vlan id $1
+    ip link add link eth1 name vlan$1 type vlan id $1   # same names as section 5
     ip link add name br-$2 type bridge
-    ip link set eth1.$1 master br-$2
+    ip link set vlan$1 master br-$2
     ip addr add 192.168.$1.1/24 dev br-$2
-    ip link set eth1.$1 up
+    ip link set vlan$1 up
     ip link set br-$2 up
 done
 
 # --- Routing ---
 sysctl -w net.ipv4.ip_forward=1
 
-# --- Firewall + NAT ---
-iptables -A INPUT -i eth0 -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT
-iptables -A INPUT -i eth0 -j DROP                       # router unreachable from the internet
+# --- Firewall + NAT (IPv4): traffic to the gateway itself ---
+iptables -A INPUT -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT
+iptables -A INPUT -m conntrack --ctstate INVALID -j DROP
+iptables -A INPUT -i lo -j ACCEPT
+iptables -A INPUT -p icmp -j ACCEPT
+iptables -A INPUT -i br-+ -p udp -m multiport --dports 53,67 -j ACCEPT   # DNS + DHCP from the LANs
+iptables -A INPUT -i br-+ -p tcp --dport 53 -j ACCEPT
+iptables -A INPUT -i br-lan -p tcp --dport 22 -j ACCEPT                  # SSH from the trusted LAN only
+iptables -P INPUT DROP                                  # everything else, WAN included: dropped
+
+# --- Firewall + NAT (IPv4): traffic through the gateway ---
 iptables -A FORWARD -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT
+iptables -A FORWARD -m conntrack --ctstate INVALID -j DROP
 iptables -A FORWARD -i br-+ -o eth0 -j ACCEPT           # all networks -> internet
 iptables -A FORWARD -i br-lan -o br-iot -j ACCEPT       # LAN -> IoT
 iptables -P FORWARD DROP                                # anything else between networks: blocked
 iptables -t nat -A POSTROUTING -o eth0 -j MASQUERADE
+
+# --- IPv6: closed (no forwarding), only what the gateway itself needs ---
+ip6tables -A INPUT -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT
+ip6tables -A INPUT -i lo -j ACCEPT
+ip6tables -A INPUT -p ipv6-icmp -j ACCEPT               # neighbor discovery + RAs: IPv6 breaks without it
+ip6tables -P INPUT DROP
+ip6tables -P FORWARD DROP
 
 # --- DHCP + DNS (foreground, Ctrl+C to stop; stop the dnsmasq service first) ---
 dnsmasq --no-daemon --bind-dynamic \
@@ -166,13 +215,15 @@ Check what you built:
 ip -br addr                 # interfaces and their IPs
 ip route                    # routing table: default route via the WAN
 ip route get 1.1.1.1        # which interface and gateway the kernel picks for a destination
-ip -d link show eth1.10     # VLAN details (id, parent)
+ip -d link show vlan10      # VLAN details (id, parent)
 bridge link                 # which ports belong to which bridge
 bridge fdb show br br-lan   # MAC addresses learned by the bridge
 ip neigh                    # ARP / neighbor table
 iptables -L -v -n           # firewall rules with packet counters
 iptables -t nat -L -v -n    # NAT rules
 ```
+
+Undo everything: `iptables -F; iptables -t nat -F; iptables -P INPUT ACCEPT; iptables -P FORWARD ACCEPT` (same with `ip6tables`, without the NAT part), then `ip link del br-lan` (and the other bridges and `vlanXX`), or simply reboot.
 
 More routing with `ip route` / `ip rule`:
 
@@ -322,9 +373,26 @@ ip -br addr
 
 > `DHCPPrefixDelegation=` requires systemd ≥ 253 (Debian 13, Ubuntu 24.04). On older versions, use `dhcpcd` or `wide-dhcpv6-client` for prefix delegation.
 
+#### IPv6 in short
+
+| Mechanism | Where | What it does |
+|---|---|---|
+| Link-local (`fe80::/10`) | Every interface | Always present, used for neighbor discovery and to talk to the next router |
+| RA (Router Advertisement) | ISP → WAN, gateway → LANs | "I'm your router, here's the prefix" |
+| SLAAC | LAN clients | Clients build their own global address from the RA prefix. Used here, so no DHCPv6 server on the LANs |
+| DHCPv6 (address) | Optional | Stateful address assignment, the IPv6 equivalent of DHCPv4. Not needed here |
+| DHCPv6-PD | Gateway ↔ ISP | The ISP **delegates a prefix** (e.g. a /56), and the gateway cuts one /64 per LAN (`SubnetId`) |
+
+IPv6 is **routed, not NATed**: protection comes from the forward chain (section 7).
+
+**Prerequisites and checks:**
+- The ISP must actually delegate a prefix. `PrefixDelegationHint=::/56` is a request, not a guarantee: you may get a /60 or a /64 (too small for three LANs), or nothing at all.
+- `networkctl status eth0` shows the delegated prefix. `ip -6 addr show br-lan` must show a global address (`2xxx:...`), and a LAN client must reach `curl -6 ifconfig.co`.
+- **The prefix can change** (ISP reconnect, router reboot on some ISPs). networkd re-announces the new one, and clients switch once the old prefix expires. Never hardcode delegated IPv6 addresses in the firewall or DNS.
+
 ### Method 2: ifupdown (classic Debian)
 
-The traditional `/etc/network/interfaces` way. Needs `apt install vlan bridge-utils`. IPv6 prefix delegation isn't built in, so add `dhcpcd` for it.
+The traditional `/etc/network/interfaces` way. Needs `apt install vlan bridge-utils`. IPv6 prefix delegation isn't built in, so add `dhcpcd` for it. VLANs are named `eth1.10` instead of `vlan10`: the `vlan` package creates them from that `parent.id` naming.
 
 ```
 auto eth0
@@ -392,6 +460,35 @@ All methods below drive the same kernel firewall (netfilter). Pick **one** and d
 | 2. iptables | Classic, still everywhere | Separate rules for IPv4 (`iptables`) and IPv6 (`ip6tables`) |
 | 3. firewalld / ufw | Frontends | Generate nftables/iptables rules from zones/commands |
 
+### How a packet crosses the gateway
+
+Every method hooks into the same netfilter points. Knowing this path is what lets you debug "it pings the gateway but not the internet":
+
+```
+ packet in (any interface)
+     │
+ PREROUTING ─── nat: DNAT (port forwards), DNS redirect
+     │
+ routing decision ── for the gateway itself? ──► INPUT ──► local service (dnsmasq, sshd)
+     │ no                                                        │ its replies
+ FORWARD ─── filter: LAN → WAN allowed? inter-VLAN policy        ▼
+     │                                                         OUTPUT
+     ▼                                                           │
+ POSTROUTING ◄───────────────────────────────────────────────────┘
+     │   nat: masquerade (source NAT) out of the WAN
+     ▼
+ packet out
+```
+
+- **Connection tracking** sees the first packet of each connection. NAT rules only run for that first packet, and replies are un-NATed automatically.
+- **Debug order**, LAN client → internet:
+  1. `tcpdump -ni br-lan` (does the request arrive?)
+  2. FORWARD counters (`nft list ruleset`, or `iptables -L FORWARD -v`)
+  3. `tcpdump -ni eth0` (does it leave with the WAN IP? does a reply come back?)
+  4. `conntrack -L` (is the reply matched to the connection?)
+
+  No reply on `eth0` means the problem is upstream. A reply on `eth0` that never reaches `br-lan` means it's a gateway problem: conntrack, firewall or routing.
+
 These are the rules every gateway should have:
 
 1. **Default deny inbound** to the router itself and to the LAN.
@@ -411,7 +508,7 @@ These are the rules every gateway should have:
 
 ```nft
 #!/usr/sbin/nft -f
-flush ruleset
+flush ruleset        # deletes EVERY table, not only these ones: see the warning below
 
 define WAN   = "eth0"
 define LAN   = "br-lan"
@@ -507,6 +604,21 @@ Load and check:
 sudo nft -c -f /etc/nftables.conf   # syntax check first
 sudo systemctl restart nftables
 sudo nft list ruleset
+```
+
+> **`flush ruleset` owns the whole firewall.** It also deletes tables created by Docker, libvirt, fail2ban or VPN tools. That's fine on a dedicated gateway. On a shared machine, give your tables their own names (e.g. `table inet gw`), replace `flush ruleset` with `table inet gw` + `flush table inet gw`, and leave the other tables alone. With several tables, a packet must be accepted by every base chain on its hook: a `drop` in any of them wins.
+
+`nft -c` only checks syntax, not whether you'll keep access. When changing the firewall **remotely**, schedule an automatic rollback first:
+
+```bash
+# 1. Save the current, working ruleset (with a flush on top, so it fully replaces)
+sudo sh -c '{ echo "flush ruleset"; nft list ruleset; } > /root/nftables.good.conf'
+# 2. Roll back automatically in 2 minutes unless cancelled
+sudo systemd-run --unit=fw-rollback --on-active=120 /usr/sbin/nft -f /root/nftables.good.conf
+# 3. Apply the new rules
+sudo nft -c -f /etc/nftables.conf && sudo nft -f /etc/nftables.conf
+# 4. Still connected? Cancel the rollback
+sudo systemctl stop fw-rollback.timer
 ```
 
 ### Method 2: iptables (classic)
@@ -666,7 +778,15 @@ Move the switch's own management IP into VLAN 10, and change its default admin p
 
 The gateway's own Wi-Fi card broadcasts one SSID per network, and `hostapd` attaches each SSID to the matching bridge (`br-lan`, `br-guest`...). Wi-Fi clients then land on the same networks as wired ones.
 
-Check the card first: `iw list` → "Supported interface modes" must contain `AP`. Mediatek MT7921/MT7922 and Atheros chips work well, while most Intel cards are limited to 2.4 GHz in AP mode.
+AP support depends on the exact chipset, driver, firmware and regulatory rules, so check your card instead of trusting the brand:
+
+```bash
+iw list | grep -A 10 "Supported interface modes"     # must contain "AP"
+iw list | grep -A 8 "valid interface combinations"   # how many APs (SSIDs) / AP + station at once
+iw list | grep -E "MHz.*(no IR|disabled)"            # "no IR" = can't start an AP on that channel
+```
+
+Many client cards can only start an AP on 2.4 GHz because their 5 GHz channels are marked `no IR`.
 
 | SSID | Bridge | Security |
 |---|---|---|
@@ -712,6 +832,16 @@ wpa_passphrase=another-guest-passphrase
 ieee80211w=1
 ap_isolate=1               # guests can't talk to each other
 ```
+
+Security modes, as set above:
+
+| Mode | `wpa_key_mgmt` | `ieee80211w` (MFP) | Use for |
+|---|---|---|---|
+| WPA2 only | `WPA-PSK` | `0` or `1` | Old/IoT devices that fail on anything newer |
+| WPA2/WPA3 transition | `WPA-PSK SAE` | `1` (optional): WPA3 clients use it, WPA2 clients may skip it | Mixed household devices (used above) |
+| WPA3 only | `SAE` | `2` (required) | Networks where every device supports WPA3 |
+
+MFP (management frame protection, 802.11w) stops forged disconnect frames. WPA3-SAE always uses it.
 
 ```bash
 sudo systemctl unmask hostapd
@@ -799,7 +929,16 @@ sudo ip addr add <ip>/<prefix> dev wwan0           # values from mmcli -b 0
 sudo ip route add default dev wwan0 metric 200     # backup route
 ```
 
-ModemManager alone doesn't reconnect after a drop. For an unattended link, Quectel's `quectel-CM` tool (from Quectel support) connects, configures `wwan0` and reconnects automatically.
+The modem has two separate sides: a **control plane** (QMI/MBIM/AT: SIM, registration, opening the data session) and a **data plane** (`wwan0`, a normal Linux interface that needs IP, route, DNS and firewall). Opening the session doesn't configure Linux. Pick **one** owner for the whole chain, and never let two tools manage `wwan0`:
+
+| Approach | Who does what | Good for |
+|---|---|---|
+| **Manual** (above) | ModemManager opens the session, you run the `ip` commands | Learning, lab |
+| **Managed** | One tool does session + IP + route + reconnect: `quectel-CM` (from Quectel support), or NetworkManager with ModemManager | Unattended gateway |
+
+An unattended setup must survive these events: loss of registration, dropped data session, modem reset (the USB device disappears and comes back), new IP after reconnect. ModemManager alone doesn't reconnect after a drop, which is why the manual way is lab-only.
+
+> These commands assume a USB modem in **QMI** mode (`qmi_wwan` driver, `/dev/cdc-wdm0`). In **MBIM** mode (`cdc_mbim`), or on PCIe/5G modems (`mhi` driver, `wwan` subsystem, RMNET), the device names and tools differ. Check with `mmcli -m 0` and `ls /sys/class/net`.
 
 Quick checks with AT commands (`picocom /dev/ttyUSB2`, stop ModemManager first since it uses the same port):
 
@@ -821,7 +960,7 @@ To the gateway, Starlink is just an Ethernet WAN. Enable **bypass mode** on the 
 
 With `RouteMetric=100` on `eth0` and `200` on the backup, the kernel uses the lowest-metric default route. If `eth0` loses its link, its route disappears and traffic moves to the backup by itself (open connections restart).
 
-That doesn't cover "cable up, but the ISP is down". For that, a small watchdog checks the internet **through `eth0`** and pushes a preferred route via the backup while it fails:
+That doesn't cover "cable up, but the ISP is down". The watchdog below shows the principle: it checks the internet **through `eth0`** and pushes a preferred route via the backup while that check fails. **It's a demonstration, not a production mechanism:**
 
 ```sh
 #!/bin/sh
@@ -835,7 +974,15 @@ while sleep 10; do
 done
 ```
 
-`wwan0` is point-to-point, so it needs no gateway address. For a `wlan1` backup, write `default via <its gateway> dev wlan1 metric 50`. Run the script as a systemd service (`Restart=always`). On OpenWrt, `mwan3` does the same with a UI.
+`wwan0` is point-to-point, so it needs no gateway address. For a `wlan1` backup, write `default via <its gateway> dev wlan1 metric 50`.
+
+Its limits:
+- One probe target, and ICMP only: a filtered ping looks like an outage.
+- No hysteresis: a flaky line makes it flap between WANs.
+- It assumes the backup is already connected (a modem session may need to be re-opened first).
+- Open connections break at every switch (NAT state is tied to the old WAN IP).
+
+A real setup uses a dedicated manager with several probe targets, "N failures to switch, M successes to switch back", and control over the backup link. On OpenWrt, `mwan3` does this. Either way, test it by unplugging the WAN, cutting upstream (modem up, ISP down), resetting the modem, and checking recovery.
 
 ---
 
@@ -885,6 +1032,16 @@ Segmentation tests:
 | Internet | any LAN IP (IPv4 or IPv6) | ❌ blocked |
 
 For the last one, scan your public IPs from outside (e.g. `nmap -Pn <wan-ip>` from a VPS, or an online IPv6 port scanner). Nothing should answer except your explicit port forwards.
+
+Recovery tests. A gateway that only works after manual commands isn't finished:
+
+| Test | Expected |
+|---|---|
+| Reboot, touch nothing | Everything above works again |
+| Boot with the WAN unplugged, plug it in later | LANs get DHCP and local DNS meanwhile; internet and IPv6 come back without intervention |
+| Restart one service (`dnsmasq`, `hostapd`, `nftables`) | It comes back without breaking the others |
+
+The config already helps here: `ConfigureWithoutCarrier=yes` keeps LAN addresses even with no cable or WAN, and dnsmasq's `bind-dynamic` picks up interfaces that appear after it starts.
 
 ---
 

@@ -140,9 +140,11 @@ Where tags exist: **tagged** on the `eth1` ↔ switch trunk. **Untagged** inside
 OS: any Debian/Ubuntu server works. Install the packages:
 
 ```bash
-sudo apt install nftables dnsmasq hostapd iproute2 conntrack tcpdump   # swap nftables for iptables-persistent if using Method 2 in section 7
+sudo apt install nftables dnsmasq hostapd iw iproute2 conntrack tcpdump   # swap nftables for iptables-persistent if using Method 2 in section 7
 sudo systemctl enable --now systemd-networkd nftables
-# Disable anything else managing interfaces (NetworkManager, ifupdown, netplan renderers)
+# Only one tool may manage the interfaces: disable NetworkManager and ifupdown.
+# Ubuntu: move the YAML files out of /etc/netplan. Netplan generates networkd files such as
+# /run/systemd/network/10-netplan-eth0.network, which sort before 10-wan.network and take precedence.
 ```
 
 ---
@@ -151,7 +153,7 @@ sudo systemctl enable --now systemd-networkd nftables
 
 Before writing any config file, you can build the whole gateway live with plain commands (as root). It's the best way to understand each piece, and handy for testing. **Nothing survives a reboot**: sections 5 to 8 make it permanent.
 
-> **Lab only.** Run this on a test machine, from its console or from `br-lan` (the `DROP` policy cuts SSH from anywhere else). IPv4 gets a complete policy. IPv6 is simply closed: nothing is forwarded, and the gateway only answers ICMPv6. The firewall uses `iptables` here on purpose, one readable command per rule. The permanent setup in section 7 uses nftables.
+> **Lab only.** Run this on a test machine, from its console or from `br-lan` (the `DROP` policy cuts SSH from anywhere else). Needs `apt install iptables dhcpcd dnsmasq`. Stop `systemd-networkd` and NetworkManager first, so nothing else reconfigures the interfaces underneath you. IPv4 gets a complete policy. IPv6 is simply closed: nothing is forwarded, and the gateway only answers ICMPv6. The firewall uses `iptables` here on purpose, one readable command per rule. The permanent setup in section 7 uses nftables.
 
 ```bash
 # --- WAN ---
@@ -181,6 +183,7 @@ iptables -A INPUT -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT
 iptables -A INPUT -m conntrack --ctstate INVALID -j DROP
 iptables -A INPUT -i lo -j ACCEPT
 iptables -A INPUT -p icmp -j ACCEPT
+iptables -A INPUT -i eth0 -p udp --sport 67 --dport 68 -j ACCEPT        # WAN DHCP replies (renewals can arrive as broadcast)
 iptables -A INPUT -i br-+ -p udp -m multiport --dports 53,67 -j ACCEPT   # DNS + DHCP from the LANs
 iptables -A INPUT -i br-+ -p tcp --dport 53 -j ACCEPT
 iptables -A INPUT -i br-lan -p tcp --dport 22 -j ACCEPT                  # SSH from the trusted LAN only
@@ -198,6 +201,7 @@ iptables -t nat -A POSTROUTING -o eth0 -j MASQUERADE
 ip6tables -A INPUT -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT
 ip6tables -A INPUT -i lo -j ACCEPT
 ip6tables -A INPUT -p ipv6-icmp -j ACCEPT               # neighbor discovery + RAs: IPv6 breaks without it
+ip6tables -A INPUT -i eth0 -s fe80::/10 -p udp --sport 547 --dport 546 -j ACCEPT   # WAN DHCPv6 replies (dhcpcd)
 ip6tables -P INPUT DROP
 ip6tables -P FORWARD DROP
 
@@ -223,7 +227,7 @@ iptables -L -v -n           # firewall rules with packet counters
 iptables -t nat -L -v -n    # NAT rules
 ```
 
-Undo everything: `iptables -F; iptables -t nat -F; iptables -P INPUT ACCEPT; iptables -P FORWARD ACCEPT` (same with `ip6tables`, without the NAT part), then `ip link del br-lan` (and the other bridges and `vlanXX`), or simply reboot.
+Undo everything: `iptables -P INPUT ACCEPT; iptables -P FORWARD ACCEPT; iptables -F; iptables -t nat -F` (policies first, so the flush never leaves an empty `DROP` chain; same with `ip6tables`, without the NAT part). Then `ip link del br-lan` (and the other bridges and `vlanXX`), or simply reboot.
 
 More routing with `ip route` / `ip rule`:
 
@@ -279,16 +283,23 @@ DHCP=yes
 IPv6AcceptRA=yes
 
 [DHCPv4]
-UseDNS=no            # we run our own resolver
-RouteMetric=100      # main WAN; backup uplinks use 200 (section 11)
+# We run our own resolver
+UseDNS=no
+# Main WAN; backup uplinks use 200 (section 11)
+RouteMetric=100
 
 [DHCPv6]
 UseDNS=no
-PrefixDelegationHint=::/56   # ask the ISP for a /56 (ISP-dependent, /60 or /64 also common)
+# Ask the ISP for a /56 (a request, not a guarantee: see "Prerequisites and checks" below)
+PrefixDelegationHint=::/56
 
 [IPv6AcceptRA]
 UseDNS=no
+# Request a prefix even if the ISP's RA doesn't set the "managed" flag
+DHCPv6Client=always
 ```
+
+> systemd files don't support comments after a value: `RouteMetric=100  # main WAN` fails to parse, and the line is **silently ignored**. Keep comments on their own lines.
 
 > **PPPoE**: many fiber/DSL ISPs require PPPoE. Use `pppd` with the `rp-pppoe` plugin on top of `eth0` (often on a VLAN like `eth0.835` for some ISPs) and treat `ppp0` as the WAN in the firewall. Remember the MSS clamping rule in section 7.
 
@@ -352,7 +363,7 @@ DHCPPrefixDelegation=yes
 
 [DHCPPrefixDelegation]
 UplinkInterface=eth0
-SubnetId=10
+SubnetId=1
 Announce=yes
 ```
 
@@ -360,8 +371,10 @@ Repeat for the other VLANs:
 
 | VLAN netdev | Bridge | Address | `SubnetId` |
 |---|---|---|---|
-| `vlan20` | `br-iot` | `192.168.20.1/24` | `20` |
-| `vlan30` | `br-guest` | `192.168.30.1/24` | `30` |
+| `vlan20` | `br-iot` | `192.168.20.1/24` | `2` |
+| `vlan30` | `br-guest` | `192.168.30.1/24` | `3` |
+
+`SubnetId` is **hexadecimal** and picks which /64 of the delegated prefix a LAN gets. It must fit in the bits between the delegated length and /64: `0`-`ff` for a /56, `0`-`f` for a /60, only `0` for a /64. Small IDs like `1`, `2`, `3` work with a /56, a /60 or a /62. (`10` would mean 0x10, which doesn't fit in a /60.)
 
 Apply and check:
 
@@ -386,9 +399,11 @@ ip -br addr
 IPv6 is **routed, not NATed**: protection comes from the forward chain (section 7).
 
 **Prerequisites and checks:**
-- The ISP must actually delegate a prefix. `PrefixDelegationHint=::/56` is a request, not a guarantee: you may get a /60 or a /64 (too small for three LANs), or nothing at all.
-- `networkctl status eth0` shows the delegated prefix. `ip -6 addr show br-lan` must show a global address (`2xxx:...`), and a LAN client must reach `curl -6 ifconfig.co`.
-- **The prefix can change** (ISP reconnect, router reboot on some ISPs). networkd re-announces the new one, and clients switch once the old prefix expires. Never hardcode delegated IPv6 addresses in the firewall or DNS.
+- The ISP must actually delegate a prefix. `PrefixDelegationHint=::/56` is a request, not a guarantee: you may get a /60, a /64, or nothing at all.
+- **With a /64**, only `SubnetId=0` fits, so only one LAN can have IPv6. Give `br-lan` `SubnetId=0` and leave the others IPv4-only.
+- **With no prefix**, the LANs simply stay IPv4-only: clients get no global IPv6 address, so they don't try IPv6 for internet traffic. Nothing else breaks.
+- `networkctl status eth0` shows the delegated prefix. `ip -6 addr show br-lan` must show a global address (`2xxx:...`), and a LAN client must reach `curl -6 ifconfig.co`. If a bridge has none, check `journalctl -u systemd-networkd` for prefix-delegation errors.
+- **The prefix can change** (ISP reconnect, router reboot on some ISPs). networkd announces the new one, but clients may keep using the old address until its lifetime expires, so expect a period of broken IPv6 after a change. Never hardcode delegated IPv6 addresses in the firewall or DNS.
 
 ### Method 2: ifupdown (classic Debian)
 
@@ -425,7 +440,9 @@ Apply with `sudo systemctl restart networking`.
 net.ipv4.ip_forward = 1
 net.ipv6.conf.all.forwarding = 1
 
-# Anti-spoofing: drop packets arriving on an interface they couldn't be routed back through
+# Anti-spoofing: drop packets arriving on an interface they couldn't be routed back through.
+# Strict (1) suits a single WAN. With a backup WAN (section 11), use 2 (loose) on both lines:
+# strict mode drops replies that arrive on the WAN that isn't currently preferred.
 net.ipv4.conf.all.rp_filter = 1
 net.ipv4.conf.default.rp_filter = 1
 
@@ -444,6 +461,9 @@ net.netfilter.nf_conntrack_max = 131072
 
 ```bash
 sudo sysctl --system
+# nf_conntrack_max only exists once the nf_conntrack module is loaded. At boot, that can happen
+# after systemd-sysctl has run, and the setting is then skipped. Load the module early:
+echo nf_conntrack | sudo tee /etc/modules-load.d/conntrack.conf
 ```
 
 > With `forwarding = 1`, the kernel ignores Router Advertisements on the WAN. That's fine here because systemd-networkd handles RAs itself (`IPv6AcceptRA=yes`). If you use another tool, set `net.ipv6.conf.eth0.accept_ra = 2`.
@@ -587,6 +607,7 @@ table ip nat {
         # iifname $WAN tcp dport 8443 dnat to 192.168.10.10:443
 
         # Optional: force IoT/guest DNS through the gateway, even if devices hardcode 8.8.8.8
+        # (IPv4 only: this table doesn't see DNS sent to IPv6 servers)
         iifname { $IOT, $GUEST } meta l4proto { tcp, udp } th dport 53 redirect to :53
     }
 
@@ -664,10 +685,40 @@ COMMIT
 COMMIT
 ```
 
-`/etc/iptables/rules.v6`: the same `*filter` table with three changes. It has no `*nat` table. ICMPv6 must be accepted (`-A INPUT -p ipv6-icmp -j ACCEPT`, and the same in `FORWARD`). The DHCP client rule becomes `-A INPUT -i eth0 -s fe80::/10 -p udp --sport 547 --dport 546 -j ACCEPT`.
+`/etc/iptables/rules.v6`: same policy for IPv6, with no NAT. ICMP rules use `ipv6-icmp` (`--icmp-type` doesn't exist in ip6tables), and the WAN DHCP rule becomes DHCPv6:
+
+```
+*filter
+:INPUT DROP [0:0]
+:FORWARD DROP [0:0]
+:OUTPUT ACCEPT [0:0]
+
+-A INPUT -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT
+-A INPUT -m conntrack --ctstate INVALID -j DROP
+-A INPUT -i lo -j ACCEPT
+-A INPUT -p ipv6-icmp -j ACCEPT
+-A INPUT -i eth0 -s fe80::/10 -p udp --sport 547 --dport 546 -j ACCEPT
+-A INPUT -i br-+ -p udp --dport 53 -j ACCEPT
+-A INPUT -i br-+ -p tcp --dport 53 -j ACCEPT
+-A INPUT -i br-lan -p tcp --dport 22 -j ACCEPT
+-A INPUT -m limit --limit 5/min -j LOG --log-prefix "ip6t input drop: "
+
+-A FORWARD -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu
+-A FORWARD -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT
+-A FORWARD -m conntrack --ctstate INVALID -j DROP
+-A FORWARD -p ipv6-icmp --icmpv6-type destination-unreachable -j ACCEPT
+-A FORWARD -p ipv6-icmp --icmpv6-type packet-too-big -j ACCEPT
+-A FORWARD -p ipv6-icmp --icmpv6-type time-exceeded -j ACCEPT
+-A FORWARD -p ipv6-icmp --icmpv6-type parameter-problem -j ACCEPT
+-A FORWARD -i br-+ -o eth0 -j ACCEPT
+-A FORWARD -i br-lan -o br-iot -j ACCEPT
+-A FORWARD -m limit --limit 5/min -j LOG --log-prefix "ip6t forward drop: "
+COMMIT
+```
 
 ```bash
 sudo iptables-restore --test < /etc/iptables/rules.v4   # syntax check
+sudo ip6tables-restore --test < /etc/iptables/rules.v6
 sudo netfilter-persistent reload
 sudo iptables -S && sudo iptables -t nat -S
 ```
@@ -679,17 +730,26 @@ sudo iptables -S && sudo iptables -t nat -S
 Good if you prefer commands over rule files (default on Fedora/RHEL). Each interface goes into a zone, and **policies** control traffic between zones (firewalld ≥ 0.9).
 
 ```bash
-sudo firewall-cmd --permanent --zone=external --change-interface=eth0     # external zone = masquerade on
-sudo firewall-cmd --permanent --zone=internal --change-interface=br-lan   # DNS/DHCP/SSH allowed
+sudo firewall-cmd --permanent --zone=external --change-interface=eth0     # external zone: masquerade on
+sudo firewall-cmd --permanent --zone=external --remove-service=ssh        # external allows SSH by default
+sudo firewall-cmd --permanent --zone=internal --change-interface=br-lan   # defaults: ssh, mdns, samba-client, dhcpv6-client
+sudo firewall-cmd --permanent --zone=internal --add-service={dns,dhcp}    # not in internal's defaults
 sudo firewall-cmd --permanent --new-zone=iot
 sudo firewall-cmd --permanent --zone=iot --change-interface=br-iot
 sudo firewall-cmd --permanent --zone=iot --add-service={dns,dhcp}
 
-# Allow internal -> internet (add another ingress zone for iot, guest, ...)
+# Allow internal -> internet (repeat --add-ingress-zone for guest, ...)
 sudo firewall-cmd --permanent --new-policy=lan-out
-sudo firewall-cmd --permanent --policy=lan-out --add-ingress-zone=internal --add-ingress-zone=iot
+sudo firewall-cmd --permanent --policy=lan-out --add-ingress-zone=internal
+sudo firewall-cmd --permanent --policy=lan-out --add-ingress-zone=iot
 sudo firewall-cmd --permanent --policy=lan-out --add-egress-zone=external
 sudo firewall-cmd --permanent --policy=lan-out --set-target=ACCEPT
+
+# Allow LAN -> IoT, not the reverse
+sudo firewall-cmd --permanent --new-policy=lan-to-iot
+sudo firewall-cmd --permanent --policy=lan-to-iot --add-ingress-zone=internal
+sudo firewall-cmd --permanent --policy=lan-to-iot --add-egress-zone=iot
+sudo firewall-cmd --permanent --policy=lan-to-iot --set-target=ACCEPT
 
 # Port forward
 # sudo firewall-cmd --permanent --zone=external --add-forward-port=port=8443:proto=tcp:toport=443:toaddr=192.168.10.10
@@ -702,7 +762,8 @@ sudo firewall-cmd --reload
 ### Notes on the rules
 
 - **IPv6 has no NAT here, and that's fine.** LAN devices get public IPv6 addresses, but the forward chain only lets in replies (`established,related`). Unsolicited inbound IPv6 is dropped by the policy. This is what protects you, not NAT.
-- **Guest client isolation** (guests not seeing each other) happens in hostapd (`ap_isolate`, see section 10), because the Wi-Fi driver delivers traffic between two clients on the same SSID directly, before the firewall sees it.
+- **Guest client isolation** (guests not seeing each other) happens in hostapd (`ap_isolate`, see section 10), because the Wi-Fi driver delivers traffic between two clients on the same SSID directly, before the firewall sees it. It only covers Wi-Fi guests: wired guest ports on VLAN 30 need port isolation on the switch.
+- **Traffic inside one bridge** (wired PC ↔ Wi-Fi phone on `br-lan`) normally never reaches the firewall. If the `br_netfilter` module is loaded (`lsmod | grep br_netfilter`, Docker loads it), it does go through the forward hook and the drop policy can block it. Test this. If it's blocked and nothing else needs `br_netfilter`, set `net.bridge.bridge-nf-call-iptables = 0` and `net.bridge.bridge-nf-call-ip6tables = 0`.
 - **Don't expose SSH or the admin UI on the WAN.** Use a VPN (WireGuard) for remote access instead of port forwards.
 - **UPnP/NAT-PMP**: leave it off. If a game console needs it, run `miniupnpd` restricted to that console's IP only.
 - **Hairpin NAT** (reaching your public IP from inside): easier to solve with local DNS (`nas.home.arpa` → private IP) than with extra NAT rules.
@@ -788,6 +849,8 @@ iw list | grep -E "MHz.*(no IR|disabled)"            # "no IR" = can't start an 
 
 Many client cards can only start an AP on 2.4 GHz because their 5 GHz channels are marked `no IR`.
 
+The config below is an example for a card that supports 5 GHz AP mode, 80 MHz VHT and two SSIDs at once (`#{ AP } <= 2` or more in the interface combinations). If yours doesn't, hostapd refuses to start: adjust the band, channel width and `ht_capab` to what `iw list` reports. It was written for the hostapd 2.10+ shipped by Debian/Ubuntu.
+
 | SSID | Bridge | Security |
 |---|---|---|
 | `Home` | `br-lan` | WPA2/WPA3 mixed mode |
@@ -800,10 +863,11 @@ Many client cards can only start an AP on 2.4 GHz because their 5 GHz channels a
 interface=wlan0
 bridge=br-lan
 driver=nl80211
-country_code=FR            # your country: sets legal channels and power
+# Your country: sets legal channels and power
+country_code=FR
 ieee80211d=1
 
-# 5 GHz, 80 MHz on channel 36 (36-48)
+# 5 GHz, 80 MHz on channel 36 (36-48). ht_capab must match the card's "HT Capabilities" in iw list
 hw_mode=a
 channel=36
 ieee80211n=1
@@ -819,7 +883,9 @@ wpa=2
 wpa_key_mgmt=WPA-PSK SAE
 rsn_pairwise=CCMP
 wpa_passphrase=change-me-long-passphrase
-ieee80211w=1               # management frame protection: optional for WPA2, required by SAE
+# Management frame protection: optional for WPA2 clients, forced for WPA3 (SAE) clients
+ieee80211w=1
+sae_require_mfp=1
 
 # Guest network on a second BSS, bridged to the guest VLAN
 bss=wlan0_1
@@ -830,7 +896,9 @@ wpa_key_mgmt=WPA-PSK SAE
 rsn_pairwise=CCMP
 wpa_passphrase=another-guest-passphrase
 ieee80211w=1
-ap_isolate=1               # guests can't talk to each other
+sae_require_mfp=1
+# Guests can't talk to each other
+ap_isolate=1
 ```
 
 Security modes, as set above:
@@ -838,18 +906,19 @@ Security modes, as set above:
 | Mode | `wpa_key_mgmt` | `ieee80211w` (MFP) | Use for |
 |---|---|---|---|
 | WPA2 only | `WPA-PSK` | `0` or `1` | Old/IoT devices that fail on anything newer |
-| WPA2/WPA3 transition | `WPA-PSK SAE` | `1` (optional): WPA3 clients use it, WPA2 clients may skip it | Mixed household devices (used above) |
+| WPA2/WPA3 transition | `WPA-PSK SAE` | `1` + `sae_require_mfp=1`: WPA2 clients may skip MFP, WPA3 clients must use it | Mixed household devices (used above) |
 | WPA3 only | `SAE` | `2` (required) | Networks where every device supports WPA3 |
 
-MFP (management frame protection, 802.11w) stops forged disconnect frames. WPA3-SAE always uses it.
+MFP (management frame protection, 802.11w) stops forged disconnect frames. WPA3 requires it. In transition mode, hostapd only enforces it for SAE clients when `sae_require_mfp=1` is set.
 
 ```bash
+# Debian ships hostapd.service masked; it reads /etc/hostapd/hostapd.conf
 sudo systemctl unmask hostapd
 sudo systemctl enable --now hostapd
 journalctl -u hostapd -f
 ```
 
-**IoT on 2.4 GHz:** one radio works on one band. Most IoT devices are 2.4 GHz only, so give `Home-IoT` a second radio (e.g. `wlan2`) with its own file, `/etc/hostapd/wlan2.conf`: `interface=wlan2`, `bridge=br-iot`, `hw_mode=g`, `channel=6`, `wpa_key_mgmt=WPA-PSK`. Start it with `sudo systemctl enable --now hostapd@wlan2`.
+**IoT on 2.4 GHz:** one radio works on one band. Most IoT devices are 2.4 GHz only, so give `Home-IoT` a second radio (e.g. `wlan2`) with its own file. `hostapd@wlan2.service` reads `/etc/hostapd/wlan2.conf`. Write it as a complete single-SSID config: copy the first block above, drop the `bss=` part and the 5 GHz lines (`ieee80211ac`, `vht_*`), then set `interface=wlan2`, `bridge=br-iot`, `hw_mode=g`, `channel=6`, `ssid=Home-IoT`, `wpa_key_mgmt=WPA-PSK`, `ieee80211w=0`, and remove `sae_require_mfp`. Start it with `sudo systemctl enable --now hostapd@wlan2`.
 
 ### Wi-Fi planning tips
 
@@ -879,7 +948,7 @@ The firewall must treat the new interface as a WAN:
 
 ### Method 1: Wi-Fi station (client)
 
-Use a **second** Wi-Fi adapter (`wlan1`). A single radio can't follow the upstream network's channel and serve your own AP at the same time.
+Use a **second** Wi-Fi adapter (`wlan1`). Some radios can run AP and station at once (see `valid interface combinations`), but only on one channel. Your AP would then have to follow whatever channel the upstream network uses, which hostapd doesn't do on its own. Needs `apt install wpasupplicant`.
 
 `/etc/wpa_supplicant/wpa_supplicant-wlan1.conf`
 
@@ -903,7 +972,8 @@ Name=wlan1
 DHCP=yes
 
 [DHCPv4]
-RouteMetric=200      # backup: used only when eth0 has no route
+# Backup: used only when eth0 has no default route
+RouteMetric=200
 ```
 
 ```bash
@@ -920,21 +990,29 @@ The EC25 (mini-PCIe card or USB dongle) shows up as `/dev/cdc-wdm0` (QMI control
 lsusb | grep 2c7c                                  # Quectel vendor ID (EC25 = 2c7c:0125)
 sudo apt install modemmanager libqmi-utils
 mmcli -L                                           # list modems
-mmcli -m 0                                         # SIM state, operator, signal, bearer path
-sudo mmcli -m 0 --simple-connect="apn=internet"    # your carrier's APN
-mmcli -b 0                                         # bearer: IP address, prefix, DNS
+mmcli -m 0                                         # SIM state, operator, signal
+sudo mmcli -m 0 --simple-connect="apn=internet,ip-type=ipv4"   # your carrier's APN
+mmcli -m 0 | grep -i bearer                        # bearer path: the index is not always 0
+mmcli -b <N>                                       # interface, IPv4 method, address, prefix, gateway, DNS, MTU
 
-sudo ip link set wwan0 up
-sudo ip addr add <ip>/<prefix> dev wwan0           # values from mmcli -b 0
-sudo ip route add default dev wwan0 metric 200     # backup route
+# If mmcli -b reports "method: static" (usual with QMI):
+sudo ip addr flush dev wwan0
+sudo ip addr add <address>/<prefix> dev wwan0
+sudo ip link set wwan0 mtu <mtu> up
+sudo ip route add default via <gateway> dev wwan0 metric 200   # backup route
+# If it reports "method: dhcp", run a DHCP client on wwan0 instead
 ```
+
+ModemManager only opens the session: it doesn't configure `wwan0`, and the values change at every reconnect. Your DNS stays dnsmasq with its fixed upstream servers (section 8), so the carrier's DNS isn't needed.
 
 The modem has two separate sides: a **control plane** (QMI/MBIM/AT: SIM, registration, opening the data session) and a **data plane** (`wwan0`, a normal Linux interface that needs IP, route, DNS and firewall). Opening the session doesn't configure Linux. Pick **one** owner for the whole chain, and never let two tools manage `wwan0`:
 
 | Approach | Who does what | Good for |
 |---|---|---|
-| **Manual** (above) | ModemManager opens the session, you run the `ip` commands | Learning, lab |
+| **Manual** (above) | ModemManager opens the session, you run the `ip` commands again after every reconnect | Learning, lab |
 | **Managed** | One tool does session + IP + route + reconnect: `quectel-CM` (from Quectel support), or NetworkManager with ModemManager | Unattended gateway |
+
+If you use NetworkManager for the modem, restrict it to that device and keep it away from DNS, so it doesn't fight systemd-networkd and dnsmasq. In `/etc/NetworkManager/conf.d/modem-only.conf`: `[keyfile]` `unmanaged-devices=except:type:gsm`, and `[main]` `dns=none`. NetworkManager gives mobile routes a high metric by default, so the connection stays a backup.
 
 An unattended setup must survive these events: loss of registration, dropped data session, modem reset (the USB device disappears and comes back), new IP after reconnect. ModemManager alone doesn't reconnect after a drop, which is why the manual way is lab-only.
 
@@ -974,7 +1052,9 @@ while sleep 10; do
 done
 ```
 
-`wwan0` is point-to-point, so it needs no gateway address. For a `wlan1` backup, write `default via <its gateway> dev wlan1 metric 50`.
+`default dev wwan0` without a gateway only works when `wwan0` is in raw-IP mode (`ip -d link show wwan0` shows `POINTOPOINT,NOARP`). Otherwise, and for a `wlan1` backup, write `default via <its gateway> dev <iface> metric 50`.
+
+**Set `rp_filter` to 2 (loose) first** (section 6). In strict mode, while the backup route is preferred, the kernel drops the replies to the watchdog's own `ping -I eth0`. The watchdog then never sees `eth0` recover and stays on the backup.
 
 Its limits:
 - One probe target, and ICMP only: a filtered ping looks like an outage.
@@ -1008,7 +1088,7 @@ ip -br addr                       # all bridges up with the right IPs
 ip -6 route                       # delegated prefix routes on each bridge
 sudo nft list ruleset             # rules loaded (iptables: sudo iptables -S)
 sudo conntrack -L | head          # NAT and connection tracking in action
-journalctl -k | grep -E "nft |ipt "   # dropped packets (from the log rules)
+journalctl -k | grep -E "nft |ip6?t "   # dropped packets (from the log rules)
 ```
 
 From a client on each network:
@@ -1055,7 +1135,8 @@ The config already helps here: `ConfigureWithoutCarrier=yes` keeps LAN addresses
 | Some websites hang (IPv4) | MTU/MSS issue with PPPoE: check the MSS clamping rule |
 | IPv6 doesn't work | ICMPv6 blocked, ISP doesn't delegate a prefix (check `networkctl status eth0`), wrong `PrefixDelegationHint` |
 | Wi-Fi clients on wrong network | Wrong `bridge=` for that SSID in the hostapd config |
-| Backup WAN never takes over | Same route metric on both WANs, or the backup interface is missing from the firewall's WAN rules |
+| Backup WAN never takes over | Same route metric on both WANs (check `ip route`: a comment after `RouteMetric=` silently disables it), or the backup interface is missing from the firewall's WAN rules |
+| Failover never switches back | `rp_filter = 1` drops the watchdog's probe replies on `eth0`: use 2 (section 6) |
 
 Handy capture commands:
 

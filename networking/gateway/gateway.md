@@ -64,7 +64,7 @@ The goal is to reproduce everything a consumer ISP box does, but in a way you ca
 | Approach | Examples | When to pick it |
 |---|---|---|
 | **DIY Linux** (this note) | Debian/Ubuntu + nftables/iptables + dnsmasq | You want to learn and control every piece |
-| **Router OS (Linux)** | OpenWrt, VyOS | Same building blocks, packaged with a UI/CLI. OpenWrt also runs on consumer routers |
+| **Router OS (Linux)** | OpenWrt, VyOS | Same building blocks, packaged with a UI/CLI. OpenWrt also runs on consumer routers ([Networking on OpenWrt](../openwrt/openwrt.md)) |
 | **Router OS (BSD)** | OPNsense, pfSense | Web UI, firewall is `pf` instead of netfilter, many plugins |
 | **ISP box / consumer router** | The box you already have | Zero effort, little control |
 

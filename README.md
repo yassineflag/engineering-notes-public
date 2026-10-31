@@ -18,6 +18,8 @@ Every note aims to be practical, so you'll find configs and commands you can reu
 
 ## Latest notes
 
+- [Networking Fundamentals for Embedded Linux Engineers](networking/fundamentals/fundamentals.md)
+- [Networking on OpenWrt](networking/openwrt/openwrt.md)
 - [Building a Home Gateway on Linux](networking/gateway/gateway.md)
 
 ## Conventions

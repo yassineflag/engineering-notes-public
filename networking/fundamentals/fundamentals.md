@@ -2,7 +2,7 @@
 
 The mental model you need to bring a board onto a network and debug it when it doesn't work: how devices find each other, how packets are addressed and routed, and what DHCP, DNS, TCP, TLS, NAT and firewalls actually do along the way.
 
-This note explains the concepts from the **device's side**. [Building a Home Gateway on Linux](../gateway/gateway.md) applies the same concepts from the **router's side** (VLANs, NAT, firewall rules, dnsmasq), so this note links there instead of repeating the configuration.
+This note explains the concepts from the **device's side**. [Building a Home Gateway on Linux](../gateway/gateway.md) applies the same concepts from the **router's side** (VLANs, NAT, firewall rules, dnsmasq), and [Networking on OpenWrt](../openwrt/openwrt.md) does it with OpenWrt's components (netifd, UCI, firewall4, odhcpd), so this note links there instead of repeating the router configuration.
 
 **Assumptions:** a Linux board with one Ethernet port (`eth0`, or `end0` on systemd-based images), `iproute2` commands (`ip`, `ss`), BusyBox equivalents mentioned where they differ. All addresses come from the example network in section 2.
 
@@ -26,6 +26,7 @@ This note explains the concepts from the **device's side**. [Building a Home Gat
 - [6. Routing and the default gateway](#6-routing-and-the-default-gateway)
 - [7. Getting an address: static, DHCP, link-local](#7-getting-an-address-static-dhcp-link-local)
 - [8. DNS: from name to IP address](#8-dns-from-name-to-ip-address)
+   - [When names don't resolve](#when-names-dont-resolve)
 - [9. TCP and UDP](#9-tcp-and-udp)
 - [10. ICMP: ping, traceroute and MTU](#10-icmp-ping-traceroute-and-mtu)
 - [11. HTTP and HTTPS](#11-http-and-https)
@@ -33,7 +34,9 @@ This note explains the concepts from the **device's side**. [Building a Home Gat
 - [13. Firewalls on the device](#13-firewalls-on-the-device)
 - [14. Putting it together: one HTTPS request, end to end](#14-putting-it-together-one-https-request-end-to-end)
 - [15. Networking on an embedded board](#15-networking-on-an-embedded-board)
+   - [Startup order](#startup-order)
 - [16. Troubleshooting by layer](#16-troubleshooting-by-layer)
+   - [Isolating a fault with packet captures](#isolating-a-fault-with-packet-captures)
 - [17. Not covered here](#17-not-covered-here)
 - [References](#references)
 
@@ -64,6 +67,8 @@ Networking is split into layers. Each layer solves one problem and relies on the
                  └──────── IP packet: at most the MTU (1500 bytes) ───────┘
 ```
 
+The sizes are the usual ones, not fixed: an 802.1Q VLAN tag adds 4 bytes to the Ethernet header, IPv4 and TCP options make those headers longer (TCP timestamps add 12 bytes on most Linux connections), and an IPv6 header is 40 bytes. The MTU of 1500 is the Ethernet default; other links have other values (section 10).
+
 Each device on the path only looks at the layers it needs: a switch reads the Ethernet header, a router reads up to the IP header (a NAT router also rewrites ports), and only the two end hosts read everything. Keep this picture in mind for section 14.
 
 ---
@@ -74,32 +79,40 @@ Every example in this note uses this network. It's the trusted LAN of the [gatew
 
 ```mermaid
 flowchart LR
-    subgraph LAN["LAN 192.168.10.0/24"]
-        laptop["Dev laptop<br/>192.168.10.100"]
-        board["Board, eth0<br/>192.168.10.20"]
-        sw["Switch"]
+    subgraph LAN["LAN 192.168.10.0/24, one broadcast domain"]
+        laptop["Dev laptop<br/>eth0 192.168.10.100"]
+        board["Board<br/>eth0 192.168.10.20"]
+        sw["Switch<br/>forwards frames, no IP address involved"]
     end
-    gw["Gateway<br/>br-lan 192.168.10.1<br/>eth0 203.0.113.10"]
+    subgraph GW["Gateway"]
+        gl["eth1<br/>physical LAN port, no IP"]
+        br["br-lan<br/>logical bridge, 192.168.10.1"]
+        rt{{"IP routing + NAT"}}
+        gw0["eth0<br/>physical WAN port, 203.0.113.10"]
+        gl --- br --- rt --- gw0
+    end
     isp["ISP router<br/>203.0.113.1"]
     inet(("Internet"))
     srv["api.example.com<br/>198.51.100.20"]
 
     laptop --- sw
     board --- sw
-    sw --- gw
-    gw --- isp --- inet --- srv
+    sw --- gl
+    gw0 --- isp --- inet --- srv
 ```
 
 | Device | Interface | MAC | IPv4 | Role |
 |---|---|---|---|---|
 | Board | `eth0` | `00:00:5e:00:53:14` | `192.168.10.20/24` (static DHCP lease) | The embedded device |
 | Dev laptop | `eth0` | `00:00:5e:00:53:64` | `192.168.10.100/24` (DHCP) | SSH, TFTP/NFS server |
-| Gateway, LAN side | `br-lan` | `00:00:5e:00:53:01` | `192.168.10.1/24` | Default gateway, DHCP and DNS server |
-| Gateway, WAN side | `eth0` | `00:00:5e:00:53:02` | `203.0.113.10/24` | Public address, NAT |
+| Gateway, LAN side | `br-lan` (bridge over the physical port `eth1`) | `00:00:5e:00:53:01` | `192.168.10.1/24` | Default gateway, DHCP and DNS server |
+| Gateway, WAN side | `eth0` | `00:00:5e:00:53:02` | `203.0.113.10/24` | Example WAN address standing in for the ISP-assigned public IP. NAT happens here |
 | ISP router | | `00:00:5e:00:53:fe` | `203.0.113.1` | Gateway's next hop |
-| Server | | | `198.51.100.20` | `api.example.com`, HTTPS on port 443 |
+| Server | | | `198.51.100.20` | Example server address for `api.example.com`, HTTPS on port 443 |
 
-The public addresses are documentation ranges (RFC 5737) and the MACs come from the documentation block `00:00:5e:00:53:xx` (RFC 7042), so none of them exist on a real network.
+`203.0.113.0/24` and `198.51.100.0/24` are **reserved for documentation** (RFC 5737): they play the role of public addresses here, but they're never assigned to real hosts. The MACs come from the documentation block `00:00:5e:00:53:xx` (RFC 7042). Replace both with your own values.
+
+**Physical and logical interfaces:** `eth0` on the board and `eth0`/`eth1` on the gateway are **physical** interfaces, each backed by a NIC and its driver. `br-lan` is a **logical** interface created in software (a bridge, section 3); other logical interfaces are VLAN interfaces (`vlan10`), tunnels (`wg0`) and loopback (`lo`). IP addresses belong to an interface, not to a device: the gateway's LAN address sits on `br-lan`, while `eth1` carries frames but has no address. In the [gateway note](../gateway/gateway.md#networks) there's one more layer: `eth1` carries tagged VLANs, and `br-lan` bridges the VLAN interface `vlan10`.
 
 ---
 
@@ -147,13 +160,19 @@ A **switch** forwards frames between its ports at layer 2. It **learns** which M
 - **Known unicast** destination: sent out of one port only.
 - **Broadcast**, **unknown unicast**, and multicast (unless the switch does IGMP snooping): **flooded** out of every port except the one it came in on.
 
-Everything a broadcast reaches is one **broadcast domain**, which is also one IP subnet in practice. Routers separate broadcast domains; VLANs split one physical switch into several of them (see the [gateway note](../gateway/gateway.md#networks) for VLAN, bridge and subnet side by side).
+Three related ideas that are easy to mix up:
+
+- **Broadcast domain** (layer 2): every device a broadcast frame reaches. Switches and bridges extend it; routers stop it.
+- **IP subnet** (layer 3): an address range such as `192.168.10.0/24`. It decides which destinations a host treats as on-link (section 4). It says nothing about cabling.
+- **VLAN** (layer 2): a way to split one switched network into several separate broadcast domains. Ports are assigned to VLANs, and links shared by several VLANs (trunks) mark each frame with an 802.1Q tag.
+
+The usual design maps **one subnet to one VLAN**, as in this note and the gateway note, but it's a convention, not a rule. Two subnets can share one broadcast domain: their hosts receive each other's broadcasts, yet each treats the other subnet as off-link and goes through a router. That's sometimes done on purpose (migrations, a second address range), and sometimes by accident (a board with a wrong static address still "sees" the LAN's ARP traffic but can't talk to anything). The [gateway note](../gateway/gateway.md#networks) puts VLAN, bridge and subnet side by side.
 
 A Linux **bridge** is a software switch: same learning and flooding, between network interfaces of one machine. On embedded devices you meet it when:
 
 - A Wi-Fi access point joins the wired LAN (`wlan0` and `eth0` in one bridge, like the gateway's `br-lan`).
 - A board has two Ethernet ports and must pass traffic through (daisy-chained industrial devices).
-- A switch chip sits behind the SoC (most routers, some industrial boards): with the kernel's **DSA** (Distributed Switch Architecture) driver, each front port shows up as its own interface (`lan1`, `lan2`...), and you group them with a bridge. OpenWrt routers work this way.
+- A switch chip sits behind the SoC (most routers, some industrial boards): with the kernel's **DSA** (Distributed Switch Architecture) driver, each front port shows up as its own interface (`lan1`, `lan2`...), and you group them with a bridge. Most current OpenWrt routers work this way (the [OpenWrt note](../openwrt/openwrt.md#bridges-routed-interfaces-and-vlans) covers bridges and VLANs there).
 
 ```bash
 ip link add name br0 type bridge
@@ -231,7 +250,7 @@ Common prefix lengths:
 |---|---|---|
 | `10.0.0.0/8`, `172.16.0.0/12`, `192.168.0.0/16` | Private (RFC 1918), not routed on the internet | Every LAN, behind NAT (section 12) |
 | `127.0.0.0/8` | Loopback (`lo`) | Services reachable only from the device itself |
-| `169.254.0.0/16` | IPv4 link-local (RFC 3927), self-assigned when there's no DHCP | Laptop cabled directly to a board. Means "DHCP failed" on most hosts |
+| `169.254.0.0/16` | IPv4 link-local (RFC 3927), self-assigned when there's no DHCP | Laptop cabled directly to a board. On Windows and macOS (and Linux hosts running a link-local client), it means "DHCP failed" |
 | `100.64.0.0/10` | Shared address space for carrier-grade NAT (RFC 6598) | Cellular modems, Starlink: you are behind someone else's NAT |
 | `192.0.2.0/24`, `198.51.100.0/24`, `203.0.113.0/24` | Documentation (RFC 5737) | Examples, like this note |
 | `224.0.0.0/4` | Multicast | mDNS (`224.0.0.251`), streaming, discovery protocols |
@@ -244,21 +263,41 @@ IPv6 uses the same layers with different mechanisms. What changes for a device:
 | | IPv4 | IPv6 |
 |---|---|---|
 | Address size | 32 bits | 128 bits, written `2001:db8:10::20` |
-| LAN prefix | Anything, `/24` is common | Always `/64` |
-| Link-local address | Optional (`169.254/16`) | **Always present** on every interface (`fe80::/10`) |
+| LAN prefix | Anything, `/24` is common | `/64` on ordinary LANs, because SLAAC needs it. Other lengths exist for other designs (e.g. `/127` on router-to-router links, RFC 6164) |
+| Link-local address | Optional (`169.254/16`) | Created automatically (`fe80::/10`) on every interface where IPv6 is enabled. Can be turned off (`disable_ipv6`, `addr_gen_mode`) |
 | IP to MAC | ARP | Neighbor Discovery (NDP), carried by ICMPv6 |
-| Getting an address | DHCP or static | SLAAC from router advertisements, and/or DHCPv6 |
+| Getting an address | DHCP or static | SLAAC from Router Advertisements, and/or DHCPv6, or static |
+| Default gateway | DHCP option 3, or static | **Router Advertisements**. DHCPv6 has no default-router option |
 | Broadcast | Yes | No, multicast instead (`ff02::1` = all nodes on the link) |
 | NAT | Almost always at home | Normally none: the firewall does the protection |
 
-Because link-local addresses always exist, IPv6 is a handy rescue path to a board whose IPv4 config is broken:
+The three mechanisms that configure an IPv6 host, and what each one provides:
+
+| Mechanism | Provides |
+|---|---|
+| **RA** (Router Advertisement, ICMPv6, sent by routers from their `fe80::` address) | The **default router** (the RA's source address, with a lifetime), on-link prefixes, flags telling hosts whether to use SLAAC and/or DHCPv6, optionally DNS servers (RDNSS, RFC 8106) |
+| **SLAAC** | The host builds its own global address from an RA prefix (a `/64`) |
+| **DHCPv6** | Addresses (stateful mode) and/or other settings such as DNS servers. Never the default route |
 
 ```bash
-ping -6 -c 2 ff02::1%eth0          # from the laptop: every IPv6 host on that link answers with its fe80:: address
-ssh root@fe80::200:5eff:fe00:5314%eth0   # %eth0 says which link: link-local addresses are only unique per link
+$ ip -6 route show default
+default via fe80::200:5eff:fe00:5301 dev eth0 proto ra metric 1024 expires 1795sec pref medium
+ip -6 addr show dev eth0       # fe80:: (scope link) and, with SLAAC, a global address (scope global)
 ```
 
-Blocking ICMPv6 breaks IPv6 entirely. The gateway note covers [IPv6 on the router side](../gateway/gateway.md#ipv6-in-short) (prefix delegation, RAs).
+A missing IPv6 default route therefore means "no RA received or accepted", not a DHCPv6 problem. On a Linux host either the kernel processes RAs (`accept_ra=1`, and only while `forwarding=0`) or the network manager does it in user space (systemd-networkd, for example). The gateway note covers [IPv6 on the router side](../gateway/gateway.md#ipv6-in-short) (prefix delegation, sending RAs), the OpenWrt note [does it with odhcpd](../openwrt/openwrt.md#7-ipv6). Blocking ICMPv6 breaks IPv6 entirely, because RAs and Neighbor Discovery both use it.
+
+**Link-local as a rescue path:** with IPv6 enabled, a board whose IPv4 config is broken still has a link-local address, and you can reach it from a laptop on the same link:
+
+```bash
+ping -c 2 fe80::200:5eff:fe00:5314%eth0        # targeted test of a known peer. %eth0: which link (link-local is only unique per link)
+ssh root@fe80::200:5eff:fe00:5314%eth0
+ip -6 neigh show dev eth0                      # IPv6 neighbors the laptop has seen recently
+ping -6 -c 2 ff02::1%eth0                      # discovery attempt: echo request to all nodes on the link
+```
+
+- The board's link-local address above is derived from its MAC (EUI-64, the kernel default). With stable-privacy addressing (`addr_gen_mode` 2 or 3, chosen by some network managers) it can't be guessed: read it once with `ip -6 addr` on the serial console.
+- `ff02::1` is a **discovery attempt, not a census**. Only hosts that answer multicast echo requests reply (Linux does by default, `net.ipv6.icmp.echo_ignore_multicast=0`; many other systems and firewalls don't). Silence from a host proves nothing: test it directly by address.
 
 ---
 
@@ -269,12 +308,12 @@ To send a packet to an **on-link** IP address, the kernel needs that host's MAC 
 ```mermaid
 sequenceDiagram
     participant B as Board 192.168.10.20
-    participant S as Switch
     participant L as Laptop 192.168.10.100
-    participant G as Gateway 192.168.10.1
-    B->>S: ARP request to ff:ff:ff:ff:ff:ff "who has 192.168.10.1? tell 192.168.10.20"
-    S->>L: flooded (not its address, ignored)
-    S->>G: flooded
+    participant G as Gateway br-lan 192.168.10.1
+    Note over B,G: All three are on the same switch. It floods the broadcast frame to every port and forwards the unicast reply by MAC, without reading the ARP inside
+    B-)L: ARP request, broadcast to ff:ff:ff:ff:ff:ff "who has 192.168.10.1? tell 192.168.10.20"
+    B-)G: the same broadcast frame
+    Note over L: not its address, ignored
     G->>B: ARP reply, unicast "192.168.10.1 is at 00:00:5e:00:53:01"
     Note over B: stores the answer in the neighbor table
     B->>G: IP packet in a frame addressed to 00:00:5e:00:53:01
@@ -289,7 +328,7 @@ $ ip neigh show dev eth0
 192.168.10.77 FAILED
 
 ip neigh flush dev eth0                 # forget everything, force new ARP requests
-arping -I eth0 -c 3 192.168.10.1        # ARP-level ping: answers even if the host firewalls ICMP
+arping -I eth0 -c 3 192.168.10.1        # ARP-level ping: usually answers even when the host's IP firewall drops ICMP
 arping -D -I eth0 -c 3 192.168.10.20    # duplicate address detection: any reply means another device already uses this IP
 ```
 
@@ -298,7 +337,15 @@ arping -D -I eth0 -c 3 192.168.10.20    # duplicate address detection: any reply
 | `REACHABLE` | Confirmed recently |
 | `STALE` | Not confirmed recently, still used. Re-checked on next use |
 | `INCOMPLETE` | Request sent, no answer yet |
-| `FAILED` | No answer: host off, wrong subnet, wrong VLAN, cabling. A layer 2 problem, not a firewall one |
+| `FAILED` | Resolution failed: no reply to repeated requests (see below) |
+
+`FAILED` says that neighbor resolution didn't succeed, not why. The usual suspects, roughly in order:
+
+- **Layer 2 path:** target off or unplugged, wrong switch port, wrong VLAN on either side, a bridge port that isn't forwarding.
+- **Addressing:** a wrong IP or prefix on either end, so the target doesn't consider the request for itself, or replies to a different address.
+- **Filtering:** ARP isn't seen by the IP firewall (`inet` tables), but it can be dropped by `arp`- or `bridge`-family nftables rules, `arptables`, Wi-Fi client isolation, or switch port security.
+
+To narrow it down, capture on both ends: `tcpdump -eni eth0 arp`. Requests leaving the board but never arriving on the target point to the path; requests arriving with no reply point to the target's addressing or filtering.
 
 A **gratuitous ARP** is a host announcing its own IP/MAC pair unprompted (after boot, IP change, or failover), so other hosts update their tables. IPv6 does the same job with Neighbor Solicitation/Advertisement messages (`ip -6 neigh`).
 
@@ -306,7 +353,11 @@ A **gratuitous ARP** is a host announcing its own IP/MAC pair unprompted (after 
 
 ## 6. Routing and the default gateway
 
-Every IP packet leaving the board goes through a **route lookup**. The kernel picks the route with the **longest matching prefix**; when two routes match equally, the **lowest metric** wins.
+**Concept:** a routing table maps destination prefixes to a next step: "deliver directly on this interface" or "hand to this router". Every host has one, not only routers.
+
+**Behavior:** every IP packet leaving the board goes through a **route lookup**. The kernel picks the route with the **longest matching prefix**; among routes with the same prefix, the **lowest metric** wins.
+
+**Linux view:** strictly, Linux first walks its **policy rules** (`ip rule`), and each rule points to a routing table. On a plain device the only rules lead to the `local` table (the device's own addresses), then `main` (what `ip route` shows), then `default` (empty), so the main table is what matters. Extra rules and tables appear when something sets up policy routing (multiple uplinks, VPNs, containers).
 
 ```bash
 $ ip route
@@ -325,7 +376,7 @@ $ ip route get 192.168.10.100       # on-link: delivered directly
 
 ```mermaid
 flowchart TD
-    A["Packet to destination D"] --> B{"Longest prefix in the routing table matching D?"}
+    A["Packet to destination D"] --> B{"Longest prefix in the main table matching D?<br/>(simplified: no policy rules)"}
     B -->|"192.168.10.0/24 dev eth0 (on-link)"| C["ARP for D itself"]
     B -->|"default via 192.168.10.1"| E["ARP for the gateway 192.168.10.1"]
     B -->|"no route at all"| F["Error: Network is unreachable"]
@@ -342,9 +393,21 @@ ip route add 10.8.0.0/24 via 192.168.10.5
 ip route del 10.8.0.0/24
 ```
 
-**Several interfaces** (Ethernet + cellular `wwan0`, or Ethernet + USB gadget `usb0`) is where embedded routing usually goes wrong:
+**Several interfaces** (Ethernet + cellular `wwan0`, or Ethernet + USB gadget `usb0`) is where embedded routing usually goes wrong. Each interface's DHCP client or modem manager may install its own default route:
 
-- Two DHCP clients each install a default route. Without different metrics, the result depends on which one came up last. Give the preferred uplink the lower metric (the gateway note's [failover section](../gateway/gateway.md#failover) shows the pattern).
+```bash
+$ ip route show default
+default via 192.168.10.1 dev eth0 proto dhcp metric 100
+default via 100.64.0.1 dev wwan0 proto static metric 700
+
+ip route get 198.51.100.20             # the route the kernel actually picks: eth0 (metric 100)
+ip route get 198.51.100.20 oif wwan0   # what would happen if the traffic were forced out of wwan0
+ip rule                                # any policy rules besides local/main/default?
+```
+
+- **Metrics decide, not installation order.** For routes with the same prefix in the same table, the lowest metric wins. Each network manager picks its own defaults (NetworkManager uses 100 for Ethernet, 600 for Wi-Fi and 700 for modems; systemd-networkd uses 1024 for DHCP routes unless `RouteMetric=` is set; a BusyBox `udhcpc` script uses whatever it was written to use). If two default routes end up with the same metric, the outcome depends on how they were installed, so don't rely on it: give each uplink a distinct metric and check with `ip route get`.
+- **A metric only orders routes that exist.** When `eth0` loses carrier, most network managers remove its routes and the backup takes over. The kernel alone keeps the route, marked `linkdown`, unless `net.ipv4.conf.all.ignore_routes_with_linkdown=1`. If `eth0` keeps its link but the upstream is dead, nothing changes and traffic is lost: detecting that needs an explicit failover mechanism (the gateway note's [failover section](../gateway/gateway.md#failover) shows the principle and its limits).
+- **Choosing an interface per traffic type** (management over `eth0`, telemetry over `wwan0`, replies leaving through the interface they arrived on) is beyond metrics: it needs **policy routing**, with `ip rule` sending matching traffic to a separate table. The gateway note has a [short example](../gateway/gateway.md#4-quick-start-everything-by-hand).
 - A point-to-point link to the laptop (`usb0`, section 15) must not install a default route at all, or internet traffic goes to the laptop.
 
 **Host or router:** a board only forwards packets that aren't addressed to it if `net.ipv4.ip_forward=1`. By default it's a host and drops them. Turning a board into a router is what the gateway note does.
@@ -357,7 +420,7 @@ ip route del 10.8.0.0/24
 |---|---|---|
 | **DHCP** | A server hands out address, prefix, gateway, DNS, lease time | Default for devices. Pair it with a **static lease** on the server (by MAC) if the device needs a fixed address |
 | **Static** | Configured on the device | Point-to-point links, isolated test benches, the DHCP server itself |
-| **Link-local** | Self-assigned `169.254.x.y` (IPv4) or `fe80::` (IPv6, always) | Direct cable to a laptop with no DHCP server |
+| **Link-local** | Self-assigned `169.254.x.y` (IPv4), or `fe80::` (IPv6, automatic wherever IPv6 is enabled) | Direct cable to a laptop with no DHCP server |
 | **Kernel `ip=`** | Kernel command line, configured before user space starts | NFS root (section 15) |
 
 ### DHCP
@@ -377,16 +440,18 @@ sequenceDiagram
     Note over B,D: at 87.5 percent (T2), broadcast REQUEST to any server
 ```
 
-If the lease expires without renewal, the client must stop using the address. Because the client has no IP when it starts, DHCP clients send and receive through raw packet sockets: the kernel needs `CONFIG_PACKET`.
+If the lease expires without renewal, the client must stop using the address.
 
-On embedded systems, check **who** runs DHCP, because they don't behave the same:
+**Linux view:** because the client has no IP address at first, Linux DHCP clients use a **packet socket** (`AF_PACKET`) at least for the initial exchange, so the kernel needs `CONFIG_PACKET`. Packet sockets get their copy of incoming frames before the IP firewall's input hook, so the first lease can work even when the firewall would drop the replies. **Renewals** are unicast UDP between the server and the client's new address, and some clients receive them on an ordinary UDP socket, which the firewall does filter. That's why a board can get its first lease and then lose its address at renewal time (section 13).
 
-| Client | Found in | Note |
+On embedded systems, check **who** runs DHCP, because they don't behave the same. Which client is present depends on the image configuration, not on Buildroot or Yocto as such; these are common cases:
+
+| Client | Commonly found in | Note |
 |---|---|---|
-| BusyBox `udhcpc` | Buildroot default, minimal images, OpenWrt (driven by netifd) | Doesn't configure anything itself: it calls a script (`/usr/share/udhcpc/default.script`) with `deconfig`/`bound`/`renew`, and the **script** sets the IP, routes and `resolv.conf`. No script, no configuration |
-| `dhcpcd` | Buildroot option, many distros | Full client, configures the interface itself |
-| systemd-networkd | Yocto/Debian images with systemd | `DHCP=yes` in a `.network` file |
-| NetworkManager, ConnMan | Desktop-like and Yocto images (`core-image-sato` uses ConnMan) | Full managers, also handle Wi-Fi and cellular |
+| BusyBox `udhcpc` | Buildroot images using ifupdown (the default unless systemd-networkd or netifrc is selected) with `BR2_SYSTEM_DHCP` set, minimal images, OpenWrt (driven by netifd) | Doesn't configure anything itself: it calls a script (`/usr/share/udhcpc/default.script`) with `deconfig`/`bound`/`renew`, and the **script** sets the IP, routes and `resolv.conf`. No script, no configuration |
+| `dhcpcd` | Buildroot package option, many distros | Full client, configures the interface itself |
+| systemd-networkd | Images built with systemd and networkd enabled (Buildroot, Yocto, Debian) | `DHCP=yes` in a `.network` file |
+| NetworkManager, ConnMan | Desktop-like images, Yocto images that include them (Poky's `core-image-sato` uses ConnMan) | Full managers, also handle Wi-Fi and cellular |
 
 ```bash
 udhcpc -i eth0 -f -q                       # BusyBox: get a lease in the foreground, then exit
@@ -404,7 +469,7 @@ ip route add default via 192.168.10.1
 echo "nameserver 192.168.10.1" > /etc/resolv.conf
 ```
 
-Persistent, BusyBox/Debian `ifupdown` (`/etc/network/interfaces`, the Buildroot default). BusyBox `ifup` doesn't manage DNS, so `resolv.conf` stays separate:
+Persistent, BusyBox/Debian `ifupdown` (`/etc/network/interfaces`, which Buildroot generates unless systemd-networkd or netifrc is selected). BusyBox `ifup` doesn't manage DNS, so `resolv.conf` stays separate:
 
 ```
 auto eth0
@@ -455,6 +520,8 @@ sequenceDiagram
     C->>A: 198.51.100.20
 ```
 
+The board only ever talks to the resolver in `resolv.conf`: it sends a **recursive** query ("give me the final answer") and never contacts the authoritative servers itself. The resolvers do the iterative work, and each one caches the answer, so most lookups end at the first hop.
+
 | Record | Maps | Example |
 |---|---|---|
 | `A` | Name to IPv4 | `api.example.com A 198.51.100.20` |
@@ -475,9 +542,24 @@ Files on the device:
 Embedded specifics:
 
 - **Read-only root filesystem:** `/etc/resolv.conf` is usually a symlink to a writable location. Buildroot links it to `/run/resolv.conf`, systemd-resolved to `/run/systemd/resolve/stub-resolv.conf` (nameserver `127.0.0.53`, a local stub that forwards to the real servers).
-- **"Ping by IP works, by name doesn't"** is always DNS: check `resolv.conf` first.
-- **Test with the same path the application uses.** `getent hosts api.example.com` goes through the C library (glibc systems). `nslookup` (BusyBox) and `dig` talk to the DNS server directly and skip `/etc/hosts` and NSS.
 - **mDNS** (`board.local`): multicast DNS on UDP port 5353 to `224.0.0.251` (RFC 6762) lets hosts on one link find each other without a DNS server. Run `avahi-daemon` (or systemd-resolved with `MulticastDNS=yes`) on the board and most desktops can `ssh root@board.local`, whatever its DHCP address.
+
+### When names don't resolve
+
+"Ping by IP works, by name doesn't" points to **name resolution**, which is broader than DNS. The cause can be a stale `/etc/hosts` entry, the NSS lookup order (glibc), a missing or wrong `nameserver`, a `search` domain appended to a short name, or a DNS server that isn't reachable. Follow the path the application uses, from the device outward:
+
+```bash
+getent hosts api.example.com            # same path as the application (glibc: NSS order, /etc/hosts, DNS)
+grep '^hosts' /etc/nsswitch.conf        # glibc lookup order, e.g. "files dns" or "files resolve dns"
+grep api.example.com /etc/hosts         # an entry here wins over DNS
+cat /etc/resolv.conf                    # nameserver, search, options (ndots decides when search domains apply)
+nslookup api.example.com 192.168.10.1   # ask the DNS server directly, bypassing /etc/hosts and NSS
+```
+
+- `getent` fails but `nslookup` works: the problem is local (`/etc/hosts`, NSS, `resolv.conf`, search domains).
+- Both fail: check that the server answers at all (route, firewall, UDP and TCP port 53), then the upstream resolvers.
+- `getent` isn't available on musl or minimal BusyBox images. There, `ping api.example.com` or the application's own error message is the closest test of the real path.
+- A successful lookup only proves resolution. The application still has to reach the address it got, which might be an IPv6 address on a board without IPv6 connectivity, or a stale address from a cache.
 
 ---
 
@@ -596,7 +678,7 @@ Content-Length: 15
 
 The `Host` header is what lets one server IP host many sites. HTTP/2 keeps the same requests in a binary, multiplexed form over one TCP connection; HTTP/3 moves to QUIC over UDP.
 
-**HTTPS** is HTTP inside **TLS**, on port 443. TLS gives encryption, integrity, and **authentication of the server** through its certificate. TLS 1.3 adds one round trip after the TCP handshake:
+**HTTPS** is HTTP inside **TLS**, on port 443. TLS gives encryption, integrity, and **authentication of the server** through its certificate. The TLS handshake is a separate step that starts only once the TCP handshake (section 9) has completed, so TCP can succeed and TLS still fail. TLS 1.3 adds one round trip:
 
 ```mermaid
 sequenceDiagram
@@ -631,7 +713,7 @@ TLS libraries you'll find on devices: OpenSSL, mbedTLS, wolfSSL. They differ in 
 
 ## 12. NAT
 
-The board's `192.168.10.20` is private: internet routers don't know where it is. The gateway does **source NAT** (masquerade on Linux): it rewrites the source address of outgoing packets to its own public address, and remembers the mapping in its **connection tracking** table so it can rewrite replies back:
+The board's `192.168.10.20` is private: internet routers don't know where it is. The gateway does **source NAT** (masquerade on Linux): it rewrites the source address of outgoing packets to its own WAN address (`203.0.113.10`, standing in for the ISP-assigned public IP), and remembers the mapping in its **connection tracking** table so it can rewrite replies back:
 
 ```mermaid
 sequenceDiagram
@@ -687,7 +769,7 @@ table inet filter {
         # ICMP and ICMPv6: ping, errors, path MTU, IPv6 neighbor discovery
         meta l4proto { icmp, ipv6-icmp } accept
 
-        # DHCP client: server replies (renewals can arrive as broadcast)
+        # DHCPv4 client: server replies, needed at least for renewals (see below)
         udp sport 67 udp dport 68 accept
 
         # mDNS, so the board answers as board.local
@@ -710,6 +792,13 @@ nft -f /etc/nftables.conf       # apply (from the console the first time: a mist
 nft list ruleset
 ```
 
+**About the DHCP rule:** it's an example for this board (one DHCPv4 client on `eth0`), not a universal DHCP policy. What a firewall must allow depends on the exchange and the client:
+
+- The first lease usually arrives through the client's packet socket, which sees frames before the input hook (section 7), so it can work with no rule at all. Renewals are unicast replies to the board's address, and clients that receive them on a UDP socket need this rule. Without it, the board works for half a lease, then loses its address.
+- The rule doesn't match the server's address, because it can change (another DHCP server, a failover pair). Restrict it with `iifname "eth0"` if the board has other interfaces.
+- DHCPv6 is different: replies from `fe80::/10`, UDP 547 → 546 (see the [gateway note's input chain](../gateway/gateway.md#method-1-nftables-recommended)). RAs and SLAAC are covered by the ICMPv6 rule.
+- Test with the firewall active: get a lease, then force a renewal (BusyBox `udhcpc` renews on `SIGUSR1`, or shorten the lease on the server) and check the address is still there.
+
 Embedded caveats:
 
 - The kernel must have nftables built in or as modules (`CONFIG_NF_TABLES`, `CONFIG_NF_TABLES_INET`, `CONFIG_NFT_CT`). Check with `zcat /proc/config.gz | grep NF_TABLES` (needs `CONFIG_IKCONFIG_PROC`). Older BSPs may only have legacy iptables.
@@ -725,7 +814,7 @@ The board runs `curl https://api.example.com/v1/status` with empty caches. Every
 sequenceDiagram
     autonumber
     participant B as Board 192.168.10.20
-    participant G as Gateway 192.168.10.1 / 203.0.113.10
+    participant G as Gateway (br-lan 192.168.10.1, eth0 203.0.113.10)
     participant S as api.example.com 198.51.100.20
     Note over B: DNS server 192.168.10.1 (resolv.conf) is on-link
     B->>G: ARP who has 192.168.10.1
@@ -733,27 +822,41 @@ sequenceDiagram
     B->>G: DNS query A api.example.com, UDP 53
     G->>B: DNS answer 198.51.100.20 (from cache or upstream)
     Note over B: route lookup for 198.51.100.20 gives default via 192.168.10.1, gateway MAC already known
-    B->>G: TCP SYN to 198.51.100.20 port 443, frame to the gateway's MAC
-    G->>S: SYN forwarded, source NATed to 203.0.113.10
-    S->>G: SYN-ACK
-    G->>B: SYN-ACK, destination translated back to 192.168.10.20
-    B->>S: ACK, then TLS handshake (through the gateway)
-    B->>S: GET /v1/status (encrypted)
-    S->>B: 200 OK (encrypted)
+    B->>G: TCP SYN to 198.51.100.20 port 443, in a frame to the gateway's MAC
+    Note over G: forward: route lookup (default via 203.0.113.1), source NAT to 203.0.113.10, new frame on eth0
+    G->>S: SYN
+    S->>G: SYN-ACK to 203.0.113.10
+    Note over G: return path: conntrack match, destination back to 192.168.10.20, new frame on br-lan
+    G->>B: SYN-ACK
+    B->>G: ACK
+    G->>S: ACK
+    Note over B,S: TCP is up. The TLS handshake, GET /v1/status and the 200 OK follow the same path, every packet forwarded and translated by the gateway in both directions
 ```
 
-What the headers look like on each link for the SYN (the ISP router and internet routers are left out of the diagram, but they forward it the same way):
+What the headers look like on each link (the ISP router and internet routers are left out of the diagram, but they forward packets the same way, minus NAT):
 
 | Link | Src MAC | Dst MAC | Src IP : port | Dst IP : port | TTL |
 |---|---|---|---|---|---|
-| Board → gateway (LAN) | `00:00:5e:00:53:14` board | `00:00:5e:00:53:01` gateway `br-lan` | `192.168.10.20:41234` | `198.51.100.20:443` | 64 |
-| Gateway → ISP router (WAN) | `00:00:5e:00:53:02` gateway `eth0` | `00:00:5e:00:53:fe` ISP router | `203.0.113.10:41234` | `198.51.100.20:443` | 63 |
-| Last router → server | that router | the server | `203.0.113.10:41234` | `198.51.100.20:443` | 64 minus hop count |
+| SYN, board → gateway (LAN) | `00:00:5e:00:53:14` board | `00:00:5e:00:53:01` gateway `br-lan` | `192.168.10.20:41234` | `198.51.100.20:443` | 64 |
+| SYN, gateway → ISP router (WAN) | `00:00:5e:00:53:02` gateway `eth0` | `00:00:5e:00:53:fe` ISP router | `203.0.113.10:41234` | `198.51.100.20:443` | 63 |
+| SYN, last router → server | that router | the server | `203.0.113.10:41234` | `198.51.100.20:443` | 64 minus hop count |
+| SYN-ACK, gateway → board (LAN) | `00:00:5e:00:53:01` gateway `br-lan` | `00:00:5e:00:53:14` board | `198.51.100.20:443` | `192.168.10.20:41234` | server's initial TTL minus hops |
+
+The same packet, as it crosses the gateway:
+
+```
+ LAN link (br-lan)                                   WAN link (eth0)
+┌──────────────────────────────────┐   gateway   ┌──────────────────────────────────┐
+│ MAC 00:00:5e:00:53:14 → ...53:01 │  new frame  │ MAC 00:00:5e:00:53:02 → ...53:fe │  MACs: replaced
+│ IP  192.168.10.20 → 198.51.100.20│ ──────────► │ IP  203.0.113.10 → 198.51.100.20 │  IP src: NAT
+│ TCP 41234 → 443, TTL 64          │             │ TCP 41234 → 443, TTL 63          │  TTL: minus 1
+└──────────────────────────────────┘             └──────────────────────────────────┘
+```
 
 Three things to take away:
 
 1. **MAC addresses are per link.** Every router builds a new Ethernet frame for the next link, after its own route lookup and ARP.
-2. **IP addresses are end to end.** Only NAT changes them, here once, at the gateway.
+2. **IP addresses normally stay the same end to end.** Here NAT changes the source once, at the gateway. Other mechanisms (proxies, tunnels, load balancers) can change them too; plain routers don't.
 3. **The TTL goes down by one at every router.** That's how `traceroute` works, and why a routing loop eventually dies out.
 
 And the debugging consequence: if this request fails, it fails at one of these numbered steps, and each one can be checked separately (section 16).
@@ -764,7 +867,7 @@ And the debugging consequence: if this request fails, it fails at one of these n
 
 ### Kernel configuration
 
-A minimal kernel config may lack things a desktop kernel always has:
+A minimal kernel config may lack things a desktop distribution kernel normally has:
 
 | Option | Needed for |
 |---|---|
@@ -777,16 +880,34 @@ A minimal kernel config may lack things a desktop kernel always has:
 
 ### Who configures the network
 
-Exactly **one** tool should own each interface (same rule as on the [gateway](../gateway/gateway.md#who-does-what-on-the-gateway)). Find out which one your image uses before changing anything:
+Exactly **one** tool should own each interface (same rule as on the [gateway](../gateway/gateway.md#who-does-what-on-the-gateway)). Buildroot and Yocto install whatever the configuration selects, so there's no single default. These are common combinations, each with its assumption:
 
-| Image | Usual network manager | Config |
+| Image (assumption) | Network manager | Config |
 |---|---|---|
-| Buildroot (default) | BusyBox `ifupdown` + `udhcpc` | `/etc/network/interfaces` |
-| Buildroot / Yocto with systemd | systemd-networkd | `/etc/systemd/network/*.network` |
-| Yocto, sysvinit images | `ifupdown` (`init-ifupdown` recipe) | `/etc/network/interfaces` |
-| Yocto, `core-image-sato` and similar | ConnMan | `connmanctl` |
-| Debian-based images (Raspberry Pi OS...) | NetworkManager | `nmcli` |
-| OpenWrt | netifd | `/etc/config/network` (UCI) |
+| Buildroot, default skeleton without systemd-networkd or netifrc | BusyBox (or standalone) `ifupdown` + `udhcpc` | `/etc/network/interfaces` |
+| Buildroot or Yocto, systemd with networkd enabled | systemd-networkd | `/etc/systemd/network/*.network` |
+| Yocto, sysvinit image with `init-ifupdown` | `ifupdown` | `/etc/network/interfaces` |
+| Yocto image that includes ConnMan (e.g. Poky's `core-image-sato`) | ConnMan | `connmanctl` |
+| Debian-based images (Raspberry Pi OS since Bookworm...) | NetworkManager | `nmcli` |
+| OpenWrt | netifd | `/etc/config/network` (UCI), see the [OpenWrt note](../openwrt/openwrt.md#3-linux-networking-the-openwrt-way) |
+
+Check what actually runs on the board before changing anything:
+
+```bash
+ps | grep -E 'udhcpc|dhcpcd|networkd|NetworkManager|connman|netifd' | grep -v grep
+ls -d /etc/network/interfaces /etc/systemd/network /etc/NetworkManager /etc/config/network 2>/dev/null
+```
+
+### Startup order
+
+On a board, the application often starts within a second of the network stack. At that moment the interface may have no carrier or lease yet, `resolv.conf` may still be empty, and the clock may still read 1970 until NTP syncs. Typical symptoms: the first connection fails with `Network is unreachable`, `Temporary failure in name resolution` or a TLS `certificate is not yet valid`, then works on retry or after a restart.
+
+Handle it in two places:
+
+- **In the application:** retry with backoff. It's needed anyway, because links come and go at runtime (cellular, Wi-Fi, a cable pulled).
+- **In the init system:** order the service after what it needs. With systemd: `network-online.target` (backed by `systemd-networkd-wait-online` or `NetworkManager-wait-online`) and `time-sync.target` (with `systemd-time-wait-sync` enabled). BusyBox and SysV init scripts have no such targets and need explicit waits.
+
+The details belong in a boot and init note.
 
 ### Interface names
 
@@ -823,18 +944,29 @@ Work **bottom-up**: a DNS error means nothing if the cable is unplugged. Each st
 
 ```mermaid
 flowchart TD
-    L1["ip -br link<br/>eth0 UP and LOWER_UP?"] -->|no| L1x["Cable, switch port, PHY, driver, device tree<br/>ethtool eth0, dmesg"]
+    L1["ip -br link<br/>eth0 UP and LOWER_UP?"] -->|no| L1x["Likely: cable, switch port, PHY, driver, device tree<br/>ethtool eth0, dmesg"]
     L1 -->|yes| L3["ip -br addr<br/>expected IP and prefix?"]
-    L3 -->|no| L3x["DHCP client running and configuring?<br/>tcpdump port 67 or port 68"]
+    L3 -->|no| L3x["Likely: DHCP client missing, not configuring, or filtered<br/>tcpdump port 67 or port 68"]
     L3 -->|yes| GW["ping 192.168.10.1<br/>gateway reachable?"]
-    GW -->|no| GWx["ip neigh: FAILED?<br/>wrong subnet, VLAN, duplicate IP"]
+    GW -->|no| GWx["Likely: ip neigh FAILED, wrong subnet or VLAN,<br/>duplicate IP, ICMP filtered (try arping)"]
     GW -->|yes| NET["ping 1.1.1.1<br/>internet by IP?"]
-    NET -->|no| NETx["ip route: default route?<br/>gateway forwarding and NAT"]
+    NET -->|no| NETx["Likely: no default route, wrong metric,<br/>gateway forwarding or NAT, ICMP filtered upstream"]
     NET -->|yes| DNS["getent hosts api.example.com<br/>name resolves?"]
-    DNS -->|no| DNSx["Check resolv.conf<br/>DNS server reachable on port 53?"]
+    DNS -->|no| DNSx["Likely: hosts, NSS, resolv.conf, search domain,<br/>DNS server unreachable (section 8)"]
     DNS -->|yes| APP["curl -v https://api.example.com"]
-    APP -->|fails| APPx["Refused or timeout: port, firewall<br/>TLS: date, CA bundle, hostname"]
+    APP -->|fails| APPx["Likely: refused or timeout (port, firewall),<br/>TLS (date, CA bundle, hostname), HTTP error"]
 ```
+
+The branches list **likely** causes, not certain ones: a check that fails at one layer can be caused by something at another (a firewall dropping ICMP makes a working gateway look unreachable). Each passing check, likewise, proves only its own step:
+
+| Passing check | Proves | Doesn't prove |
+|---|---|---|
+| `ping 198.51.100.20` | IP path works both ways, for ICMP | That TCP to the service port is allowed |
+| `nc -vz 198.51.100.20 443` | The TCP handshake completes | That TLS succeeds: clock, CA bundle, hostname |
+| `openssl s_client -connect api.example.com:443 -servername api.example.com` | TLS handshake and certificate verification (check `Verify return code: 0 (ok)`) | That the HTTP request is accepted |
+| `curl -v https://api.example.com/v1/status` returns `200` | The HTTP exchange works | That the payload is what the application expects (API version, authentication, content) |
+
+So "the network works" isn't one fact: a board can ping the server and still fail at TCP, TLS, HTTP or in the application itself.
 
 | Layer | Question | Command | BusyBox |
 |---|---|---|---|
@@ -846,7 +978,20 @@ flowchart TD
 | Application | Does the protocol work? | `curl -v`, `openssl s_client` | `wget` |
 | Any | What is actually on the wire? | `tcpdump -ni eth0 -e host 198.51.100.20` | Install `tcpdump` |
 
-`tcpdump` settles arguments: if the request leaves the board and no answer comes back, the problem is not on the board. The gateway note has the [router-side debug order](../gateway/gateway.md#how-a-packet-crosses-the-gateway) and a [symptom table](../gateway/gateway.md#14-troubleshooting).
+### Isolating a fault with packet captures
+
+A capture shows what one interface sent and received, nothing more. Seeing the request leave `eth0` with no reply doesn't clear the board: the frame may carry a wrong destination MAC or source address, the gateway may drop it, or the reply may come back and be dropped on the board itself. On Linux, `tcpdump` sees incoming packets **before** the input firewall and `rp_filter`, so a reply visible in the capture can still be discarded before it reaches the application. Outgoing packets dropped by the board's own output rules never appear.
+
+Capture at several points along the path, at the same time, and compare:
+
+| Capture point | Command | If the packet is missing here (but seen at the previous point) |
+|---|---|---|
+| 1. Board `eth0` | `tcpdump -eni eth0 host 198.51.100.20` | Never left: application, local routing, output filtering |
+| 2. Gateway LAN `br-lan` | `tcpdump -eni br-lan host 192.168.10.20` | Lost on the LAN: cable, switch, VLAN, wrong destination MAC |
+| 3. Gateway WAN `eth0` | `tcpdump -ni eth0 host 198.51.100.20` | Dropped by the gateway: forward rules, NAT, routing |
+| 4. Server, if you control it | `tcpdump -ni any port 443` | Lost upstream |
+
+Then follow the **reply** back the same way, from point 4 to point 1. The first point where a packet stops appearing brackets the fault between two captures. The gateway note gives the [router-side debug order](../gateway/gateway.md#how-a-packet-crosses-the-gateway) and a [symptom table](../gateway/gateway.md#14-troubleshooting); the OpenWrt note has [playbooks](../openwrt/openwrt.md#playbooks) for the same steps on OpenWrt.
 
 ---
 
@@ -862,6 +1007,7 @@ Topics for separate, more advanced notes:
 - **IPv6 in depth**: SLAAC, DHCPv6, privacy addresses, multicast and MLD.
 - **Device security**: TLS client certificates and provisioning, WireGuard, hardening network services.
 - **Time**: NTP in depth, PTP (IEEE 1588) for industrial timing.
+- **Boot and init ordering**: `network-online.target`, wait-online services, time-sync ordering, BusyBox init scripts.
 - **Performance**: `iperf3`, offloads (`ethtool -k`), interrupt coalescing, throughput on small SoCs.
 - **Industrial and IoT protocols**: MQTT and CoAP in depth, Modbus TCP, time-sensitive networking.
 
@@ -882,7 +1028,9 @@ Standards (all on <https://www.rfc-editor.org>):
 | DHCP | [RFC 2131](https://www.rfc-editor.org/rfc/rfc2131) |
 | DNS, mDNS | [RFC 1034](https://www.rfc-editor.org/rfc/rfc1034), [RFC 1035](https://www.rfc-editor.org/rfc/rfc1035), [RFC 6762](https://www.rfc-editor.org/rfc/rfc6762) |
 | Path MTU discovery | [RFC 1191](https://www.rfc-editor.org/rfc/rfc1191) |
-| IPv6 neighbor discovery, SLAAC, ICMPv6 | [RFC 4861](https://www.rfc-editor.org/rfc/rfc4861), [RFC 4862](https://www.rfc-editor.org/rfc/rfc4862), [RFC 4443](https://www.rfc-editor.org/rfc/rfc4443) |
+| IPv6 addressing, /127 point-to-point links | [RFC 4291](https://www.rfc-editor.org/rfc/rfc4291), [RFC 6164](https://www.rfc-editor.org/rfc/rfc6164) |
+| IPv6 neighbor discovery and RAs, SLAAC, ICMPv6, DNS in RAs | [RFC 4861](https://www.rfc-editor.org/rfc/rfc4861), [RFC 4862](https://www.rfc-editor.org/rfc/rfc4862), [RFC 4443](https://www.rfc-editor.org/rfc/rfc4443), [RFC 8106](https://www.rfc-editor.org/rfc/rfc8106) |
+| DHCPv6 | [RFC 8415](https://www.rfc-editor.org/rfc/rfc8415) |
 | HTTP, TLS 1.3 | [RFC 9110](https://www.rfc-editor.org/rfc/rfc9110), [RFC 9112](https://www.rfc-editor.org/rfc/rfc9112), [RFC 8446](https://www.rfc-editor.org/rfc/rfc8446) |
 | NAT behavior | [RFC 3022](https://www.rfc-editor.org/rfc/rfc3022), [RFC 4787](https://www.rfc-editor.org/rfc/rfc4787) |
 

@@ -1,19 +1,26 @@
 # Wi-Fi for Embedded Linux Engineers
 
-How Wi-Fi works from the radio up to the handshake, how Linux implements it (cfg80211, mac80211, wpa_supplicant, hostapd), and what it takes to put a Wi-Fi chip on an embedded board and debug it when the link is slow, drops or never comes up.
+How Wi-Fi works from the radio up to the handshake, how Linux implements it (cfg80211, mac80211, drivers, firmware, wpa_supplicant, hostapd), and what it takes to put a Wi-Fi chip in a product and debug it when the link is slow, drops or never comes up.
 
-This note covers the **wireless link**: everything below IP. What happens once the device has an address (DHCP, DNS, routing, NAT) is in [Networking Fundamentals for Embedded Linux Engineers](../../networking/fundamentals/fundamentals.md). Router-side Wi-Fi configuration is in [Building a Home Gateway on Linux](../../networking/gateway/gateway.md#10-wi-fi-access-point-hostapd) (hostapd) and [Networking on OpenWrt](../../networking/openwrt/openwrt.md#6-wi-fi-bridges-and-vlans-a-guest-network) (UCI), so this note links there instead of repeating it.
+This note covers the **wireless link**: everything below IP. What happens once the device has an address (DHCP, DNS, routing, NAT) is in [Networking Fundamentals for Embedded Linux Engineers](../../networking/fundamentals/fundamentals.md). Router-side configuration is in [Building a Home Gateway on Linux](../../networking/gateway/gateway.md#10-wi-fi-access-point-hostapd) (hostapd) and [Networking on OpenWrt](../../networking/openwrt/openwrt.md#6-wi-fi-bridges-and-vlans-a-guest-network) (UCI). This note links to them instead of repeating them.
 
 **Assumptions:**
-- An example network (section 2): the gateway's access point and a board with an SDIO Wi-Fi module.
-- Linux with `iw`, `wpa_supplicant` 2.10+ and `hostapd` 2.10+. BusyBox-based images are covered where they differ.
-- Regulatory values are given for the EU (country `FR`) and the US. They change: check your regulator before shipping a product.
+- One example network (section 2) is used throughout: the gateway's AP, a second AP, a board with an SDIO Wi-Fi module, a phone, and a wired dev laptop.
+- Linux 6.x with `iw`, `wpa_supplicant` and `hostapd` 2.10 or later. Features that need 2.11 (preliminary Wi-Fi 7) or 2.12 (RSN overriding, AFC, more complete Wi-Fi 7) say so. BusyBox-based images are covered where they differ.
+- Regulatory values are given for the EU (country `FR`) and the US, with their sources in the references. They change, and other countries differ: check the current rules before shipping a product.
+
+**Conventions:**
+- **Normative** values come from IEEE 802.11 or a regulation.
+- **Rule of thumb** marks empirical values that depend on the environment, chip and application.
+- **Driver-dependent** or **certification** marks behavior that isn't guaranteed by the standard: support varies between chips, drivers, firmware versions and Wi-Fi Alliance programs.
+
+**Verification status:** options and defaults were checked against the hostap 2.12 reference configurations and ChangeLogs, regulatory values against the FCC rules (47 CFR 15.407) and EU implementing decisions, and Linux behavior against the kernel sources and documentation. Nothing here was run on the example hardware: command outputs are illustrative and abridged.
 
 **How to read it:**
-- **To learn:** Part 1 (sections 1 to 10) in order.
-- **To bring up Wi-Fi on Linux:** Part 2 (sections 11 to 15).
-- **To integrate a chip in a product:** Part 3 (sections 16 and 17).
-- **To debug:** section 18 first, then the section of the step that fails.
+- **To learn:** Part 1 (sections 1 to 11) in order.
+- **To bring up Wi-Fi on Linux:** Part 2 (sections 12 to 17).
+- **To integrate a chip in a product:** Part 3 (sections 18 and 19).
+- **To debug:** section 20 first, then the section of the step that fails.
 
 ## Table of contents
 
@@ -21,49 +28,51 @@ This note covers the **wireless link**: everything below IP. What happens once t
 
 - [1. The mental model: what 802.11 changes compared to Ethernet](#1-the-mental-model-what-80211-changes-compared-to-ethernet)
 - [2. Example network](#2-example-network)
-- [3. Generations and standards](#3-generations-and-standards)
+- [3. Generations, amendments and certifications](#3-generations-amendments-and-certifications)
 - [4. Bands, channels and regulatory rules](#4-bands-channels-and-regulatory-rules)
-- [5. The radio link: OFDM, MCS, MIMO and signal levels](#5-the-radio-link-ofdm-mcs-mimo-and-signal-levels)
-- [6. Sharing the air: medium access, QoS and aggregation](#6-sharing-the-air-medium-access-qos-and-aggregation)
+- [5. The radio link: OFDM, MCS, MIMO, OFDMA and signal levels](#5-the-radio-link-ofdm-mcs-mimo-ofdma-and-signal-levels)
+- [6. Sharing the air: medium access, QoS, aggregation and spatial reuse](#6-sharing-the-air-medium-access-qos-aggregation-and-spatial-reuse)
 - [7. 802.11 frames and addressing](#7-80211-frames-and-addressing)
 - [8. Joining a network: scan, authenticate, associate, handshake](#8-joining-a-network-scan-authenticate-associate-handshake)
 - [9. Security: WPA2, WPA3, Enterprise and known attacks](#9-security-wpa2-wpa3-enterprise-and-known-attacks)
-- [10. Power save, roaming and multi-AP networks](#10-power-save-roaming-and-multi-ap-networks)
+- [10. Power save and roaming](#10-power-save-and-roaming)
+- [11. Beyond one AP and its clients: MLO, mesh, P2P, TDLS, Passpoint](#11-beyond-one-ap-and-its-clients-mlo-mesh-p2p-tdls-passpoint)
 
 **Part 2: How Linux implements it**
 
-- [11. The Linux wireless stack](#11-the-linux-wireless-stack)
-- [12. Tools: iw, wpa_cli, hostapd_cli and friends](#12-tools-iw-wpa_cli-hostapd_cli-and-friends)
-- [13. Station mode: connecting a device](#13-station-mode-connecting-a-device)
-- [14. Access point mode and provisioning](#14-access-point-mode-and-provisioning)
-- [15. Monitor mode and over-the-air captures](#15-monitor-mode-and-over-the-air-captures)
+- [12. The Linux wireless stack](#12-the-linux-wireless-stack)
+- [13. Operating modes and interface combinations](#13-operating-modes-and-interface-combinations)
+- [14. Tools: iw, wpa_cli, hostapd_cli and friends](#14-tools-iw-wpa_cli-hostapd_cli-and-friends)
+- [15. Station mode: connecting a device](#15-station-mode-connecting-a-device)
+- [16. Access point mode and provisioning](#16-access-point-mode-and-provisioning)
+- [17. Monitor mode and over-the-air captures](#17-monitor-mode-and-over-the-air-captures)
 
 **Part 3: Embedded products**
 
-- [16. Integrating a Wi-Fi chip on a board](#16-integrating-a-wi-fi-chip-on-a-board)
-- [17. Performance, power and tuning](#17-performance-power-and-tuning)
+- [18. Integrating a Wi-Fi chip on a board](#18-integrating-a-wi-fi-chip-on-a-board)
+- [19. Performance, power and tuning](#19-performance-power-and-tuning)
 
 **Debugging and reference**
 
-- [18. Troubleshooting](#18-troubleshooting)
-- [19. Not covered here](#19-not-covered-here)
+- [20. Troubleshooting](#20-troubleshooting)
+- [21. Not covered here](#21-not-covered-here)
 - [References](#references)
 
 ---
 
 ## 1. The mental model: what 802.11 changes compared to Ethernet
 
-To IP, Wi-Fi (IEEE 802.11) looks like Ethernet: `wlan0` has a MAC address, carries Ethernet frames to and from the kernel, and can join a bridge on an AP. Underneath, almost everything is different:
+To IP, Wi-Fi (IEEE 802.11) looks like Ethernet: `wlan0` has a MAC address, exchanges Ethernet frames with the kernel, and can join a bridge on an AP. Underneath, almost everything is different:
 
 | | Switched Ethernet | Wi-Fi |
 |---|---|---|
-| Medium | One full-duplex link per port | One shared radio channel, half-duplex: one transmitter at a time in range |
+| Medium | One full-duplex link per port | One shared radio channel, half-duplex: one transmitter at a time among everyone who hears each other |
 | Collisions | None on switched links | Can't be detected while transmitting, so they are **avoided** (CSMA/CA, section 6) |
 | Delivery | A lost frame is rare | Every unicast frame is acknowledged and retried; loss and retries are normal |
-| Rate | Fixed by the link (1 Gb/s) | Chosen per frame from the signal quality, changes all the time |
-| Broadcast | Cheap | Expensive: sent at a low rate, not acknowledged (section 6) |
+| Rate | Fixed by the link (1 Gb/s) | Chosen per transmission from the link quality, changes all the time |
+| Broadcast | Cheap | Expensive: low rate, not acknowledged, delayed for sleeping clients (sections 6 and 10) |
 | Addresses per frame | 2 | 3, sometimes 4 (section 7) |
-| Joining | Plug the cable | Scan, authenticate, associate, 4-way handshake (section 8) |
+| Joining | Plug the cable | Scan, authenticate, associate, handshake (section 8) |
 | Security | Physical access to the port | Authentication and encryption in the link layer (section 9) |
 | Mobility | None | Clients move between access points (roaming, section 10) |
 
@@ -71,193 +80,215 @@ To IP, Wi-Fi (IEEE 802.11) looks like Ethernet: `wlan0` has a MAC address, carri
 
 | Term | Meaning |
 |---|---|
-| STA (station) | Any 802.11 device. In practice "station" means a client |
-| AP (access point) | A station that runs a network and bridges it to a wired LAN (the distribution system, DS) |
-| BSS | Basic service set: one AP and its associated clients, on one channel |
-| BSSID | MAC address identifying a BSS: usually the AP radio's MAC (one per SSID on multi-SSID APs) |
-| SSID | Network name (0 to 32 bytes) carried in beacons. Several BSSes can share one SSID |
-| ESS | Extended service set: several BSSes with the same SSID on one LAN, between which clients roam |
-| IBSS, mesh | Networks without an AP: ad hoc (IBSS, obsolete) and 802.11s mesh (section 10) |
-| Radio / wiphy | One physical radio (`phy0` in Linux), tuned to one channel at a time |
-| Interface / vif | A logical interface on a radio (`wlan0`, `wlan0-1`): station, AP, monitor... (section 11) |
-| Associated | The AP accepted the client (802.11 state) |
-| Authorized | The 4-way handshake finished: keys installed, data allowed (the 802.1X "port" is open) |
+| STA (station) | Any 802.11 device. "Non-AP STA" or "client" is the precise word for a client |
+| AP (access point) | A station that runs a network and bridges it to the distribution system (DS), usually a wired LAN |
+| BSS, BSSID | Basic service set: one AP and its associated clients on one channel. The BSSID is the MAC address identifying it (one per SSID on a multi-SSID AP) |
+| SSID | Network name (0 to 32 bytes). Several BSSes can share one SSID |
+| ESS | Extended service set: BSSes with the same SSID on one LAN, between which clients roam |
+| Radio | Hardware that transmits and receives on one channel at a time (baseband, RF front end, antennas). A chip can have one or several (dual-band dual-concurrent chips have two) |
+| wiphy (`phy0`) | The Linux object a driver registers for a wireless device. Usually one radio; a dual-radio card may register two wiphys, and recent kernels let one wiphy describe several radios (used for Wi-Fi 7 MLO) |
+| Interface (`wlan0`) | A logical interface (netdev) on a wiphy, with a type: station, AP, monitor, mesh... Several can share one radio (section 13) |
+| MLD | Multi-link device (Wi-Fi 7): one logical AP or client operating over several links (section 11) |
+| Associated / Authorized | Associated: accepted by the AP (802.11 state). Authorized: keys installed after the 4-way handshake, data allowed |
 
-**The AP is a bridge.** A client sends every frame to the AP, even when the destination is another client of the same AP: the frame crosses the air twice. The AP converts 802.11 frames to Ethernet frames and hands them to its bridge (`br-lan` in the [gateway note](../../networking/gateway/gateway.md#10-wi-fi-access-point-hostapd)), and the other way round. Seen from the wired LAN, a Wi-Fi client is just another MAC address behind the AP's port.
+**The AP is a bridge.** In an infrastructure network, a client sends every frame to the AP, even when the destination is another client of the same AP: the frame crosses the air twice (section 7). The AP converts between 802.11 and Ethernet frames and hands them to its bridge (`br-lan` in the [gateway note](../../networking/gateway/gateway.md#10-wi-fi-access-point-hostapd)). From the wired LAN, a Wi-Fi client is just another MAC address behind the AP's port.
 
-**Airtime is the resource.** Everyone in range on the same channel (your clients, your neighbors' networks, a baby monitor) shares one channel's time. A slow client uses more airtime per byte and slows down everyone else. Most Wi-Fi tuning is about spending less airtime per byte.
+**Airtime is the resource.** Everyone in range on the same channel (your clients, neighbors' networks, other devices on the band) shares that channel's time. A slow client uses more airtime per byte and slows down everyone else (section 6). Most Wi-Fi tuning is about spending less airtime per byte.
 
 ---
 
 ## 2. Example network
 
-The examples use the trusted LAN of the [gateway note](../../networking/gateway/gateway.md#networks), with a board joining it over Wi-Fi.
+The examples use the trusted LAN of the [gateway note](../../networking/gateway/gateway.md#networks) and the addresses of the [fundamentals note](../../networking/fundamentals/fundamentals.md#2-example-networks): the dev laptop stays on Ethernet, so it can serve as the wired reference host for throughput tests.
 
 ```mermaid
 flowchart LR
     subgraph GW["Gateway"]
-        ap1["wlan0 (AP)<br/>SSID Home, BSSID ...:a0<br/>5 GHz ch 36, 80 MHz"]
-        br["br-lan 192.168.10.1/24"]
+        ap1["wlan0: AP<br/>BSSID 00:00:5e:00:53:a0<br/>ch 36, 80 MHz"]
+        br["br-lan<br/>192.168.10.1/24"]
         ap1 --- br
     end
-    ap2["Access point 2 (wired to br-lan)<br/>SSID Home, BSSID ...:a1<br/>5 GHz ch 52, 80 MHz"]
-    board["Board<br/>wlan0 192.168.10.21<br/>SDIO module, 1x1 Wi-Fi 5"]
-    laptop["Dev laptop<br/>192.168.10.100<br/>2x2 Wi-Fi 6"]
-    board -. "802.11 (station)" .- ap1
-    laptop -. "802.11" .- ap1
-    board -. "roams to (section 10)" .- ap2
-    ap2 --- br
+    ap2["Access point 2<br/>BSSID 00:00:5e:00:53:a1<br/>ch 52, 80 MHz, DFS"]
+    laptop["Dev laptop<br/>eth0 192.168.10.100<br/>iperf3 server<br/>USB sniffer wlan1"]
+    board["Board<br/>wlan0 192.168.10.21<br/>1x1 Wi-Fi 5, SDIO"]
+    phone["Phone<br/>192.168.10.101<br/>2x2 Wi-Fi 6"]
+    br ---|Ethernet| ap2
+    br ---|Ethernet| laptop
+    board -.-|802.11| ap1
+    phone -.-|802.11| ap1
+    board -.-|roams to| ap2
 ```
 
 | Device | Interface | MAC / BSSID | Settings |
 |---|---|---|---|
-| Gateway AP | `wlan0` in `br-lan` | `00:00:5e:00:53:a0` | SSID `Home`, channel 36 at 80 MHz (center 42), WPA2/WPA3 transition, country `FR` |
+| Gateway AP | `wlan0` in `br-lan` | `00:00:5e:00:53:a0` | SSID `Home`, 5 GHz channel 36 at 80 MHz (center 42), WPA2/WPA3 transition mode, country `FR` |
 | Access point 2 | its own radio, wired to `br-lan` | `00:00:5e:00:53:a1` | Same SSID and passphrase, channel 52 at 80 MHz (DFS). Used for roaming examples |
-| Board | `wlan0` | `00:00:5e:00:53:15` | SDIO module, 1 spatial stream, Wi-Fi 5 (802.11ac), DHCP lease `192.168.10.21` |
-| Dev laptop | `wlp2s0` | `00:00:5e:00:53:64` | 2x2 Wi-Fi 6, `192.168.10.100` |
+| Board | `wlan0` | `00:00:5e:00:53:15` | SDIO Wi-Fi 5 + Bluetooth combo module, 1 spatial stream, `192.168.10.21` (static DHCP lease) |
+| Phone | | `00:00:5e:00:53:65` | 2x2 Wi-Fi 6 client, `192.168.10.101` |
+| Dev laptop | `eth0` (wired), `wlan1` (USB adapter, `phy1`) | `00:00:5e:00:53:64` | `192.168.10.100`: iperf3 server, Wireshark, and a monitor-mode sniffer on `wlan1` (section 17) |
 
 The MACs come from the documentation block `00:00:5e:00:53:xx` (RFC 7042). The SSID, passphrases and addresses are placeholders.
 
 ---
 
-## 3. Generations and standards
+## 3. Generations, amendments and certifications
 
-The **IEEE** writes 802.11 and its amendments. The **Wi-Fi Alliance** certifies interoperability and owns the marketing names (Wi-Fi 6, WPA3, WMM, Passpoint, EasyMesh). A certification profile picks a subset of the standard and makes some optional features mandatory: for example, WPA3 support is required for Wi-Fi 6 certification. Linux and hostapd use the IEEE PHY names (HT, VHT, HE, EHT), so learn both.
+The **IEEE** writes 802.11 and its amendments. The **Wi-Fi Alliance** certifies interoperability, owns the marketing names, and decides which optional features a certification requires: for example, WPA3 support is required for Wi-Fi 6 certification, and PMF with beacon protection for Wi-Fi 7. A feature can therefore be **in the standard** (IEEE), **mandatory for a certification** (Wi-Fi Alliance), or **vendor-specific**. Linux and hostapd use the IEEE PHY names (HT, VHT, HE, EHT).
 
-| Name | IEEE | PHY name | Year | Bands (GHz) | Max width | Top modulation | Max streams (spec) | Peak PHY rate |
+| Name | IEEE | PHY | Standard / first certification | Bands (GHz) | Max width | Top modulation | Max streams (spec) | Peak PHY rate |
 |---|---|---|---|---|---|---|---|---|
 | - | 802.11b | DSSS/CCK | 1999 | 2.4 | 22 MHz | CCK | 1 | 11 Mb/s |
 | - | 802.11a | OFDM | 1999 | 5 | 20 MHz | 64-QAM | 1 | 54 Mb/s |
 | - | 802.11g | ERP-OFDM | 2003 | 2.4 | 20 MHz | 64-QAM | 1 | 54 Mb/s |
 | Wi-Fi 4 | 802.11n | HT | 2009 | 2.4, 5 | 40 MHz | 64-QAM | 4 | 600 Mb/s |
 | Wi-Fi 5 | 802.11ac | VHT | 2013 | 5 | 160 MHz | 256-QAM | 8 | 6.9 Gb/s |
-| Wi-Fi 6 | 802.11ax | HE | 2019 | 2.4, 5 | 160 MHz | 1024-QAM | 8 | 9.6 Gb/s |
-| Wi-Fi 6E | 802.11ax | HE | 2020 | + 6 | 160 MHz | 1024-QAM | 8 | 9.6 Gb/s |
-| Wi-Fi 7 | 802.11be | EHT | 2024 | 2.4, 5, 6 | 320 MHz (6 GHz) | 4096-QAM | 16 | 46 Gb/s |
+| Wi-Fi 6 | 802.11ax | HE | 802.11ax-2021 / 2019 | 2.4, 5 | 160 MHz | 1024-QAM | 8 | 9.6 Gb/s |
+| Wi-Fi 6E | 802.11ax | HE | / 2020 | + 6 | 160 MHz | 1024-QAM | 8 | 9.6 Gb/s |
+| Wi-Fi 7 | 802.11be | EHT | 802.11be-2024 / 2024 | 2.4, 5, 6 | 320 MHz (6 GHz only) | 4096-QAM | 16 | 46 Gb/s |
 | Wi-Fi 8 | 802.11bn | UHR | in development | 2.4, 5, 6 | 320 MHz | 4096-QAM | | Targets reliability and latency, not peak rate |
 
-Peak rates assume the maximum streams and width, which no real device has. A phone or laptop is typically 2x2, an embedded module 1x1 or 2x2: a 1x1 Wi-Fi 5 module at 80 MHz tops out at 433 Mb/s on the air (section 5).
+Peak rates assume the maximum streams and width, which no real device has. Phones and laptops are typically 2x2, embedded modules 1x1 or 2x2, and APs 2x2 to 4x4 per band. A 1x1 Wi-Fi 5 module at 80 MHz tops out at 433 Mb/s on the air (section 5). Some Wi-Fi 5 chips also offered 1024-QAM as a **vendor extension**; it is only standard from Wi-Fi 6.
 
-**What each generation brought, in one line:**
-- **Wi-Fi 4 (HT):** MIMO (several spatial streams), 40 MHz channels, frame aggregation, short guard interval.
+**What each generation brought:**
+- **Wi-Fi 4 (HT):** MIMO (several spatial streams), 40 MHz channels, frame aggregation with Block Ack, short guard interval. HT requires QoS (WMM): without WMM, no HT rates.
 - **Wi-Fi 5 (VHT):** 80 and 160 MHz, 256-QAM, explicit beamforming, downlink MU-MIMO. 5 GHz only.
-- **Wi-Fi 6 (HE):** OFDMA, 1024-QAM, longer OFDM symbols, uplink MU-MIMO, target wake time (TWT), BSS coloring. Better with many clients, not just faster. 6E adds the 6 GHz band.
-- **Wi-Fi 7 (EHT):** 320 MHz, 4096-QAM, multi-link operation (MLO: one connection over several bands), preamble puncturing, multiple resource units per client.
+- **Wi-Fi 6 (HE):** OFDMA in both directions, 1024-QAM, 4x longer OFDM symbols, uplink MU-MIMO, target wake time (TWT), BSS coloring and spatial reuse. Better with many clients, not only faster. 6E adds the 6 GHz band.
+- **Wi-Fi 7 (EHT):** 320 MHz, 4096-QAM, multi-link operation (MLO), preamble puncturing, multiple resource units per client, 16 streams in the spec.
 
-**Amendments you meet in configs and logs:** they are merged into periodic revisions of the base standard (802.11-2016, 802.11-2020, 802.11-2024), but everyone still uses the letters.
+**Amendments you meet in configs and logs** (merged into periodic revisions such as 802.11-2020 and 802.11-2024, but everyone still uses the letters):
 
 | Amendment | What it adds | Where you see it |
 |---|---|---|
 | 802.11d | Country information in beacons | hostapd `ieee80211d=1` |
-| 802.11e | QoS: access categories, EDCA (certified as WMM) | `wmm_enabled=1`, section 6 |
+| 802.11e | QoS: access categories, EDCA, Block Ack (certified as WMM) | `wmm_enabled=1`, section 6 |
 | 802.11h | DFS and transmit power control in 5 GHz | `ieee80211h=1`, section 4 |
 | 802.11i | RSN: WPA2, CCMP, 4-way handshake | `wpa=2`, section 9 |
 | 802.11k | Radio measurements, neighbor reports | `rrm_neighbor_report=1`, section 10 |
-| 802.11r | Fast BSS transition (fast roaming) | `mobility_domain=`, `FT-PSK`, section 10 |
-| 802.11s | Mesh networking | `iw ... mesh join`, section 10 |
-| 802.11u | Interworking (base of Passpoint/Hotspot 2.0) | hostapd `interworking=1` |
-| 802.11v | Network management, BSS transition requests | `bss_transition=1`, section 10 |
+| 802.11r | Fast BSS transition (FT) | `mobility_domain=`, `FT-PSK`, section 10 |
+| 802.11s | Mesh networking | `iw ... mesh join`, section 11 |
+| 802.11u | Interworking: GAS/ANQP pre-association queries (base of Passpoint) | `interworking=1`, section 11 |
+| 802.11v | Network management: BSS transition management, WNM sleep | `bss_transition=1`, section 10 |
 | 802.11w | Protected management frames (PMF) | `ieee80211w=`, section 9 |
-| 802.11ad, 802.11ay | 60 GHz (WiGig) | Rare outside niche devices |
-| 802.11ah | Sub-1 GHz long range low power ("Wi-Fi HaLow") | Separate chips, out-of-tree drivers |
+| 802.11z | Tunneled direct link setup (TDLS) | `tdls_prohibit`, section 11 |
+| 802.11ai | Fast initial link setup (FILS) | Rare outside enterprise |
+| 802.11mc, 802.11az | Fine timing measurement (ranging, positioning) | Not covered here |
+| 802.11ad, 802.11ay | 60 GHz | Niche |
+| 802.11ah | Sub-1 GHz long range low power ("Wi-Fi HaLow") | Separate chips, mostly out-of-tree drivers |
 
-**Backward compatibility:** a Wi-Fi 6 AP still serves an 802.11g client, but the old client uses more airtime, and some legacy (802.11b) clients force protection mechanisms that cost everyone airtime (section 6).
+**Wi-Fi Alliance programs** with no single IEEE letter: WMM, WPA3, Enhanced Open (OWE), Wi-Fi Easy Connect (DPP), Passpoint, Wi-Fi Direct, Wi-Fi Aware, EasyMesh, Wi-Fi Agile Multiband (MBO: steering and channel preferences). They define how standard features must be combined and tested.
+
+**Backward compatibility:** a Wi-Fi 6 AP still serves an 802.11g client, but the old client uses more airtime, and 802.11b clients force protection mechanisms that cost everyone airtime (section 6).
 
 ---
 
 ## 4. Bands, channels and regulatory rules
 
+Regulatory numbers below are **normative for the country cited, at the time of writing**. Rules differ per country and change: the device's regulatory database (section 12) and your certification lab are the references for a product.
+
 ### 2.4 GHz
 
-2400 to 2483.5 MHz. Channel *n* is centered at 2407 + 5*n* MHz (channel 14, 2484 MHz, is 802.11b only, in Japan). Channels are 5 MHz apart but a transmission is 20 MHz wide, so only **1, 6 and 11** don't overlap.
+2400 to 2483.5 MHz. Channel *n* (1 to 13) is centered at 2407 + 5*n* MHz; channel 14 (2484 MHz) is 802.11b-only, in Japan. Channels are 5 MHz apart while a transmission is about 20 MHz wide.
 
 | Channel | 1 | 6 | 11 | 13 |
 |---|---|---|---|---|
 | Center (MHz) | 2412 | 2437 | 2462 | 2472 |
-| Allowed | Everywhere | Everywhere | Everywhere | EU and most countries, not the US |
+| Allowed | Everywhere | Everywhere | Everywhere | EU and most countries. US: 12 and 13 are legal at reduced power but rarely enabled |
 
-- Use 20 MHz. A 40 MHz channel takes two-thirds of the band, and APs must fall back to 20 MHz when they detect neighbors (20/40 coexistence).
-- Shared with Bluetooth, Zigbee, microwave ovens and every neighbor. Use it for range, wall penetration and 2.4 GHz-only IoT devices.
+- Use **1, 6, 11** at 20 MHz (1, 5, 9, 13 is also possible in the EU for OFDM-only networks). A 40 MHz channel takes most of the band, and APs must fall back to 20 MHz when they detect overlapping networks (20/40 coexistence).
+- Shared with Bluetooth, Zigbee/Thread, microwave ovens and every neighbor. Use it for range, wall penetration and 2.4 GHz-only IoT devices.
 
 ### 5 GHz
 
 Channel *n* is centered at 5000 + 5*n* MHz. Channels are numbered every 4 (20 MHz apart) and don't overlap.
 
-| Sub-band | 20 MHz channels | MHz | EU (ETSI) | US (FCC) |
+| Sub-band | 20 MHz channels | MHz | EU (2005/513/EC as amended) | US (47 CFR 15.407) |
 |---|---|---|---|---|
-| U-NII-1 | 36, 40, 44, 48 | 5150-5250 | Indoor only, 23 dBm (200 mW) EIRP | Indoor and outdoor, no DFS |
-| U-NII-2A | 52, 56, 60, 64 | 5250-5350 | Indoor only, 23 dBm with TPC, DFS | DFS |
-| U-NII-2C | 100 to 144 | 5470-5725 | 30 dBm (1 W) with TPC, DFS, up to channel 140 | DFS |
-| U-NII-3 | 149 to 165 | 5725-5850 | Low power (14 dBm, 25 mW) in many countries | Up to 1 W conducted, no DFS |
-| U-NII-4 | 169 to 177 | 5850-5925 | Not for Wi-Fi | Partly opened for indoor use |
+| U-NII-1 | 36-48 | 5150-5250 | Indoor, 23 dBm (200 mW) EIRP. Also allowed inside road vehicles | Indoor and outdoor, no DFS |
+| U-NII-2A | 52-64 | 5250-5350 | Indoor, 23 dBm EIRP with TPC (20 dBm without), DFS. Not in road vehicles | DFS |
+| U-NII-2C | 100-144 | 5470-5725 | Indoor and outdoor, 30 dBm (1 W) EIRP with TPC (27 dBm without), DFS, up to channel 140 | DFS |
+| U-NII-3 | 149-165 | 5725-5850 | Not harmonized for Wi-Fi: low-power (25 mW) use allowed in many countries | No DFS, high power allowed |
+| U-NII-4 | 169-177 | 5850-5925 | Intelligent transport systems (ITS), not Wi-Fi | 5850-5895 MHz: indoor access points only, 36 dBm EIRP max |
 
-Without TPC (transmit power control), EU limits are 3 dB lower. Check your country: rules have been changing in U-NII-3 and U-NII-4.
-
-**Channel bonding:** wider channels combine adjacent 20 MHz channels. One of them is the **primary** channel: beacons, management frames and legacy clients use it. The others are secondary and only used when free. Configs refer to the block by its **center channel index**:
+**Channel bonding:** wider channels combine adjacent 20 MHz channels. One of them is the **primary** channel: beacons, management frames and legacy clients use it, and the medium is sensed there first (section 6). The others are secondary and used only when free. Configurations name the block by its **center channel index**:
 
 | Width | Channels | Center index |
 |---|---|---|
 | 40 MHz | 36+40, 44+48, 52+56, ... | 38, 46, 54, ... |
 | 80 MHz | 36-48 / 52-64 / 100-112 / 116-128 / 132-144 / 149-161 | 42 / 58 / 106 / 122 / 138 / 155 |
-| 160 MHz | 36-64 / 100-128 / 149-177 | 50 / 114 / 163 |
+| 160 MHz | 36-64 / 100-128 / 149-177 (US) | 50 / 114 / 163 |
 
 In the EU that leaves 19 channels of 20 MHz (36-64, 100-140), four of 80 MHz and two of 160 MHz. `HT40+` means the secondary channel is above the primary (36+40), `HT40-` below (40+36).
 
-**DFS (dynamic frequency selection):** U-NII-2 channels are shared with radars. An AP on a DFS channel must:
-1. Listen for radar for the **channel availability check** (CAC) before transmitting: 60 s, or 10 minutes on 5600-5650 MHz (channels 120-128) in the EU (weather radars).
-2. Keep listening while operating. On a detection, stop transmitting within seconds, announce a channel switch (CSA) to its clients and leave the channel for 30 minutes (non-occupancy period).
+**Preamble puncturing (Wi-Fi 7):** an EHT AP can leave out ("puncture") a busy 20 MHz subchannel inside an 80, 160 or 320 MHz channel instead of falling back to a narrower width. The AP advertises statically punctured subchannels in its EHT Operation element (hostapd `punct_bitmap`); EHT clients transmit around them. Wi-Fi 6 only allowed puncturing in some multi-user transmissions. Pre-EHT clients still see only the primary 20/40/80 MHz.
 
-Consequences: the AP needs a minute (or ten) before its SSID appears; clients may be moved or dropped on a radar hit; clients can't probe on a DFS channel until they hear the AP's beacons (passive scanning, section 8). Client devices only need to follow the AP, but an AP needs DFS support in its driver and firmware, and certification, which many client chips don't have: it's why so many Linux cards can't start an AP on most 5 GHz channels (`no IR` in `iw list`).
+**DFS (dynamic frequency selection):** U-NII-2 channels are shared with radars. An AP on a DFS channel must:
+1. Listen for radar during the **channel availability check** (CAC) before transmitting: 60 s, or 10 minutes on 5600-5650 MHz (channels 120-128) in the EU (weather radars).
+2. Keep listening while operating. On a detection, stop transmitting within 10 s, announce a channel switch (CSA) to its clients, and stay off the channel for 30 minutes (non-occupancy period).
+
+Consequences: the SSID appears a minute (or ten) after the AP starts; clients may be moved or dropped on a radar hit; clients can't probe on a DFS channel until they hear the AP's beacons (section 8). Some APs run the CAC on a dedicated detection chain in the background ("zero-wait DFS" or background CAC, supported by hostapd with some drivers). Clients only need to follow the AP, but an AP needs DFS support in its driver, firmware and certification, which most client chips don't have: it's why so many Linux cards can't start an AP on most 5 GHz channels (`no IR` in `iw list`).
 
 ### 6 GHz
 
-Channel *n* is centered at 5950 + 5*n* MHz, with 20 MHz channels at *n* = 1, 5, 9 ... 233.
+Channel *n* is centered at 5950 + 5*n* MHz, with 20 MHz channels at *n* = 1, 5, 9 ... 233. Channel 2 (5935 MHz) is a special 20 MHz channel at the bottom edge.
 
-| | EU | US |
+| | EU (2021/1067 as amended) | US (47 CFR 15.407) |
 |---|---|---|
-| Range | 5945-6425 MHz (480 MHz) | 5925-7125 MHz (1200 MHz) |
-| Channels (20/80/160/320 MHz) | 24 / 6 / 3 / 1 | 59 / 14 / 7 / 3 |
-| Low power indoor (LPI) | 23 dBm EIRP, 10 dBm/MHz | 5 dBm/MHz (30 dBm at 320 MHz) |
-| Very low power (VLP), portable | 14 dBm, 1 dBm/MHz | 14 dBm |
-| Standard power (SP) | Not allowed | Outdoor and higher power, only under AFC (automated frequency coordination: a database lists free frequencies at the AP's location) |
+| Range | 5945-6425 MHz. The upper part (6425-7125 MHz) isn't open to Wi-Fi; its use is still being decided | 5925-7125 MHz |
+| Channels (20 / 80 / 160 / 320 MHz) | 24 / 6 / 3 / 1 | 59 / 14 / 7 / 3 |
+| Low power indoor (LPI) | 23 dBm EIRP, 10 dBm/MHz. Indoors only (buildings, trains with metal-coated windows, aircraft); not in road vehicles | AP 5 dBm/MHz, 30 dBm max; client -1 dBm/MHz, 24 dBm max. Indoors only; prohibited in cars, trains, boats and aircraft (except large aircraft above 10,000 ft, lower part of the band) |
+| Very low power (VLP) | 14 dBm EIRP, 1 dBm/MHz, indoor and outdoor | 14 dBm EIRP, -5 dBm/MHz, whole band, indoor and outdoor including vehicles; not on fixed outdoor infrastructure |
+| Standard power (SP) | Not allowed | U-NII-5 and U-NII-7 only: 36 dBm, 23 dBm/MHz, under AFC (automated frequency coordination: a database authorizes frequencies and power at the AP's location) |
 
 Rules that differ from 2.4 and 5 GHz:
-- **HE/EHT only:** no Wi-Fi 4 or 5, no legacy rates.
-- **WPA3 (SAE with hash-to-element) or Enhanced Open (OWE) only**, PMF required. No WPA2, no open networks (section 9).
-- **Discovery:** with so many channels, clients don't probe everywhere. They learn about 6 GHz APs from a reduced neighbor report (RNR) in the beacons of the AP's 2.4/5 GHz radios, or scan the 15 **preferred scanning channels** (PSC: 5, 21, 37, 53, ... every 16 channels up to 229). Put a 6 GHz AP's primary channel on a PSC.
-- Indoor LPI power density is low: a 6 GHz AP has less range than the same AP on 5 GHz, more so through walls.
+- **HE/EHT only:** no Wi-Fi 4 or 5 clients, no 802.11b rates.
+- **Security:** WPA3-Personal (SAE with hash-to-element only), WPA3-Enterprise, or Enhanced Open (OWE), always with PMF. No WPA2, no open networks (section 9).
+- **Discovery:** with up to 59 channels, clients don't probe everywhere. They learn about 6 GHz APs from a **reduced neighbor report** (RNR) in the beacons of the same AP's 2.4/5 GHz radios, or scan the 15 **preferred scanning channels** (PSC: 5, 21, 37, 53, ... every 16 channels up to 229; channels 5 to 85 in the EU). Put a 6 GHz AP's primary channel on a PSC. 6 GHz APs can also send FILS discovery frames or unsolicited broadcast probe responses between beacons.
+- **Client power follows the AP:** the AP advertises its power type (LPI, SP, VLP) and a Transmit Power Envelope element; clients limit their power accordingly.
+- LPI power density is low: a 6 GHz AP has less range than the same AP on 5 GHz, more so through walls.
 
 ### Which band for what
 
 | Band | Strengths | Weaknesses | Use for |
 |---|---|---|---|
-| 2.4 GHz | Range, walls, every device supports it | 3 usable channels, crowded, 20 MHz only in practice | IoT, far rooms, low data rates |
+| 2.4 GHz | Range, walls, every device supports it | 3 usable channels, crowded, 20 MHz in practice | IoT, far rooms, low data rates |
 | 5 GHz | Many channels, 80/160 MHz | Less range, DFS complications | Default for anything that can |
-| 6 GHz | Clean spectrum, wide channels, only modern devices | Shortest range, WPA3 only, new chips and drivers | High throughput, low latency in the same room |
+| 6 GHz | Clean spectrum, wide channels, only modern devices | Shortest range, WPA3/OWE only, newer chips and drivers | High throughput, low latency in the same room |
+
+### Vehicles and other special cases
+
+Products used in cars (head units acting as AP for phone projection, telematics units, rear-seat entertainment) meet the strictest rules, per country:
+
+| Band | EU | US |
+|---|---|---|
+| 2.4 GHz | Allowed | Allowed |
+| 5150-5250 MHz | Allowed inside road vehicles (2022/179) | Allowed |
+| 5250-5350 MHz | Not in road vehicles (DFS band) | Allowed with DFS |
+| 6 GHz | LPI not in road vehicles; VLP allowed | LPI prohibited in vehicles; VLP allowed |
+| 5855-5925 MHz | ITS (V2X): a neighbor to protect, not usable for Wi-Fi | 5895-5925 MHz is C-V2X; U-NII-4 limited to indoor APs |
+
+A vehicle AP that must start fast should avoid DFS channels (CAC delay, radar moves). Check every target country: these EU and US rules aren't universal, and they change.
 
 ### Regulatory domains
 
-Each country sets which frequencies, widths and powers are allowed, and whether DFS or indoor-only rules apply. A device must operate within the rules of where it is:
-
-- **Country setting:** the AP is configured with a country (`country_code=FR` in hostapd) and advertises it in its beacons (802.11d). Clients may adopt it.
-- **On Linux:** cfg80211 enforces the active regulatory domain, from the `wireless-regdb` database, the driver, or both (section 11). The default world domain `00` is the most restrictive: no AP on most 5 GHz channels, passive scanning only on many.
-- **In the chip:** many vendors also lock power tables in firmware or calibration data (section 16). A product ships with fixed regulatory data matching its certification.
+- **Country setting:** an AP is configured with a country (`country_code=FR` in hostapd) and advertises it in its beacons (802.11d). Clients may use it as a hint.
+- **On Linux:** cfg80211 enforces the active regulatory domain, built from the `wireless-regdb` database, driver or firmware rules, and hints (user setting, AP country element). The default world domain `00` is the most restrictive: passive scanning only on many channels, no AP on most 5 GHz channels. Section 12 has the details.
+- **In the chip:** vendors also lock power tables in firmware, calibration or board data (section 18). A product ships with fixed regulatory data matching its certification.
 
 ```bash
-iw reg get              # active rules: frequency ranges, max width, max EIRP, flags
-sudo iw reg set FR      # set the country (a hint: drivers or the AP may override it)
-iw list | grep -A 30 Frequencies   # what this card allows per channel: dBm, disabled, no IR, radar
+iw reg get              # active rules: frequency ranges, max width, max EIRP, flags (global and per wiphy)
+sudo iw reg set FR      # a user hint: driver and firmware rules can still restrict it
+iw list | grep -A 40 Frequencies   # per channel: max dBm, disabled, no IR, radar detection
 ```
 
-Flags in `iw reg get` and `iw list`: `NO-IR` (no initiating radiation: no AP, no active scan), `DFS`/`radar detection`, `NO-OUTDOOR`, `AUTO-BW` (adjacent rules can be combined into a wider channel), `disabled`.
+Flags in `iw reg get` and `iw list`: `NO-IR` (no initiating radiation: no AP, no active scan), `DFS` / `radar detection`, `NO-OUTDOOR`, `AUTO-BW` (adjacent rules can be combined into a wider channel), `disabled`.
 
 ---
 
-## 5. The radio link: OFDM, MCS, MIMO and signal levels
+## 5. The radio link: OFDM, MCS, MIMO, OFDMA and signal levels
 
 ### OFDM
 
-Since 802.11a/g, Wi-Fi uses **OFDM**: the channel is split into many narrow subcarriers, each carrying one modulated symbol at a time. Most subcarriers carry data, some are pilots (tracking) or left empty at the edges. Between symbols, a **guard interval** (GI) absorbs echoes from reflections (multipath).
+Since 802.11a/g, Wi-Fi uses **OFDM**: the channel is split into many narrow subcarriers, each carrying one modulated symbol at a time. Most subcarriers carry data, some are pilots (phase tracking), and some are left empty (DC and band edges). Between symbols, a **guard interval** (GI) absorbs echoes from reflections (multipath).
 
 | PHY | Subcarrier spacing | Symbol without GI | Guard interval | Data subcarriers at 20 / 40 / 80 / 160 / 320 MHz |
 |---|---|---|---|---|
@@ -267,13 +298,13 @@ Since 802.11a/g, Wi-Fi uses **OFDM**: the channel is split into many narrow subc
 | HE (Wi-Fi 6) | 78.125 kHz | 12.8 µs | 0.8, 1.6 or 3.2 µs | 234 / 468 / 980 / 1960 / - |
 | EHT (Wi-Fi 7) | 78.125 kHz | 12.8 µs | 0.8, 1.6 or 3.2 µs | 234 / 468 / 980 / 1960 / 3920 |
 
-Wi-Fi 6 made symbols four times longer: the fixed guard interval is a smaller share of the time, and long GIs help outdoors, where echoes are long.
+Wi-Fi 6 made symbols four times longer: the guard interval is a smaller share of the time, and long GIs help outdoors, where echoes are long.
 
 ### MCS: modulation and coding
 
-The **MCS** (modulation and coding scheme) index picks how many bits each subcarrier carries per symbol (modulation) and how much of them is error correction (coding rate). Higher MCS needs a cleaner signal. VHT, HE and EHT share this table:
+The **MCS** (modulation and coding scheme) index sets how many bits each subcarrier carries per symbol (modulation) and how much of them is error correction (coding rate). Higher MCS needs a cleaner signal. VHT, HE and EHT share this table:
 
-| MCS | Modulation | Bits per subcarrier | Coding rate | Rough SNR needed |
+| MCS | Modulation | Bits per subcarrier | Coding rate | SNR needed (rule of thumb) |
 |---|---|---|---|---|
 | 0 | BPSK | 1 | 1/2 | 5 dB |
 | 1 | QPSK | 2 | 1/2 | 8 dB |
@@ -285,17 +316,20 @@ The **MCS** (modulation and coding scheme) index picks how many bits each subcar
 | 7 | 64-QAM | 6 | 5/6 | 25 dB |
 | 8 | 256-QAM | 8 | 3/4 | 29 dB |
 | 9 | 256-QAM | 8 | 5/6 | 31 dB |
-| 10 | 1024-QAM (Wi-Fi 6) | 10 | 3/4 | 34 dB |
-| 11 | 1024-QAM (Wi-Fi 6) | 10 | 5/6 | 37 dB |
-| 12 | 4096-QAM (Wi-Fi 7) | 12 | 3/4 | 40 dB |
-| 13 | 4096-QAM (Wi-Fi 7) | 12 | 5/6 | 43 dB |
+| 10 | 1024-QAM (HE) | 10 | 3/4 | 34 dB |
+| 11 | 1024-QAM (HE) | 10 | 5/6 | 37 dB |
+| 12 | 4096-QAM (EHT) | 12 | 3/4 | 40 dB |
+| 13 | 4096-QAM (EHT) | 12 | 5/6 | 43 dB |
 
-The SNR column is a rule of thumb: real thresholds depend on the chip (its datasheet gives receiver sensitivity per MCS) and the channel. HT (Wi-Fi 4) numbers MCS 0 to 31 and encodes the stream count in the index: MCS 15 is MCS 7 on two streams.
+- The SNR column is **not normative**: the standard only specifies minimum receiver sensitivities, and real thresholds depend on the chip (its datasheet gives sensitivity per MCS and width), the channel and the error rate you accept.
+- **HT** (Wi-Fi 4) numbers MCS 0 to 31 and folds the stream count into the index: HT MCS 15 is MCS 7 on two streams. VHT and later give MCS and NSS (number of spatial streams) separately: `VHT-MCS 9 VHT-NSS 2`.
+- VHT MCS 9 isn't valid at 20 MHz for most stream counts (the bits don't divide evenly).
+- For range, HE adds dual carrier modulation (DCM, the same data on two subcarriers) and EHT adds MCS 14 and 15 (duplicated, very robust modes).
 
 ### PHY rate
 
 ```
-rate = data subcarriers × bits per subcarrier × coding rate × spatial streams / (symbol + GI)
+PHY rate = data subcarriers × bits per subcarrier × coding rate × spatial streams / (symbol + GI)
 ```
 
 Worked example, the board's 1x1 Wi-Fi 5 module at 80 MHz, MCS 9, short GI:
@@ -314,74 +348,103 @@ The same at Wi-Fi 6 MCS 11, 0.8 µs GI: 980 × 10 × 5/6 / 13.6 µs = **600.5 Mb
 | HE | 160 MHz | 11 | 0.8 µs | 1201 | 2402 |
 | EHT | 320 MHz | 13 | 0.8 µs | 2882 | 5765 |
 
-Rates in Mb/s. These are rates **on the air** during a frame: what an application gets is roughly half to two-thirds of it (section 6).
+Rates in Mb/s. These are **PHY rates**: the bit rate during the data part of one transmission. They exclude preambles, waiting, acknowledgments, retries and sharing. Application throughput is much lower (section 6 explains why, section 19 gives measured ranges).
 
-### MIMO, beamforming, MU-MIMO, OFDMA
+### MIMO and beamforming
 
-- **Antennas and streams:** `2x2:2` means 2 transmit chains, 2 receive chains, 2 spatial streams. A link carries at most min(streams of the AP, streams of the client) streams.
-- **Spatial multiplexing:** several streams on the same channel at the same time, separated by the receiver using multipath. Needs a good SNR; at long range, the chip uses the extra antennas for diversity instead (STBC, maximum ratio combining): fewer streams, more range.
-- **Beamforming (Wi-Fi 5+):** the AP sounds the channel (null data packet, client feedback) and shapes its transmission toward the client. A few dB of gain, mostly at medium range.
-- **MU-MIMO:** the AP sends different streams to different clients at once (downlink since Wi-Fi 5, uplink in Wi-Fi 6). Needs sounding overhead and clients spatially apart; the gains in real homes are usually small.
-- **OFDMA (Wi-Fi 6+):** the AP splits the channel into **resource units** (RUs: 26, 52, 106, 242, 484, 996 subcarriers...) and serves several clients in one transmission, uplink too (scheduled by trigger frames). It helps with many clients sending small packets (IoT, VoIP): less contention and lower latency. It doesn't raise any single client's peak rate.
+- **Chains and streams:** `2x2:2` means 2 transmit chains, 2 receive chains, 2 spatial streams. A link carries at most min(AP streams, client streams).
+- **Spatial multiplexing:** several streams on the same channel at the same time, separated by the receiver thanks to multipath. Needs a good SNR; at long range, the chip uses the extra antennas for diversity instead (STBC, maximum ratio combining): fewer streams, more range.
+- **Beamforming (Wi-Fi 5+):** the AP sounds the channel (NDP announcement, null data packet, compressed feedback from the client) and steers its transmission toward the client. A few dB of gain, mostly at medium range. Sounding costs airtime.
+- **MU-MIMO:** the AP sends different streams to different clients at once (downlink since Wi-Fi 5, uplink in Wi-Fi 6). It needs fresh sounding and spatially separated clients; real-world gains are often small.
+
+### OFDMA, resource units and trigger-based uplink
+
+OFDMA (Wi-Fi 6+) lets the AP split one transmission into **resource units** (RUs) for different clients:
+
+| RU size (subcarriers) | 26 | 52 | 106 | 242 | 484 | 996 | 2×996 | 4×996 |
+|---|---|---|---|---|---|---|---|---|
+| About | 2 MHz | 4 MHz | 8 MHz | 20 MHz | 40 MHz | 80 MHz | 160 MHz | 320 MHz (EHT) |
+
+Up to 9 clients share a 20 MHz channel with 26-tone RUs (37 in 80 MHz). Wi-Fi 7 adds **multiple RUs** (MRU) per client, such as 484+242 tones, which pairs well with puncturing.
+
+```mermaid
+sequenceDiagram
+    participant AP
+    participant A as Client A
+    participant B as Client B
+    AP->>A: Trigger frame (RU 1, MCS, length, target power)
+    AP->>B: same Trigger frame (RU 2 for B)
+    Note over A,B: SIFS later, both transmit at once, each in its RU (HE TB PPDU)
+    A->>AP: data in RU 1
+    B->>AP: data in RU 2
+    AP->>A: Multi-STA Block Ack
+    AP->>B: same Multi-STA Block Ack
+```
+
+- **Downlink OFDMA** is just the AP scheduling several clients in one transmission.
+- **Uplink OFDMA** is **trigger-based**: clients report their queued data (buffer status reports), the AP's **Trigger frame** assigns RUs, MCS, duration and target receive power, and clients answer simultaneously after SIFS. It needs tight timing, frequency and power control on the clients.
+- **Benefits:** many small packets (IoT, VoIP, TCP ACKs) with less contention and lower latency. **Limits:** no gain for one client's peak rate; the gain depends entirely on the AP's scheduler, which is vendor firmware. Many APs enable uplink OFDMA only in some modes. On Linux, it is decided by the AP driver and firmware, not by hostapd.
 
 ### Signal levels
 
-Power is given in **dBm**: decibels relative to 1 mW. Adding 3 dB doubles the power, adding 10 dB multiplies it by 10.
+Power is given in **dBm**: decibels relative to 1 mW. +3 dB doubles the power, +10 dB multiplies it by 10.
 
 | dBm | 30 | 20 | 14 | 10 | 0 | -30 | -60 | -90 |
 |---|---|---|---|---|---|---|---|---|
 | Power | 1 W | 100 mW | 25 mW | 10 mW | 1 mW | 1 µW | 1 nW | 1 pW |
 
-**EIRP** = transmit power + antenna gain (dBi) - cable losses. Regulatory limits are on EIRP, so a higher-gain antenna means less conducted power is allowed. `iw` shows transmit power in dBm, and sets it in mBm (100 × dBm).
+**EIRP** = transmit power + antenna gain (dBi) - cable losses. Regulatory limits apply to EIRP (or power density), so a higher-gain antenna means less conducted power is allowed. `iw` shows transmit power in dBm and sets it in mBm (100 × dBm).
 
-| Received signal (RSSI) | Quality |
+| Received signal | What to expect (rule of thumb, with a normal noise floor) |
 |---|---|
-| -30 to -50 dBm | Excellent, top MCS if the noise is low |
-| -50 to -67 dBm | Good. -67 dBm is a common design target for voice and video |
+| -30 to -50 dBm | Top MCS if the channel is clean |
+| -50 to -67 dBm | Good. -67 dBm is a common design target in vendor guides for voice and video |
 | -67 to -75 dBm | Usable for data, lower MCS, more retries |
-| -75 to -85 dBm | Unreliable, frequent rate drops and disconnects |
+| -75 to -85 dBm | Unreliable: frequent rate drops and disconnects |
 | below -85 dBm | Near the noise |
 
-**Noise floor:** thermal noise in 20 MHz is about -101 dBm; with the receiver's own noise figure, chips report around -95 dBm. Each doubling of the channel width adds 3 dB of noise (about -89 dBm at 80 MHz). **SNR** = signal - noise, and SNR picks the MCS (table above), not RSSI alone: -60 dBm next to a busy neighbor network can be worse than -70 dBm in a quiet place.
+**RSSI caveats:** reported values depend on the chip's calibration, may be per chain or combined, and are averaged differently by each driver. Compare values from the same chip, not between devices.
 
-**Free-space path loss:** FSPL (dB) = 20 log10(d in m) + 20 log10(f in MHz) - 27.55. At 1 m: 40 dB at 2.4 GHz, 47 dB at 5.5 GHz. Each doubling of distance adds 6 dB. Walls add more: roughly 3-5 dB for drywall, 6-12 dB for brick, 10-20+ dB for concrete, more for metal and coated glass, and more at 5/6 GHz than at 2.4 GHz.
+**Noise and SNR:** thermal noise in 20 MHz is about -101 dBm; with the receiver's noise figure, chips typically report a floor around -95 to -90 dBm. Doubling the channel width adds 3 dB of noise (about -89 dBm at 80 MHz). **SNR** = signal - noise, and interference counts as noise: -60 dBm next to a busy neighbor network can be worse than -70 dBm in a quiet place.
 
-**Link budget example** (the board, 10 m from the AP, 2 walls, channel 36):
+**Free-space path loss:** FSPL (dB) = 20 log10(d in m) + 20 log10(f in MHz) - 27.55. At 1 m: 40 dB at 2.4 GHz, 47 dB at 5.5 GHz. Each doubling of distance adds 6 dB. Walls add more: roughly 3-5 dB for drywall, 6-12 dB for brick, 10-20+ dB for concrete, more for metal and coated glass, and more at 5/6 GHz than at 2.4 GHz (rule of thumb).
+
+**Link budget example** (the board, 10 m from the gateway AP, 2 walls, channel 36):
 
 | Item | Value |
 |---|---|
 | AP transmit power | +20 dBm |
 | AP antenna gain | +3 dBi |
 | Free-space path loss, 10 m at 5180 MHz | -66.7 dB |
-| Two brick walls | -15 dB |
+| Two brick walls (estimate) | -15 dB |
 | Board antenna gain | +2 dBi |
-| **Received signal** | **-56.7 dBm** |
+| **Received signal at the board** | **-56.7 dBm** |
 | Noise floor at 80 MHz | about -89 dBm |
-| **SNR** | **about 32 dB: MCS 9 is just possible** |
+| **SNR** | **about 32 dB: MCS 8-9 is plausible** |
 
-The link is **asymmetric**: the board probably transmits at 15 dBm or less, so the AP hears it 5 dB weaker than it hears the AP. Uplink problems (retries, low TX rate on the board) often come from this.
+The link is **asymmetric**: the board probably transmits at 15 dBm or less, so the AP hears it 5 dB weaker than the board hears the AP. Uplink problems (retries, low TX rate on the board) often come from this.
 
 ---
 
-## 6. Sharing the air: medium access, QoS and aggregation
+## 6. Sharing the air: medium access, QoS, aggregation and spatial reuse
 
 ### CSMA/CA
 
 A radio can't hear a collision while it transmits, so 802.11 avoids collisions instead (carrier sense multiple access with collision avoidance):
 
-1. **Listen** (clear channel assessment): the channel is busy if the radio decodes a Wi-Fi preamble above about -82 dBm (20 MHz), or sees any energy above about -62 dBm.
+1. **Listen** (clear channel assessment, CCA): the primary 20 MHz channel is busy if the radio detects a Wi-Fi preamble at or above -82 dBm, or any energy above about -62 dBm. Secondary channels use other thresholds.
 2. **Wait** a fixed time once the channel is free (DIFS, or AIFS for QoS traffic).
 3. **Back off** a random number of slots between 0 and CW (contention window). The countdown pauses while the channel is busy.
-4. **Transmit**, then wait for the **ACK**, which the receiver sends a SIFS after the frame.
-5. **No ACK:** assume a collision or corruption, double CW (up to CWmax) and retry, up to a retry limit. Then drop the frame.
+4. **Transmit**, then expect an **ACK** (or Block Ack) a SIFS after the frame.
+5. **No ACK:** assume a collision or corruption, double CW (up to CWmax) and retry, usually at a lower rate chosen by rate control, up to a retry limit (dot11 defaults: 7 short, 4 long). Then drop the frame.
 
 | Timing (OFDM) | 2.4 GHz | 5/6 GHz |
 |---|---|---|
-| Slot | 9 µs (20 µs with 802.11b clients) | 9 µs |
+| Slot | 9 µs (20 µs with 802.11b stations) | 9 µs |
 | SIFS | 10 µs | 16 µs |
 | DIFS = SIFS + 2 slots | 28 µs | 34 µs |
 
-Every frame also carries a **duration** field: stations that hear it set their NAV (network allocation vector) and stay quiet until the exchange ends, even if they can't hear the other side.
+Every frame also carries a **duration** field: stations that decode it set their **NAV** (network allocation vector) and stay quiet until the exchange ends, even if they can't hear the other side.
 
 ### Hidden nodes and RTS/CTS
 
@@ -390,11 +453,11 @@ Every frame also carries a **duration** field: stations that hear it set their N
         A and B can't hear each other (walls, distance)
 ```
 
-A and B both sense a free channel and transmit together: the AP receives garbage. With **RTS/CTS**, a station first sends a short request-to-send; the AP answers clear-to-send, which B hears, and B's NAV keeps it quiet. It costs airtime on every frame, so it's used above a size threshold (`iw phy phy0 set rts <bytes|off>`) or automatically by rate control. **CTS-to-self** is a variant used as "protection" so that legacy (802.11b) stations, which can't decode OFDM, stay quiet.
+A and B both sense a free channel and transmit together: the AP receives garbage. With **RTS/CTS**, a station first sends a short request-to-send; the AP answers clear-to-send, which B hears, and B's NAV keeps it quiet. It costs airtime, so it's used above a size threshold (`iw phy phy0 set rts <bytes|off>`, driver-dependent) or automatically by rate control. **CTS-to-self** is a protection mechanism that keeps legacy (802.11b) stations, which can't decode OFDM, quiet.
 
 ### QoS: WMM access categories
 
-802.11e (certified as **WMM**) gives each frame one of four access categories. Higher categories wait less and back off less, so they win the medium more often.
+802.11e (certified as **WMM**) gives each frame one of four access categories. Higher categories wait less and back off less, so they win the medium more often. QoS is mandatory for HT and later rates: an AP with `wmm_enabled=0` limits clients to legacy rates.
 
 | Access category | 802.1D user priority | AIFSN | CWmin | CWmax | TXOP limit |
 |---|---|---|---|---|---|
@@ -403,50 +466,71 @@ A and B both sense a free channel and transmit together: the AP receives garbage
 | AC_BE (best effort) | 0, 3 | 3 | 15 | 1023 | one frame exchange |
 | AC_BK (background) | 1, 2 | 7 | 15 | 1023 | one frame exchange |
 
-Values are the defaults an AP advertises to its clients (hostapd `wmm_ac_*`); the AP's own parameters are a bit more aggressive (`tx_queue_data*`). AIFS = SIFS + AIFSN × slot.
+These are the default client parameters the AP advertises (hostapd `wmm_ac_*`); the AP's own parameters are a bit more aggressive (`tx_queue_data*`). AIFS = SIFS + AIFSN × slot. Wi-Fi 6 adds **MU EDCA** parameters: clients that are being served by uplink OFDMA triggers contend less aggressively on their own.
 
-**How Linux picks the category:** mac80211 asks cfg80211 (`cfg80211_classify8021d()`) to map each packet to a user priority, from the DSCP field (its top 3 bits, with RFC 8325 adjustments in recent kernels). An application can force one with `SO_PRIORITY` set to 256 + UP (256 to 263). An AP can also push a DSCP mapping to its clients (QoS Map, hostapd `qos_map_set`). Most applications send DSCP 0, so most traffic is best effort.
+**How Linux picks the category:** mac80211 calls `cfg80211_classify8021d()`, which maps the packet's DSCP to a user priority (mostly its top 3 bits, with RFC 8325 adjustments in recent kernels). An application can force a priority with `SO_PRIORITY` set to 256 + UP (256 to 263). An AP can push a DSCP mapping to its clients (QoS Map, hostapd `qos_map_set`). Most applications send DSCP 0, so most traffic is best effort.
 
 ### Unicast vs multicast
 
 | | Unicast | Broadcast, multicast |
 |---|---|---|
 | Acknowledged | Yes, retried | No: a lost frame is just lost |
-| Rate | Chosen per client by rate control | The lowest basic rate (1 or 6 Mb/s) so that every client can decode it |
-| Power save | Delivered when the client wakes | Buffered until the next DTIM beacon (section 10) |
+| Rate | Chosen per client by rate control | A basic rate (often 1 or 6 Mb/s) so that every client can decode it |
+| Power save | Delivered when the client wakes | Held until the next DTIM beacon (section 10) |
 
-A 2 Mb/s multicast video stream sent at 6 Mb/s takes a third of the channel's airtime. mDNS, SSDP and IPv6 neighbor discovery chatter costs the same way. Remedies: multicast-to-unicast conversion on the AP (hostapd `multicast_to_unicast=1`, or the bridge port option `mcast_to_unicast`), raising the basic rates (drop 802.11b rates: hostapd `basic_rates=60 120 240` and `supported_rates=60 90 120 180 240 360 480 540`, in units of 100 kb/s), and proxy ARP/ND on the AP (`proxy_arp=1`).
+A 2 Mb/s multicast stream sent at 6 Mb/s takes a third of the channel's airtime; mDNS, SSDP and IPv6 neighbor discovery chatter costs the same way. Remedies:
+- **Multicast-to-unicast** on the AP: hostapd `multicast_to_unicast=1` converts ARP, IPv4 and IPv6 multicast into one unicast frame per client (acknowledged, at each client's rate). It can break receivers that rely on the frame being multicast, and costs airtime when there are many clients.
+- **Raise the basic rates**: drop 802.11b rates with hostapd `basic_rates=60 120 240` and `supported_rates=60 90 120 180 240 360 480 540` (units of 100 kb/s).
+- **Proxy ARP/ND** on the AP (`proxy_arp=1`, with a bridge): the AP answers for its clients so that broadcasts don't wake them.
 
 ### Aggregation and Block Ack
 
-Every transmission pays a fixed cost: AIFS, backoff, a preamble of tens of µs, SIFS and the acknowledgment. At high rates the payload is tiny in comparison: a 1500-byte frame lasts 10 µs at 1201 Mb/s, after about 200 µs of overhead. Aggregation sends many frames per transmission:
+Every transmission pays a fixed cost: AIFS, backoff, a preamble of tens of µs, SIFS and the acknowledgment, about 200 µs in total for best effort (illustrative). At high rates the payload is tiny in comparison: a 1500-byte frame lasts 10 µs at 1201 Mb/s. Aggregation sends many frames per transmission:
 
 | | A-MSDU | A-MPDU |
 |---|---|---|
-| What is aggregated | Several packets inside one 802.11 frame (one header, one FCS) | Several complete 802.11 frames in one transmission (PPDU) |
+| What is aggregated | Several packets inside one MPDU (one 802.11 header, one FCS) | Several MPDUs in one PPDU (one PHY transmission) |
 | One bit error | Loses the whole A-MSDU | Loses only that MPDU |
-| Acknowledgment | One ACK | Block Ack: a bitmap of received frames, only the missing ones are resent |
-| Limits | 7935 B (HT), 11454 B (VHT) | 64 frames (HT/VHT), 256 (HE), 1024 (EHT) per Block Ack window; about 5.5 ms per transmission |
+| Acknowledgment | One ACK (or one Block Ack bit) | Block Ack: a bitmap of received MPDUs, only the missing ones are resent |
+| Limits | 3839 or 7935 B (HT); MPDU up to 11454 B (VHT/HE) | Block Ack window of 64 (HT/VHT), 256 (HE), 1024 (EHT) MPDUs; about 5.5 ms per PPDU |
 
-The two combine (A-MSDUs inside an A-MPDU). With 64 aggregated frames, the same 200 µs overhead is shared by 640 µs of payload: about 75% efficiency instead of 5%. Aggregation needs a queue of packets for the same client and TID: it works for bulk transfers, not for a single ping. A Block Ack session is set up per client and TID with ADDBA action frames.
+The two combine (A-MSDUs inside an A-MPDU). With 64 aggregated frames, the same overhead is shared by about 640 µs of payload: roughly 75% efficiency instead of 5%. Aggregation needs a queue of packets for the same client and TID (traffic identifier): it works for bulk transfers, not for a single ping. A Block Ack agreement is set up per client and TID with ADDBA action frames.
 
 ### Rate control
 
-The transmitter chooses MCS, streams and GI for each frame from recent success statistics: mac80211 has **Minstrel-HT** (used by drivers that leave rate control to the host), and most modern chips run their own algorithm in firmware. When retries rise, rate control drops the MCS; `tx bitrate` in `iw dev wlan0 station dump` is the rate of the last frames sent (section 17).
+The transmitter chooses MCS, streams, width and GI for each transmission from recent success statistics, often with a chain of fallback rates for the retries. mac80211 has **Minstrel-HT** for drivers that leave rate control to the host; most modern chips (iwlwifi, ath10k and later, mt76 Wi-Fi 6+ chips, all FullMAC chips) run their own algorithm in firmware. `tx bitrate` in `iw dev wlan0 station dump` is the rate the driver last reported (section 19).
 
-### Why throughput is far below the PHY rate
+### Airtime, slow clients and real throughput
 
+The same 1 MB costs very different airtime depending on the rate (payload time only, overhead excluded):
+
+| Rate | Airtime for 1 MB |
+|---|---|
+| 6.5 Mb/s (HT MCS 0, 20 MHz: a far client) | 1.23 s |
+| 72.2 Mb/s (HT MCS 7, 20 MHz) | 111 ms |
+| 433.3 Mb/s (VHT MCS 9, 80 MHz, 1 stream: the board) | 18.5 ms |
+| 1201 Mb/s (HE MCS 11, 80 MHz, 2 streams: the phone) | 6.7 ms |
+
+Without airtime fairness, every client gets a similar chance to transmit, so a far client at MCS 0 can take most of the channel's time. mac80211 has an **airtime fairness** scheduler for drivers that support it, and many AP firmwares have their own.
+
+**Why application throughput is far below the PHY rate:**
 - Half duplex: TCP data and TCP ACKs compete for the same channel.
 - Fixed per-transmission overhead, reduced but not removed by aggregation.
-- Retries, and rate control backing off below the best MCS.
+- Retries, and rate control using lower MCS than the best one.
 - Contention with every network on the channel, including neighbors.
-- Airtime shared with slower clients: one distant client at MCS 0 can take most of the channel.
+- Airtime shared with slower clients.
 
-Rule of thumb: a single TCP flow close to the AP gets **50 to 70% of the PHY rate**, shared among all clients of the channel. Section 17 shows what to expect per configuration and how to measure.
+Rule of thumb: a single TCP flow close to the AP gets **50 to 70% of the PHY rate**, shared among all clients of the channel. Section 19 has measured ranges and the method.
 
-**Latency under load (Linux):** mac80211 queues packets per client and TID with fq_codel (intermediate TX queues), and AQL (airtime queue limits, kernel 5.5) caps how much airtime is queued in the driver and firmware. With drivers that support them, latency stays low during bulk transfers. Out-of-tree and FullMAC drivers often queue deep in firmware instead (bufferbloat).
+**Latency under load (Linux):** mac80211 queues packets per client and TID with fq_codel (intermediate TX queues), and AQL (airtime queue limits, kernel 5.5) caps how much airtime sits in the driver and firmware. With drivers that support them, latency stays low during bulk transfers. Drivers that queue deep in firmware (many FullMAC and out-of-tree drivers) show bufferbloat instead.
 
-**Wi-Fi 6 additions for dense networks:** **BSS coloring** (a 6-bit color in each frame lets a station ignore a neighbor network's frames at a higher threshold and transmit anyway: spatial reuse), OFDMA (section 5) and TWT (section 10).
+### Spatial reuse and BSS coloring
+
+Dense deployments waste airtime because a station defers to any frame above -82 dBm, even from a distant neighbor network. Wi-Fi 6 adds:
+
+- **BSS color:** a 6-bit value (1-63) in the HE preamble identifying the BSS. A station knows within microseconds whether a frame is from its own BSS (intra-BSS) or another (OBSS). The AP changes color if it detects a neighbor using the same one (hostapd `he_bss_color`).
+- **OBSS_PD spatial reuse:** for an OBSS frame received between -82 dBm and a higher **OBSS_PD** threshold (up to -62 dBm), a station may ignore it and transmit anyway, but must lower its transmit power for that opportunity. The AP advertises the allowed thresholds in a Spatial Reuse Parameter Set element (hostapd `he_spr_*`).
+- **Limits:** gains depend on geometry and on firmware support (driver-dependent); the reduced power also lowers the MCS of the reused transmission. It helps apartment buildings and offices, not an isolated home.
 
 ---
 
@@ -454,56 +538,88 @@ Rule of thumb: a single TCP flow close to the AP gets **50 to 70% of the PHY rat
 
 ### Frame format
 
+The general MAC frame format. Which fields are present depends on the frame type and flags:
+
 ```
-┌─────────┬──────────┬───────┬───────┬───────┬─────────┬───────┬─────────┬─────────┬─────────────┬─────┐
-│ Frame   │ Duration │ Addr1 │ Addr2 │ Addr3 │ Seq     │ Addr4 │ QoS     │ HT      │ Body        │ FCS │
-│ control │ / ID     │ (RA)  │ (TA)  │       │ control │ (opt) │ control │ control │             │     │
-│ 2 B     │ 2 B      │ 6 B   │ 6 B   │ 6 B   │ 2 B     │ 6 B   │ 2 B     │ 4 B     │ 0-7951+ B   │ 4 B │
-└─────────┴──────────┴───────┴───────┴───────┴─────────┴───────┴─────────┴─────────┴─────────────┴─────┘
+Octets:  2         2          6       6       6       2          6       2         4        0..n     4
+      ┌─────────┬──────────┬───────┬───────┬───────┬──────────┬───────┬─────────┬─────────┬────────┬─────┐
+      │ Frame   │ Duration │ Addr1 │ Addr2 │ Addr3 │ Sequence │ Addr4 │ QoS     │ HT      │ Frame  │ FCS │
+      │ control │ / ID     │ (RA)  │ (TA)  │       │ control  │       │ control │ control │ body   │     │
+      └─────────┴──────────┴───────┴───────┴───────┴──────────┴───────┴─────────┴─────────┴────────┴─────┘
+Present: always   always     always  most    mgmt,   mgmt,      WDS/    QoS data  +HTC=1    variable always
+                                     frames  data    data       mesh    frames
 ```
 
-**Frame control** bits: protocol version, type, subtype, To DS, From DS, More Fragments, **Retry** (set on retransmissions: a high share of retries in a capture means a bad link), Power Management (the sender goes to sleep after this frame), More Data, **Protected** (body encrypted), +HTC.
+| Frame | Header | Example |
+|---|---|---|
+| Management | Frame control, Duration, Addr1-3, Sequence control (+ HT control) = 24 B | Beacon, authentication, association |
+| Data, 3 addresses | 24 B; QoS data adds QoS control = 26 B | Client ↔ AP traffic |
+| Data, 4 addresses | 30 B, or 32 B with QoS | WDS, mesh, 4-address mode |
+| Control | Short formats: ACK and CTS = Frame control, Duration, RA, FCS (14 B in total); RTS adds TA (20 B) | ACK, RTS/CTS, Block Ack, Trigger |
 
-**Sequence control:** a 12-bit sequence number per sender (per TID for QoS data) and a fragment number. The receiver uses it to drop duplicates when an ACK was lost.
+- **Frame control** bits: protocol version, type, subtype, To DS, From DS, More Fragments, **Retry** (set on retransmissions), Power Management (the sender sleeps after this frame), More Data (more buffered frames follow), **Protected** (body encrypted), +HTC (an HT/VHT/HE control field is present; HE uses it to carry buffer status, operating mode changes and more).
+- **Duration/ID:** time in µs to reserve the medium (the NAV), or the AID in PS-Poll frames.
+- **Sequence control:** a 12-bit sequence number (per TID for QoS data) and a fragment number, used to drop duplicates when an ACK was lost and to reorder A-MPDUs.
+- **Frame body:** a single MSDU carries up to 2304 B; an MPDU carrying an A-MSDU can reach 7991 or 11454 B with VHT/HE. Encryption adds a header and a MIC inside the body.
 
-On the air, a 1500-byte IP packet becomes: QoS data header 26 B + CCMP header 8 B + LLC/SNAP 8 B + 1500 B + MIC 8 B + FCS 4 B = 1554 B, preceded by a PHY preamble.
+On the air, a 1500-byte IP packet in a CCMP-protected QoS data frame becomes: header 26 B + CCMP header 8 B + LLC/SNAP 8 B + 1500 B + MIC 8 B + FCS 4 B = **1554 B**, inside a PPDU that starts with the PHY preamble. GCMP-256 has a 16 B MIC.
 
 ### Frame types
 
 | Type | Subtypes (value) | Wireshark filter |
 |---|---|---|
-| Management | Association request (0), response (1), reassociation request (2), response (3), probe request (4), probe response (5), beacon (8), disassociation (10), authentication (11), deauthentication (12), action (13) | `wlan.fc.type == 0`, e.g. beacons `wlan.fc.type_subtype == 0x08` |
+| Management | Association request (0), response (1), reassociation request (2), response (3), probe request (4), probe response (5), beacon (8), disassociation (10), authentication (11), deauthentication (12), action (13), action no-ack (14) | `wlan.fc.type == 0`, beacons `wlan.fc.type_subtype == 0x08` |
 | Control | Trigger (2), Block Ack request (8), Block Ack (9), PS-Poll (10), RTS (11), CTS (12), ACK (13) | `wlan.fc.type == 1` |
 | Data | Data (0), null (4), QoS data (8), QoS null (12) | `wlan.fc.type == 2` |
 
-Null frames carry no data: clients send them to signal power save changes, and APs to poll idle clients. **Action frames** carry most newer features: Block Ack setup, spectrum management (channel switch), radio measurements (802.11k), BSS transition (802.11v), FT (802.11r), SA Query (PMF). EAPOL handshake frames are ordinary data frames (EtherType 0x888e).
+Null and QoS null frames carry no data: clients send them to signal power save changes, and APs to poll idle clients. **Action frames** carry most newer features: Block Ack setup, channel switch, radio measurements (802.11k), BSS transition (802.11v), FT (802.11r), SA Query (PMF), GAS/ANQP (Passpoint), TDLS discovery. EAPOL handshake frames are ordinary data frames (EtherType 0x888e).
 
 ### The four address fields
 
-The To DS / From DS bits say which way a frame goes relative to the distribution system (the wired side), and give the address fields their meaning. RA/TA are the radios at each end of this hop, DA/SA the final destination and original source.
+To DS and From DS say which way a frame goes relative to the distribution system, and give the address fields their meaning. RA and TA are the receiver and transmitter of this hop; DA and SA the final destination and original source.
 
 | To DS | From DS | Case | Addr1 | Addr2 | Addr3 | Addr4 |
 |---|---|---|---|---|---|---|
-| 0 | 0 | Management, control, IBSS | DA | SA | BSSID | - |
+| 0 | 0 | Management, control, IBSS, TDLS | DA | SA | BSSID | - |
 | 1 | 0 | Client → AP | BSSID (RA) | SA (TA) | DA | - |
 | 0 | 1 | AP → client | DA (RA) | BSSID (TA) | SA | - |
 | 1 | 1 | AP ↔ AP: WDS, mesh, 4-address mode | RA | TA | DA | SA |
 
-Example: the board pings the laptop, both on the gateway AP. Frame 1 (board → AP): Addr1 = AP BSSID `...:a0`, Addr2 = board `...:15`, Addr3 = laptop `...:64`. The AP turns it into Ethernet for `br-lan`; the bridge sends it back out of `wlan0`. Frame 2 (AP → laptop): Addr1 = laptop, Addr2 = BSSID, Addr3 = board.
+Example: the board pings the phone, both on the gateway AP. The frame crosses the air twice, with different addresses:
 
-**802.11 to Ethernet:** the data body starts with an LLC/SNAP header (`aa aa 03 00 00 00` + EtherType). The AP, or the driver on a client, replaces the 802.11 header and LLC/SNAP with an Ethernet header (DA, SA, EtherType). That's why `tcpdump -i wlan0` shows Ethernet frames, with no 802.11 header (section 15).
+```mermaid
+sequenceDiagram
+    participant B as Board 00:00:5e:00:53:15
+    participant A as Gateway AP, BSSID 00:00:5e:00:53:a0
+    participant P as Phone 00:00:5e:00:53:65
+    B->>A: To DS. Addr1 = BSSID ..53:a0, Addr2 = board ..53:15, Addr3 = phone ..53:65
+    A->>B: ACK
+    Note over A: 802.11 to Ethernet, br-lan forwards it back out of wlan0
+    A->>P: From DS. Addr1 = phone ..53:65, Addr2 = BSSID ..53:a0, Addr3 = board ..53:15
+    P->>A: ACK
+```
+
+**802.11 to Ethernet:** the data body starts with an LLC/SNAP header (`aa aa 03 00 00 00` + EtherType). The AP, or the client's driver or firmware, replaces the 802.11 header and LLC/SNAP with an Ethernet header (DA, SA, EtherType). That's why `tcpdump -i wlan0` shows Ethernet frames without 802.11 headers (section 17).
 
 ### Why a station can't be bridged
 
-A 3-address frame from a client carries only one source address, and it must be the client's own MAC: the AP drops frames from MACs that aren't associated. So if the board puts `wlan0` (station) in a bridge with `eth0`, frames from devices behind `eth0` can't be sent with their own source MAC, and replies to them have no way back. Options:
+A 3-address frame from a client has room for only one source address, and it must be the client's own MAC: the AP drops frames from MACs that aren't associated. So if the board bridges `eth0` and `wlan0` (station), frames from a PC behind `eth0` can't be sent with the PC's source MAC, and replies to the PC have no way back.
+
+```
+ PC 00:00:5e:00:53:77 ──eth0──► Board br0 ──wlan0 (station)──► AP
+                                 3 addresses: Addr1 = BSSID, Addr2 = TA = must be the board 53:15,
+                                 Addr3 = DA. No field left for SA = 53:77
+```
+
+Linux enforces it: `ip link set wlan0 master br0` on a managed interface fails with `Device does not allow enslaving to a bridge`, unless 4-address mode is on. Options:
 
 | Approach | How | Limits |
 |---|---|---|
-| Route (and usually NAT) | Separate subnet behind the board, like any router | Not one LAN: discovery protocols don't cross |
-| 4-address mode (WDS) | `iw dev wlan0 set 4addr on` on the client, `wds_sta=1` on a hostapd AP | Both ends must support it, usually Linux to Linux |
-| Pseudo-bridge (proxy ARP, relayd) | The board answers ARP for the hosts behind it and routes | IPv4 only unless extra work, fragile with DHCP |
-| MAC NAT | Rewrite source MACs to the board's (ebtables, some vendor firmware) | Breaks protocols that care about MACs |
-| 802.11s mesh | Mesh interfaces use 4 addresses natively (section 10) | All nodes must run the mesh |
+| Route (and usually NAT) | Separate subnet behind the board, like any router ([gateway note](../../networking/gateway/gateway.md)) | Not one LAN: discovery protocols don't cross |
+| 4-address mode (WDS) | `iw dev wlan0 set 4addr on` on the client, `wds_sta=1` on a hostapd AP | Both ends must support it; mostly Linux to Linux or one vendor |
+| Pseudo-bridge (proxy ARP, relayd) | The board answers ARP for hosts behind it and routes | IPv4-centric, fragile with DHCP |
+| MAC NAT | Rewrite source MACs to the board's (ebtables, vendor firmware) | Breaks protocols that care about MACs |
+| 802.11s mesh | Mesh interfaces use 4 addresses natively (section 11) | All nodes must run the mesh |
 
 ---
 

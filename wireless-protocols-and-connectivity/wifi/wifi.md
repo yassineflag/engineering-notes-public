@@ -1753,29 +1753,55 @@ tshark -r home-ch36.pcap -Y 'wlan.addr == 00:00:5e:00:53:15 && (eapol || wlan.fc
 
 ---
 
-## 16. Integrating a Wi-Fi chip on a board
+## 18. Integrating a Wi-Fi chip on a board
 
-### Buses
+```mermaid
+flowchart LR
+    subgraph SOC["Application processor (SoC)"]
+        sdhc["SDIO host controller<br/>(or PCIe, USB)"]
+        uart["UART with RTS/CTS"]
+        gpio["GPIOs"]
+        clk["32.768 kHz clock<br/>(RTC or PMIC)"]
+        pwr["Regulators"]
+    end
+    subgraph MOD["Wi-Fi + Bluetooth module"]
+        wl["Wi-Fi core<br/>firmware, NVRAM, CLM"]
+        bt["Bluetooth core<br/>firmware patch"]
+        fe["RF front end<br/>PA, LNA, switch, filters"]
+    end
+    ant["Antenna(s)"]
+    sdhc ---|"CLK, CMD, D0-D3"| wl
+    uart ---|"HCI"| bt
+    gpio ---|"WL_REG_ON, BT_REG_ON"| MOD
+    wl ---|"WL_HOST_WAKE (interrupt, wake)"| gpio
+    clk ---|"LPO"| MOD
+    pwr ---|"VBAT, VDDIO"| MOD
+    wl --- fe
+    bt --- fe
+    fe --- ant
+```
 
-| Bus | Practical Wi-Fi throughput | Pros | Cons |
-|---|---|---|---|
-| SDIO (3.0, 4-bit) | Typically 100-400 Mb/s, depends on the host controller | Few pins, low power, most embedded modules | Bus ceiling below Wi-Fi 6 rates, signal integrity at 100-200 MHz clocks, host controller quirks |
-| PCIe | Gigabit and above | Full Wi-Fi 6/7 rates, M.2 modules | Power, needs a PCIe controller, larger modules |
-| USB 2.0 / 3.x | About 250 Mb/s / gigabit | Easy (dongles), hot-plug | USB 2.0 caps throughput; more latency and power; USB 3 noise near 2.4 GHz |
-| SPI | Tens of Mb/s at best | Any host | Slow, FullMAC only (wilc1000, ESP32 hosted firmware) |
+### Buses and enumeration
 
-Combo chips usually put Wi-Fi on SDIO or PCIe and Bluetooth on a UART (HCI) or USB.
+| Bus | Practical Wi-Fi throughput (rule of thumb) | How it enumerates | Pros | Cons |
+|---|---|---|---|---|
+| SDIO 3.0, 4-bit | 100-400 Mb/s, depends on host controller and clock | The MMC core detects the card once powered; functions bind the driver (`/sys/bus/sdio/devices/mmc1:0001:1/{vendor,device}`) | Few pins, low power, most embedded modules | Bus ceiling below Wi-Fi 6 rates, signal integrity at 100-200 MHz, host controller quirks |
+| PCIe | Gigabit and above | Link training at boot, then `lspci -nnk` | Full Wi-Fi 6/7 rates, M.2 modules | Power, needs a PCIe controller, ASPM power-state issues |
+| USB 2.0 / 3.x | About 250 Mb/s / gigabit | Hot-plug, `lsusb -t` | Easy (dongles) | USB 2.0 caps throughput; autosuspend and latency issues; USB 3 noise near 2.4 GHz |
+| SPI | Tens of Mb/s at best | Device tree node, driver probe | Any host | Slow, FullMAC only (wilc1000, ESP32 hosted firmware) |
+
+Combo chips usually put Wi-Fi on SDIO or PCIe and Bluetooth on a UART (HCI) or USB. An SDIO card that isn't powered is invisible: "no `wlan0`" on a new board starts with power and reset, not with the driver.
 
 ### Signals and power sequencing
 
 | Signal | Role |
 |---|---|
-| `WL_REG_ON` | Enables the Wi-Fi part (internal regulators). Held low = chip off. Controlled by a GPIO |
-| `BT_REG_ON` | Same for Bluetooth on combo chips |
+| `WL_REG_ON` | Enables the Wi-Fi part (internal regulators). Low = Wi-Fi off. A GPIO driven by the host, released after power is stable |
+| `BT_REG_ON` | Same for Bluetooth on combo chips. Some chips need both sequenced in a given order |
 | `WL_HOST_WAKE` | Out-of-band interrupt from the chip (instead of SDIO in-band interrupts), and the wake source in suspend |
-| 32.768 kHz LPO | Sleep clock. Some modules need it from the host (RTC or PMIC output), and fail in strange ways without it |
-| VBAT, VDDIO | Main supply and I/O voltage. VDDIO must match the SDIO host's signaling (1.8 V for UHS modes, `vqmmc-supply`) |
-| SDIO CLK, CMD, D0-D3 | Keep short, matched, with clean ground: most "flaky Wi-Fi" on new boards is SDIO signal integrity |
+| 32.768 kHz LPO | Sleep clock. Some modules need it from the host (RTC or PMIC output) and fail in strange ways without it |
+| VBAT, VDDIO | Main supply and I/O voltage. VDDIO must match the SDIO host's signaling: 1.8 V I/O for UHS modes (`vqmmc-supply`). TX bursts draw current peaks: check supply droop |
+| SDIO CLK, CMD, D0-D3 | Keep short, matched, with clean ground. Much "flaky Wi-Fi" on new boards is SDIO signal integrity |
 
 ### Device tree (SDIO, brcmfmac example)
 
@@ -1783,7 +1809,7 @@ Combo chips usually put Wi-Fi on SDIO or PCIe and Bluetooth on a UART (HCI) or U
 / {
 	wifi_pwrseq: wifi-pwrseq {
 		compatible = "mmc-pwrseq-simple";
-		reset-gpios = <&gpio2 10 GPIO_ACTIVE_LOW>;	/* WL_REG_ON, released after power-up */
+		reset-gpios = <&gpio2 10 GPIO_ACTIVE_LOW>;	/* WL_REG_ON: asserted (low) until power-up */
 		post-power-on-delay-ms = <200>;
 		clocks = <&pmic_clk32k>;			/* 32.768 kHz LPO, if the module needs it */
 		clock-names = "ext_clock";
@@ -1813,31 +1839,36 @@ Combo chips usually put Wi-Fi on SDIO or PCIe and Bluetooth on a UART (HCI) or U
 };
 ```
 
-Controller, GPIO and regulator labels are examples (`usdhc2` is an i.MX SD controller). Useful extra properties when debugging: `max-frequency = <50000000>;` to rule out signal integrity, `cap-power-off-card` to let the host power the card off. PCIe and USB chips are discovered on their bus and usually need no Wi-Fi node, only the power and reset GPIOs (regulators, `reset-gpios` or a pwrseq on the PCIe controller).
+- Labels for the controller, GPIOs and regulators are examples (`usdhc2` is an i.MX SD controller); delays come from the module datasheet.
+- Debug helpers: `max-frequency = <50000000>;` rules out signal integrity; `cap-power-off-card` lets the host power the card off (and changes suspend behavior).
+- PCIe and USB chips are discovered on their bus and need no Wi-Fi node, only their power and reset (regulators, a reset GPIO or a pwrseq on the PCIe controller node).
+- The Bluetooth half of a combo chip is a child of its UART node (serdev), with its own enable and wake GPIOs and firmware. See the [Bluetooth notes](../bluetooth/).
 
 ### Bring-up order
 
 | Step | Check | Passing looks like |
 |---|---|---|
 | 1. Power and clock | Measure VBAT, VDDIO, `WL_REG_ON` going high, the 32 kHz clock | Levels and timing from the module datasheet |
-| 2. Bus enumeration | `dmesg | grep mmc`, `ls /sys/bus/sdio/devices/`, `lspci`, `lsusb` | `mmc1: new high speed SDIO card at address 0001`; vendor `0x02d0` (Broadcom/Infineon) |
-| 3. Driver and firmware | `dmesg | grep -i -e brcmf -e firmware`, `ethtool -i wlan0` | Firmware version line, no `-2` errors |
-| 4. Radio | `iw list`, `iw reg get` | Expected bands, channels, modes, the right country |
-| 5. Scan | `iw dev wlan0 scan | grep -e SSID -e signal` | Neighbor networks at signal levels similar to a phone in the same place |
-| 6. Connect | wpa_supplicant, DHCP | Section 13 |
-| 7. Throughput, stability | iperf3 over hours, both directions (section 17) | No firmware crashes or bus errors in `dmesg` |
+| 2. Bus enumeration | `dmesg | grep mmc`, `ls /sys/bus/sdio/devices/`, `lspci -nnk`, `lsusb` | `mmc1: new high speed SDIO card at address 0001` (or `ultra high speed SDR104`); vendor `0x02d0` for Broadcom/Infineon |
+| 3. Driver and firmware | `dmesg | grep -i -e brcmf -e firmware`, `ethtool -i wlan0` | A firmware version line, no unresolved `-2` errors |
+| 4. Radio and regulatory | `iw list`, `iw reg get` | Expected bands, channels, modes and country |
+| 5. Scan | `sudo iw dev wlan0 scan | grep -e SSID -e signal` | Neighbor networks at signal levels similar to a reference device in the same place |
+| 6. Connect | wpa_supplicant, DHCP | Section 15 |
+| 7. Throughput and stability | iperf3 over hours, both directions (section 19) | No firmware crashes or bus errors in `dmesg` |
 | 8. Suspend, resume, reboot loops | Hundreds of cycles | The chip comes back every time |
 
 ### Firmware and calibration files
 
 | Driver | Files in `/lib/firmware` | Notes |
 |---|---|---|
-| brcmfmac | `brcm/brcmfmac43455-sdio.bin` (firmware), `.clm_blob` (regulatory and power tables), `.txt` (NVRAM) | NVRAM is **board-specific**: antenna, TX power, crystal, MAC. The driver first looks for a name with the DT root `compatible` (`brcmfmac43455-sdio.raspberrypi,4-model-b.txt`). Get it from the module vendor |
-| ath10k, ath11k | `ath10k/QCA6174/hw3.0/firmware-6.bin`, `board-2.bin` (calibration per board ID) | Wrong board data: low power, poor range, or no probe |
+| brcmfmac | `brcm/brcmfmac43455-sdio.bin` (firmware), `.clm_blob` (country and power tables), `.txt` (NVRAM) | NVRAM is **board-specific**: antenna, TX power, crystal, sometimes the MAC. The driver first tries names with the DT root `compatible` (`brcmfmac43455-sdio.raspberrypi,4-model-b.txt`). Get the files from the module vendor |
+| ath10k, ath11k | `ath10k/QCA6174/hw3.0/firmware-6.bin`, `board-2.bin` (calibration per board ID) | Wrong board data: low power, poor range, or probe failure |
 | iwlwifi | `iwlwifi-<chip>-<api>.ucode`, `.pnvm` on newer chips | The driver tries API versions from newest to oldest |
-| mt76 | `mediatek/WIFI_RAM_CODE_MT7961_1.bin`, `mediatek/WIFI_MT7961_patch_mcu_1_2_hdr.bin` (mt7921) | |
+| mt76 | e.g. `mediatek/WIFI_RAM_CODE_MT7961_1.bin`, `mediatek/WIFI_MT7961_patch_mcu_1_2_hdr.bin` (mt7921) | |
 
-**MAC addresses:** from the chip's OTP, the NVRAM, or the device tree (`local-mac-address`, or an NVMEM cell in an EEPROM). Check that two units of your product have different MACs: some modules' default NVRAM contains a placeholder MAC.
+Calibration and regulatory data (NVRAM, board files, CLM, OTP/EEPROM in the chip) are part of the **certified configuration**: changing them can change transmit power and invalidate the certification.
+
+**MAC addresses:** from the chip's OTP, the NVRAM, or the device tree (`local-mac-address` or an NVMEM cell), depending on what the driver supports. Check that two units have different MACs: some modules' sample NVRAM files contain a placeholder MAC.
 
 ### Kernel and build options
 
@@ -1845,6 +1876,7 @@ Controller, GPIO and regulator labels are examples (`usdhc2` is an i.MX SD contr
 |---|---|
 | `CONFIG_CFG80211`, `CONFIG_MAC80211` | The stack (mac80211 only for SoftMAC drivers) |
 | Driver: `CONFIG_BRCMFMAC` + `CONFIG_BRCMFMAC_SDIO`, `CONFIG_ATH10K_PCI`, `CONFIG_MT7921E`... | Your chip and bus |
+| `CONFIG_CFG80211_REQUIRE_SIGNED_REGDB` and its key options | Regulatory database signature checking (section 12) |
 | `CONFIG_RFKILL` | rfkill |
 | `CONFIG_CFG80211_WEXT` | Only for old tools that still use WEXT |
 | `CONFIG_MAC80211_DEBUGFS`, `CONFIG_CFG80211_DEBUGFS` | Debug counters (development builds) |
@@ -1853,52 +1885,71 @@ Controller, GPIO and regulator labels are examples (`usdhc2` is an i.MX SD contr
 | Build system | Packages |
 |---|---|
 | Buildroot | `BR2_PACKAGE_WPA_SUPPLICANT` (with its `_WPA3`, `_AUTOSCAN`, `_CLI` options), `BR2_PACKAGE_HOSTAPD`, `BR2_PACKAGE_IW`, `BR2_PACKAGE_WIRELESS_REGDB`, `BR2_PACKAGE_LINUX_FIRMWARE` with the per-chip options |
-| Yocto | `wpa-supplicant`, `hostapd`, `iw`, `wireless-regdb-static`, `linux-firmware-<chip>` (split packages such as `linux-firmware-bcm43455`), `DISTRO_FEATURES` containing `wifi` |
+| Yocto | `wpa-supplicant`, `hostapd`, `iw`, `wireless-regdb-static`, `linux-firmware-<chip>` split packages (e.g. `linux-firmware-bcm43455`), `wifi` in `DISTRO_FEATURES` |
 
-Package and option names change between releases: check them in your version.
+Package and option names change between releases: check them in your version. hostapd and wpa_supplicant features are also chosen at build time (`.config`: `CONFIG_SAE`, `CONFIG_OWE`, `CONFIG_DPP`, `CONFIG_IEEE80211BE`...): a feature missing from the build fails as an unknown configuration option.
 
-### Antennas and RF
+### Antennas, RF and coexistence
 
-- **Types:** PCB trace or chip antennas (cheap, need a ground plane and a keep-out area, sensitive to nearby metal), external antennas on u.FL/MHF connectors (small cables lose a few dB per meter at 5 GHz).
-- **Placement:** away from metal, batteries, displays, DDR and switching regulators; not inside a metal enclosure without an external antenna.
-- **Two chains, two antennas:** compare per-chain signals in `iw dev wlan0 station dump` (`signal: -52 [-54, -57] dBm`). A chain much weaker than the other points to an antenna, cable or connector problem.
-- **Noise from your own board:** USB 3.0, HDMI, DDR and DC-DC converters raise the noise floor. Compare `noise` in `iw dev wlan0 survey dump` with the interferer on and off.
-- **Coexistence:** on combo chips, Wi-Fi on 2.4 GHz and Bluetooth share the band and often the antenna, arbitrated by the chip (PTA). Bluetooth audio plus 2.4 GHz Wi-Fi throughput suffer together: put Wi-Fi on 5 GHz when possible. A cellular modem on nearby bands (LTE bands 7, 40, 41) needs filtering and antenna separation.
+- **Antennas:** PCB trace or chip antennas need a ground plane and a keep-out area and are detuned by nearby metal and plastic; external antennas on u.FL/MHF connectors lose a few dB per meter of thin cable at 5 GHz. Use only antenna types and gains covered by the module's certification. RF design itself belongs in the [RF notes](../../hardware/rf/).
+- **Placement:** away from metal, batteries, displays, DDR and switching regulators; not inside a metal enclosure without an external antenna. Test in the final enclosure.
+- **Two chains:** compare per-chain signals in `iw dev wlan0 station dump` (`signal: -52 [-54, -57] dBm`). One chain much weaker than the other points to an antenna, cable or connector problem.
+- **Self-interference:** USB 3.0, HDMI, DDR and DC-DC converters raise the noise floor. Compare `noise` in `iw dev wlan0 survey dump` with the suspected source on and off.
+- **Bluetooth coexistence:** on combo chips, 2.4 GHz Wi-Fi and Bluetooth share the band and often the antenna; the chip arbitrates between them (packet traffic arbitration, PTA), configured by firmware and NVRAM. Bluetooth audio and 2.4 GHz Wi-Fi throughput suffer together: put Wi-Fi on 5/6 GHz when possible. With separate chips, wire their coexistence signals if both support them.
+- **Cellular coexistence:** an LTE/5G modem on nearby bands (7, 38, 40, 41, n41) needs filtering and antenna separation.
+
+### Suspend and resume
+
+- Without Wake on WLAN configured, cfg80211 disconnects from the AP when the system suspends, and the connection manager reconnects on resume.
+- With WoWLAN (section 19), the chip stays powered and associated (`keep-power-in-suspend`), and wakes the host through `WL_HOST_WAKE`.
+- Typical bugs: the SDIO card loses power and must re-enumerate and reload its firmware; the driver's resume path fails; the wake interrupt isn't a wake source. Test hundreds of cycles, with and without traffic.
+
+### Development vs production configuration
+
+| Topic | Development | Production |
+|---|---|---|
+| Firmware | Debug or test-mode firmware, verbose logging | The certified release firmware, NVRAM and regulatory files, versioned and updatable |
+| Regulatory | `iw reg set` by hand | Country fixed per product SKU, matching certification; users can't select another |
+| Debug interfaces | debugfs, monitor mode, `-dd` logs, `-K` key logging | Not mounted or not built; no key logging |
+| Credentials | In a config file | `0600` on a data partition (or a secure element / encrypted storage), never in the read-only image |
+| Control sockets | Open to all | Group-restricted |
+| Per-unit data | Defaults | MAC address and calibration programmed and checked at the end-of-line test |
+| Recovery | Reflash | Factory reset to provisioning mode, firmware updates with rollback |
 
 ### Certification and regulatory
 
 - **Use a pre-certified module** (modular approval: FCC ID, ISED, CE RED, MIC...). The approval holds only if you follow the module's integration rules: listed antenna types and maximum gains, trace layout, labeling.
-- **The end product still needs its own tests and declarations** (EU RED, FCC unintentional emitter, ...), and test labs need **test modes**: continuous transmission on a given channel, rate and power. They come from the vendor (manufacturing tools, special firmware, `nl80211` testmode): ask for them early.
-- **Lock regulatory settings:** users must not choose a country or TX power outside the certified ones. Ship the matching regulatory data (CLM blob, board data, regdb) and set the country per product SKU.
-- **EU RED cybersecurity:** since 1 August 2025, internet-connected radio equipment sold in the EU must meet the RED delegated act requirements (harmonized standards EN 18031-1/2/3): no universal default passwords, protected credentials, secure updates.
+- **The product still needs its own tests and declarations** (EU RED: radio standards such as ETSI EN 300 328 for 2.4 GHz, EN 301 893 for 5 GHz, EN 303 687 for 6 GHz, plus EMC and safety; FCC Part 15). Test labs need **test modes**: continuous transmission at a fixed channel, rate and power, from vendor manufacturing tools or test firmware. Ask the module vendor early.
+- **EU RED cybersecurity:** since 1 August 2025, internet-connected radio equipment sold in the EU must meet the RED delegated act requirements (harmonized standards EN 18031-1/-2/-3): no universal default passwords, protected credentials, secure updates.
+- **Vehicles:** besides the band rules in section 4, automotive products need automotive-grade parts and temperature ranges, and fast AP startup (avoid DFS channels).
 
 ---
 
-## 17. Performance, power and tuning
+## 19. Performance, power and tuning
 
 ### Measuring throughput
 
-Run an `iperf3` server on a wired host (the dev laptop on Ethernet, not over the same Wi-Fi), so the test measures one wireless hop:
+Run `iperf3 -s` on the wired dev laptop (`192.168.10.100`, section 2). A test from the board then crosses one wireless hop (board ↔ gateway AP), the gateway's bridge and Ethernet, so it measures the Wi-Fi link and not two wireless hops:
 
 ```bash
-iperf3 -s                                     # on the wired host
-iperf3 -c 192.168.10.100 -t 30                # board → host (uplink)
-iperf3 -c 192.168.10.100 -t 30 -R             # host → board (downlink)
-iperf3 -c 192.168.10.100 -t 30 -P 4           # 4 parallel streams
-iperf3 -c 192.168.10.100 -u -b 150M -t 30     # UDP at a fixed rate: loss and jitter, no TCP effects
+iperf3 -s                                       # on the dev laptop (wired)
+iperf3 -c 192.168.10.100 -t 30                  # board → laptop: board uplink
+iperf3 -c 192.168.10.100 -t 30 -R               # laptop → board: board downlink
+iperf3 -c 192.168.10.100 -t 30 -P 4             # 4 parallel streams
+iperf3 -c 192.168.10.100 -u -b 150M -t 30       # UDP at a fixed rate: loss and jitter without TCP effects
 ```
 
-Typical TCP throughput close to the AP, on a clean channel:
+Typical TCP throughput close to the AP, on a clean channel (rule of thumb):
 
 | Link (PHY rate) | TCP throughput |
 |---|---|
 | 1x1 Wi-Fi 4, 20 MHz (72 Mb/s) | 40-55 Mb/s |
-| 1x1 Wi-Fi 5, 80 MHz (433 Mb/s) | 200-300 Mb/s, less if SDIO limits it |
+| 1x1 Wi-Fi 5, 80 MHz (433 Mb/s) | 200-300 Mb/s, less if the SDIO bus limits it |
 | 2x2 Wi-Fi 5, 80 MHz (867 Mb/s) | 450-650 Mb/s |
 | 2x2 Wi-Fi 6, 80 MHz (1201 Mb/s) | 650-900 Mb/s |
 | 2x2 Wi-Fi 6, 160 MHz (2402 Mb/s) | 1.2-1.8 Gb/s |
 
-### Reading `station dump` and `survey dump`
+### Reading `station dump`, counters and `survey dump`
 
 ```
 $ iw dev wlan0 station dump
@@ -1924,15 +1975,24 @@ Station 00:00:5e:00:53:a0 (on wlan0)
 	connected time:	3600 seconds
 ```
 
-| Field | What to look for |
-|---|---|
-| `signal`, `signal avg` (per chain in brackets) | Section 5 levels; chains within a few dB of each other |
-| `tx retries` / `tx packets` | Under about 10% is healthy; above 30%, interference, weak uplink or hidden nodes |
-| `tx failed` | Frames dropped after all retries: should stay near zero |
-| `tx bitrate` vs `rx bitrate` | Large asymmetry: the device's uplink (TX power, antenna) is the weak side |
-| `expected throughput` | mac80211's estimate from rate control: compare with iperf3 |
-| `beacon loss` | Missed beacons: weak signal, interference or firmware trouble |
-| `authorized`, `MFP` | The handshake completed; PMF in use |
+**Counters are cumulative and driver-reported:** sample them twice under the same load and compare differences, not absolute values.
+
+| Field | Meaning | Caveats |
+|---|---|---|
+| `tx packets` | Frames sent to this peer | Counted by mac80211 or the driver, per MSDU |
+| `tx retries` | Retransmission attempts reported by the driver: a frame sent 3 times adds 2 or 3 | Not a count of frames that needed a retry, so `retries / packets` isn't a retry rate. Drivers that report status per A-MPDU, or not at all (many FullMAC), undercount or show 0 |
+| `tx failed` | Frames dropped after the last retry | Each is a lost packet that TCP must recover: should stay near zero |
+| `signal`, `signal avg` | Last and averaged signal, per chain in brackets | Chip calibration differs (section 5) |
+| `tx bitrate`, `rx bitrate` | The rate the driver last reported | A snapshot, not an average. A large asymmetry points to the weaker direction |
+| `expected throughput` | Estimate from rate control | Only with Minstrel or drivers that compute it |
+| `beacon loss` | Missed beacons | Weak signal, interference, firmware trouble |
+
+The same counters per interface, plus netdev counters:
+
+```bash
+ethtool -S wlan0 | grep -e tx_retries -e tx_retry_failed -e rx_dropped -e signal   # mac80211 drivers
+ip -s link show wlan0           # packets to/from the IP stack; TX dropped = queue drops before the driver
+```
 
 ```
 $ iw dev wlan0 survey dump
@@ -1945,7 +2005,9 @@ Survey data from wlan0
 	channel transmit time:		1900 ms
 ```
 
-**Channel utilization** = busy / active = 28% here. Above about 50%, the channel is congested: change channel (or band) before tuning anything else. The other channels' values appear when the driver surveys during scans. The noise value is the place to spot local interference (section 16).
+- **Channel utilization** = busy / active = 28% here, **including your own traffic**. Busy - receive - transmit (about 1.6% here) approximates time taken by others and by interference the radio couldn't decode. What counts as "receive" (all frames, or only frames for this device) depends on the driver.
+- Survey support, the meaning of the counters and when they reset are driver-dependent; other channels appear when the driver surveys during scans.
+- High utilization with little of your own traffic means a congested channel: change channel or band before tuning anything else.
 
 ### What limits throughput
 
@@ -1953,20 +2015,20 @@ Survey data from wlan0
 |---|---|
 | Radio: signal, width, streams | `iw dev wlan0 link`: MCS, width, NSS |
 | Contention, neighbors | `survey dump` busy time, `scan` for networks on the same channel |
-| Bus | SDIO clock in `dmesg` or `/sys/kernel/debug/mmc1/ios`; a fixed ceiling whatever the signal |
-| CPU | `mpstat -P ALL 1` or `top` during iperf3: one core at 100% in softirq or `ksoftirqd`. Software crypto when the chip doesn't do it |
-| TCP | Single stream lower than `-P 4`: window or latency limited |
-| The other side | Run the same test on the wired side, and from a laptop over Wi-Fi |
+| Bus | SDIO clock and mode in `/sys/kernel/debug/mmc1/ios` or `dmesg`; a fixed ceiling whatever the signal |
+| CPU | `mpstat -P ALL 1` or `top` during iperf3: one core at 100% in softirq or `ksoftirqd`; software crypto if the chip doesn't do it |
+| TCP | One stream much slower than `-P 4`: window or latency limited |
+| The other end | Test the gateway-to-laptop path on Ethernet, and the AP with another client (the phone) |
 
 ### Tuning checklist
 
-- **Set the country:** the default world domain disables channels and power.
-- **Pick the channel** from `survey dump` and a scan, not by default. 2.4 GHz: 1, 6 or 11 at 20 MHz. 5 GHz: 80 MHz.
+- **Set the country:** the default world domain disables channels and limits power.
+- **Pick the channel** from `survey dump` and a scan. 2.4 GHz: 1, 6 or 11 at 20 MHz. 5 GHz: 80 MHz.
 - **Disable power save** where latency matters (below).
-- **Avoid background scans** on stationary devices: no `bgscan`, or fewer scans from the manager (NetworkManager scans periodically while connected).
-- **Don't maximize the AP's TX power:** clients hear it from far away but can't answer; it also delays roaming.
-- **Drop legacy 802.11b rates** on the AP, and convert multicast to unicast (section 6).
-- **Update the firmware and driver:** performance and stability fixes are frequent.
+- **Avoid background scans** on stationary devices: no `bgscan`, and fewer periodic scans from the connection manager.
+- **Don't maximize the AP's TX power:** clients hear it far away but can't answer, and roam later.
+- **Drop legacy 802.11b rates** and convert multicast to unicast on the AP (section 6).
+- **Update firmware and driver:** performance and stability fixes are frequent.
 
 ### Power save and latency
 
@@ -1978,13 +2040,13 @@ sudo iw dev wlan0 set power_save off       # not persistent: set it at each conn
 | Where | Persistent setting |
 |---|---|
 | NetworkManager | `nmcli con modify Home 802-11-wireless.powersave 2` (2 = disable, 3 = enable) |
-| systemd-networkd / wpa_supplicant | A unit or the `wpa_cli` action script running `iw ... set power_save off` after connection |
+| systemd-networkd / wpa_supplicant | A unit, or the `wpa_cli` action script, running `iw ... set power_save off` after connection |
 | brcmfmac | Power save is on by default; set it off as above |
 | iwlwifi | `iwlmvm` module parameter `power_scheme` (1 = active, 2 = balanced, 3 = low power) |
 
-Measure the effect: `ping -i 0.2 192.168.10.21` from the laptop with power save on and off. With it on, round trips jump to 50-300 ms when the board is idle (section 10).
+Measure the effect with `ping -i 0.2 192.168.10.21` from the laptop, power save on and off: with it on, an idle board shows round trips of tens to hundreds of ms (section 10). Whether `set power_save` reaches the firmware is driver-dependent.
 
-**Battery-powered devices** go the other way: keep power save on, raise the AP's `dtim_period` and the client's listen interval if multicast latency is acceptable, use TWT when both sides support it, and filter useless broadcast traffic at the AP (proxy ARP, multicast-to-unicast). Datasheets give the current per state (TX, RX, power save idle, deep sleep): the radio state usually dominates the device's consumption.
+**Battery-powered devices** go the other way: keep power save on, raise the AP's `dtim_period` and use a long listen interval if multicast latency is acceptable, use TWT when both sides support it, and filter useless broadcast traffic at the AP (proxy ARP, multicast-to-unicast). Datasheets give the current per state (TX, RX, power save idle, deep sleep); measure the real profile with a current probe.
 
 ### Wake on WLAN
 
@@ -1994,86 +2056,112 @@ The chip stays associated while the host suspends, and wakes it on a trigger:
 iw phy phy0 wowlan show
 sudo iw phy phy0 wowlan enable magic-packet disconnect
 echo mem | sudo tee /sys/power/state
-# From the laptop: send a magic packet to 00:00:5e:00:53:15 (wakeonlan, etherwake)
+# From the laptop: wakeonlan 00:00:5e:00:53:15   (or etherwake)
 ```
 
-Triggers include `any`, `disconnect`, `magic-packet`, `patterns` (byte patterns in received packets), `gtk-rekey-failure` and `net-detect` (wake when a known network appears). Hardware requirements: `WL_HOST_WAKE` on a wake-capable GPIO, `wakeup-source` or the interrupt in the device tree, `keep-power-in-suspend` on the SDIO host. The firmware keeps the link alive meanwhile (GTK rekeys, ARP replies), if it supports those offloads.
+Triggers include `any`, `disconnect`, `magic-packet`, `patterns` (byte patterns in received packets), `gtk-rekey-failure`, `net-detect` (wake when a known network appears) and `tcp`, depending on the driver. Requirements: `WL_HOST_WAKE` on a wake-capable GPIO, the interrupt (or `wakeup-source`) in the device tree, `keep-power-in-suspend` on the SDIO host. The firmware keeps the link alive meanwhile (GTK rekeys, ARP replies) only if it supports those offloads.
 
 ---
 
-## 18. Troubleshooting
+## 20. Troubleshooting
 
 ### Method
 
-Work up from the hardware, and don't go further until a step passes. Each step's failure has different causes:
+Work up from the hardware and don't go further until a step passes:
 
-| Step | Question | Commands |
+```mermaid
+flowchart TD
+    A{"wlan0 present,<br/>firmware loaded?"} -->|no| HW["Hardware, power, bus,<br/>driver, firmware"]
+    A -->|yes| B{"Country set,<br/>AP channel allowed?"}
+    B -->|no| REG["Regulatory"]
+    B -->|yes| C{"AP in scan results,<br/>plausible signal?"}
+    C -->|no| SCAN["Scan: band support, hidden SSID,<br/>DFS, antenna, interference"]
+    C -->|yes| D{"Authentication and<br/>association succeed?"}
+    D -->|no| ASSOC["Status codes: security mismatch,<br/>PMF, AP limits"]
+    D -->|yes| E{"Handshake completes,<br/>port authorized?"}
+    E -->|no| SEC["Passphrase, SAE, EAP,<br/>EAPOL frames lost"]
+    E -->|yes| F{"IP address,<br/>routes, DNS?"}
+    F -->|no| IP["Fundamentals note: DHCP,<br/>bridge, VLAN, isolation"]
+    F -->|yes| G{"Stable and<br/>fast enough?"}
+    G -->|no| Q["Signal, retries, channel load,<br/>power save, roaming, driver"]
+```
+
+| Fault domain | Evidence | Tools |
 |---|---|---|
-| 0. Hardware, driver | Does `wlan0` exist? Firmware loaded? Not blocked? | `ip -br link`, `dmesg`, `rfkill list`, `ethtool -i wlan0`, `iw list` |
-| 1. Regulatory | Right country? Is the AP's channel allowed? | `iw reg get`, `iw list` (Frequencies) |
-| 2. Scan | Does the device see the AP, at what signal, with which security? | `sudo iw dev wlan0 scan`, `wpa_cli scan_results` |
-| 3. Authentication, association | Accepted? Which status code? | `wpa_supplicant -dd`, `iw event -t -f`, hostapd log on the AP |
-| 4. Handshake | Keys installed, port authorized? | `wpa_cli status` (`wpa_state=COMPLETED`), `station dump` (`authorized: yes`), `tcpdump -eni wlan0 ether proto 0x888e` |
-| 5. IP | Address, route, DNS? | The [fundamentals note](../../networking/fundamentals/fundamentals.md#22-troubleshooting) |
-| 6. Quality | Signal, retries, rates, channel load? | `station dump`, `survey dump`, `iperf3` (section 17) |
+| Hardware, power, bus | No device on the bus, SDIO/PCIe errors, resets under load | Multimeter, scope, `dmesg`, `lspci`, `/sys/bus/sdio` |
+| Firmware | Load errors, crashes, restarts, wrong version | `dmesg`, `ethtool -i` |
+| Regulatory | Channels disabled or `no IR`, wrong country, regdb not loaded | `iw reg get`, `iw list`, `dmesg | grep cfg80211` |
+| Scan | AP missing or much weaker than on a reference device | `iw dev wlan0 scan`, `wpa_cli scan_results` |
+| Authentication, association | Status codes, retries without response | `iw event -t -f`, `wpa_supplicant -dd`, hostapd log |
+| Security handshake | Reason 15/23, `WRONG_KEY`, EAP failures | `tcpdump ether proto 0x888e`, hostapd and RADIUS logs |
+| Power management | Latency spikes when idle, missed broadcasts, drops on group rekeys | `iw ... get power_save`, ping tests, DTIM settings |
+| Roaming | Sticky client, ping-pong, drops during moves | wpa_supplicant log (bgscan, roam decisions), both APs' logs, firmware roaming settings |
+| Interference, contention | High busy time, retries rising with neighbors' activity | `survey dump`, monitor capture, spectrum analyzer |
+| Driver behavior | Counters stuck, features silently ignored, different results after an update | Compare driver/firmware versions, tracepoints, debugfs |
+| Upper layers | Link up and authorized, but no IP or no traffic | [Fundamentals note](../../networking/fundamentals/fundamentals.md#22-troubleshooting) |
 
-Look at **both ends**: the AP's log (hostapd, or the vendor AP's log) often says plainly what the client only sees as a timeout. When both ends disagree, a monitor-mode capture (section 15) settles it.
+Look at **both ends**: the AP's log often says plainly what the client only sees as a timeout. When both ends disagree, a monitor-mode capture (section 17) settles it. Thresholds for signal, retries or utilization depend on the environment and the driver: compare with a known-good reference (another device, another AP, before and after a change) rather than with fixed numbers.
 
 ### Symptoms
 
 | Symptom | Where to look first |
 |---|---|
 | No `wlan0` | Bus enumeration (`dmesg | grep mmc`, `lspci`, `lsusb`), power sequencing and LPO clock, driver loaded (`lsmod`), firmware errors (`-2`) |
-| `Operation not possible due to RF-kill` | `rfkill list`: soft block → `rfkill unblock wifi`; hard block → switch, BIOS, a GPIO, or the platform driver |
-| Scan returns nothing | Interface down, regulatory domain `00` (passive scanning only), antenna not connected, another manager holding the interface |
-| AP missing from the scan, a phone sees it | Its channel isn't allowed by your country setting (12-13 in the US, 149-165 or DFS in some EU configurations), the AP is on 6 GHz or 5 GHz and the module isn't, hidden SSID (`scan_ssid=1`), DFS channel heard only passively |
-| Much weaker signal than a phone at the same spot | Antenna, cable or connector, wrong NVRAM or board data, enclosure, a single chain working (per-chain `signal` values) |
-| Authentication or association rejected | The status code (section 8): security mismatch (SAE vs PSK, PMF required, cipher). Compare `wpa_cli scan_results` flags with your network block |
-| `reason=15`, `WRONG_KEY` | Wrong passphrase. If it's right: a hashed PSK used for SAE, shell quoting in `wpa_cli set_network`, a PSK hashed with another SSID, handshake frames lost at the cell edge |
-| Connects, then drops every few minutes | Reason 16 (group rekey missed while asleep), beacon loss (signal), AP inactivity timeout (reason 4), roaming back and forth between two APs, DFS radar events, firmware crashes in `dmesg` |
-| Connected but no IP address | Port not authorized (`wpa_state` not `COMPLETED`), AP bridged to the wrong network or VLAN, DHCP issues ([fundamentals](../../networking/fundamentals/fundamentals.md#8-getting-an-address-dhcp-slaac-static)), MAC randomization vs DHCP reservations |
-| Works, then stalls under load | Bus or firmware errors in `dmesg` (SDIO CRC errors, timeouts): lower the SDIO `max-frequency`, check power supply droops under TX, temperature |
-| Slow | Section 17: radio, contention, bus, CPU, TCP, the other side |
+| `Operation not possible due to RF-kill` | `rfkill list`: soft block → `rfkill unblock wifi`; hard block → switch, BIOS, a GPIO or platform driver |
+| Scan returns nothing | Interface down, world domain `00` (passive scanning only), antenna not connected, another manager holding the interface, `Device or resource busy` from a concurrent scan |
+| AP missing from the scan, a phone sees it | Channel not allowed by the regulatory domain (or the firmware's tables), AP on 6 GHz or 5 GHz and the module isn't, hidden SSID (`scan_ssid=1`), DFS channel heard only passively, MBSSID profiles the client doesn't parse |
+| Much weaker signal than a reference device | Antenna, cable or connector, wrong NVRAM or board data, enclosure, one chain dead (per-chain `signal` values) |
+| Authentication or association rejected | The status code (section 8): security mismatch (SAE vs PSK, PMF required, cipher, Wi-Fi 7 security requirements). Compare `wpa_cli scan_results` flags with your network block |
+| `reason=15`, `WRONG_KEY` | Wrong passphrase. If it's right: a hashed PSK used for SAE, shell quoting in `wpa_cli set_network`, a PSK hashed with another SSID, EAPOL frames lost at the cell edge |
+| Connects, then drops every few minutes | Reason 16 (group rekey missed while asleep), beacon loss (signal), inactivity timeout (reason 4), roaming back and forth, DFS radar events, firmware crashes in `dmesg` |
+| Connected but no IP address | Port not authorized (`wpa_state` not `COMPLETED`), AP bridged to the wrong network or VLAN, DHCP ([fundamentals](../../networking/fundamentals/fundamentals.md#8-getting-an-address-dhcp-slaac-static)), MAC randomization vs DHCP reservations |
+| Works, then stalls under load | Bus or firmware errors in `dmesg` (SDIO CRC errors, timeouts): lower the SDIO `max-frequency`, check supply droop during TX bursts, temperature |
+| Slow | Section 19: radio, contention, bus, CPU, TCP, the other end |
 | Ping spikes, laggy SSH | Power save, background scans, a busy channel, deep firmware queues |
 | mDNS or discovery fails over Wi-Fi only | `ap_isolate`, multicast lost or delayed (DTIM, low basic rate), multicast snooping on the AP's bridge |
-| hostapd won't start | `iw list`: no `AP` mode or `no IR` on the channel; options the card doesn't support (`ht_capab`, VHT/HE settings); DFS CAC still running; NetworkManager holding the interface (`nmcli dev set wlan0 managed no`) |
-| Clients don't roam, or stick to a far AP | `bgscan` missing or thresholds too low, firmware roaming, 802.11k/v not enabled, AP TX power too high |
-| Fine on the bench, poor in the product | Antenna detuned by the enclosure, metal, cables near the antenna, board noise. Test in the final enclosure |
-| No Wi-Fi after suspend | `keep-power-in-suspend`, wake interrupt, firmware reload on resume. Unloading and reloading the module confirms a driver suspend bug |
+| hostapd won't start | `iw list`: no `AP` mode or `no IR` on the channel; options the card doesn't support (`ht_capab`, VHT/HE/EHT settings); DFS CAC still running; interface combination exceeded; another manager holding the interface |
+| Clients don't roam, or stick to a far AP | No `bgscan`, firmware roaming, 802.11k/v not enabled, AP TX power too high |
+| Fine on the bench, poor in the product | Antenna detuned by the enclosure, metal, cables near the antenna, board noise |
+| No Wi-Fi after suspend | `keep-power-in-suspend`, wake interrupt, firmware reload on resume. Unloading and reloading the module confirms a driver resume bug |
 
 ### Messages and what they mean
 
 | Message | Meaning |
 |---|---|
-| `Direct firmware load for brcm/... failed with error -2` | File not found. brcmfmac tries board-specific names first: the error is harmless if a later name loads (look for the firmware version line) |
+| `Direct firmware load for brcm/... failed with error -2` | File not found. Harmless if a later name loads (look for the firmware version line) |
 | `mmc1: error -110 whilst initialising SDIO card` | The card doesn't answer: power, `WL_REG_ON`, pwrseq delays, clock, wiring |
 | `brcmf_sdio_htclk: HT Avail timeout` | The chip doesn't start its clock: LPO clock, supply, firmware or NVRAM mismatch |
-| `ath10k_pci ...: failed to fetch board data` | `board-2.bin` missing or has no entry for this board ID |
+| `ath10k_pci ...: failed to fetch board data` | `board-2.bin` missing or without an entry for this board |
 | `iwlwifi ...: Microcode SW error detected. Restarting` | Firmware crash: update firmware and kernel, report with the dump |
+| `cfg80211: loaded regulatory.db is malformed or signature is missing/invalid` | Regulatory database not trusted by this kernel (section 12): world domain in use |
 | `wlan0: deauthenticated from ... (Reason: 15=4WAY_HANDSHAKE_TIMEOUT)` | mac80211 decodes reason codes in `dmesg` (section 8) |
-| `nl80211: kernel reports: Match already configured` | Two programs manage the interface (two wpa_supplicants, or NetworkManager plus yours) |
+| `nl80211: kernel reports: Match already configured` | Two programs manage the interface (two wpa_supplicants, or a manager plus yours) |
 | `ctrl_iface exists and seems to be in use - cannot override it` | wpa_supplicant already runs on this interface |
-| `CTRL-EVENT-SSID-TEMP-DISABLED ... reason=CONN_FAILED` | Repeated authentication or association failures: look at the status codes above it |
-| hostapd: `Could not set channel for kernel driver` | Channel not allowed (regulatory, `no IR`) or unsupported width |
-| hostapd: `DFS-CAC-START` then nothing for a minute | Normal on DFS channels: the channel availability check (section 4) |
+| `CTRL-EVENT-SSID-TEMP-DISABLED ... reason=CONN_FAILED` | Repeated authentication or association failures: look at the status codes before it |
+| `AP-STA-POSSIBLE-PSK-MISMATCH` (hostapd) | The client's message 2 MIC failed: wrong passphrase on the client |
+| hostapd `Could not set channel for kernel driver` | Channel not allowed (regulatory, `no IR`) or unsupported width |
+| hostapd `DFS-CAC-START` then nothing for a minute | Normal on DFS channels (section 4) |
+
+### A useful bug report
+
+Kernel version, driver and firmware version (`ethtool -i`), `iw list` (or at least the relevant capabilities), the country (`iw reg get`), the AP's model and settings (band, channel, width, security), a timestamped `wpa_supplicant -dd -t` log around the failure, `iw event -t` output, two `station dump` samples, and if possible a monitor capture and the AP's log for the same moment.
 
 The [gateway note](../../networking/gateway/gateway.md#14-troubleshooting) covers the router side (bridges, firewall, DHCP), and the [OpenWrt note](../../networking/openwrt/openwrt.md#playbooks) its OpenWrt equivalents.
 
 ---
 
-## 19. Not covered here
+## 21. Not covered here
 
 Topics for separate notes:
 
 - **Wi-Fi driver development:** writing a mac80211 or cfg80211 driver, firmware interfaces, nl80211 vendor commands ([linux-kernel-device-driver-development/](../../linux-kernel-device-driver-development/)).
-- **RF design and measurements:** antenna design and matching, conducted and radiated tests, spectrum analyzers ([hardware/rf/](../../hardware/rf/)).
+- **RF design and measurements:** antenna design and matching, conducted and radiated tests ([hardware/rf/](../../hardware/rf/)).
 - **The PHY in depth:** OFDM signal processing, LDPC coding, channel estimation, beamforming math ([hardware/baseband/](../../hardware/baseband/), [hardware/sdr/](../../hardware/sdr/)).
-- **Passpoint (Hotspot 2.0)**, ANQP and carrier Wi-Fi offload.
 - **Wi-Fi location and sensing:** fine timing measurement (802.11mc/az), CSI-based sensing.
 - **802.11ah (HaLow)** and 60 GHz (802.11ad/ay).
-- **Enterprise deployments:** FreeRADIUS, certificate provisioning for fleets, dynamic VLANs.
-- **Mesh in depth:** 802.11s, batman-adv, EasyMesh.
-- **Wi-Fi 7 MLO on Linux** in practice, once driver support settles.
+- **Enterprise deployments:** FreeRADIUS, certificate provisioning for fleets, dynamic VLANs, Passpoint operator setup.
+- **Mesh in depth:** 802.11s path selection, batman-adv, EasyMesh controllers.
+- **Wi-Fi 8 (802.11bn)** once the standard settles.
 - **Bluetooth** and **cellular** ([wireless-protocols-and-connectivity/](../)).
 
 ---
@@ -2084,26 +2172,37 @@ Standards and specifications:
 
 | Topic | Document |
 |---|---|
-| 802.11 (all amendments merged) | IEEE 802.11-2020, IEEE 802.11-2024. Free to download through the IEEE GET program on <https://ieeexplore.ieee.org> |
-| Wi-Fi 6, Wi-Fi 7 | IEEE 802.11ax-2021, IEEE 802.11be |
-| WPA3, Enhanced Open, Easy Connect, WMM | Wi-Fi Alliance specifications: <https://www.wi-fi.org/discover-wi-fi/specifications> |
+| 802.11 (amendments merged) | IEEE 802.11-2020, IEEE 802.11-2024. Free to download through the IEEE GET program on <https://ieeexplore.ieee.org> |
+| Wi-Fi 6, Wi-Fi 7 | IEEE 802.11ax-2021, IEEE 802.11be-2024 |
+| WPA3, Enhanced Open, Easy Connect, WMM, Passpoint | Wi-Fi Alliance specifications: <https://www.wi-fi.org/discover-wi-fi/specifications> |
 | EAP, EAP-TLS (TLS 1.2, 1.3) | [RFC 3748](https://www.rfc-editor.org/rfc/rfc3748), [RFC 5216](https://www.rfc-editor.org/rfc/rfc5216), [RFC 9190](https://www.rfc-editor.org/rfc/rfc9190) |
 | RADIUS, RADIUS for 802.1X | [RFC 2865](https://www.rfc-editor.org/rfc/rfc2865), [RFC 3580](https://www.rfc-editor.org/rfc/rfc3580) |
 | Dragonfly (SAE's ancestor), OWE | [RFC 7664](https://www.rfc-editor.org/rfc/rfc7664), [RFC 8110](https://www.rfc-editor.org/rfc/rfc8110) |
 | DSCP to 802.11 user priority | [RFC 8325](https://www.rfc-editor.org/rfc/rfc8325) |
 | Documentation MAC addresses | [RFC 7042](https://www.rfc-editor.org/rfc/rfc7042) |
 
+Regulation (check for amendments before relying on values):
+
+- US: 47 CFR 15.407 (U-NII bands, 6 GHz LPI/SP/VLP, vehicle restrictions): <https://www.ecfr.gov/current/title-47/chapter-I/subchapter-A/part-15/subpart-E/section-15.407>
+- EU 5 GHz: Commission Decision 2005/513/EC as amended, and Implementing Decisions (EU) 2022/179 and 2022/2307 (in-vehicle use): <https://eur-lex.europa.eu/eli/dec_impl/2022/2307/oj/eng>
+- EU 6 GHz: Implementing Decision (EU) 2021/1067, amended by (EU) 2024/3157 and (EU) 2025/913: <https://eur-lex.europa.eu/eli/dec_impl/2021/1067/oj/eng>; CEPT ECC Decision (20)01
+- Harmonized standards: ETSI EN 300 328 (2.4 GHz), EN 301 893 (5 GHz), EN 303 687 (6 GHz); RED cybersecurity: EN 18031-1/-2/-3
+
 Linux and tools:
 
-- Linux wireless documentation (successor of the wireless wiki): <https://wireless.docs.kernel.org>
+- Linux wireless documentation: <https://wireless.docs.kernel.org>
 - Kernel 802.11 driver API (cfg80211, mac80211): <https://docs.kernel.org/driver-api/80211/index.html>
-- hostapd and wpa_supplicant: <https://w1.fi>. The annotated example configurations are the real reference for every option: [hostapd.conf](https://w1.fi/cgit/hostap/plain/hostapd/hostapd.conf), [wpa_supplicant.conf](https://w1.fi/cgit/hostap/plain/wpa_supplicant/wpa_supplicant.conf)
+- hostapd and wpa_supplicant: <https://w1.fi>. The annotated reference configurations document every option: [hostapd.conf](https://git.w1.fi/cgit/hostap/plain/hostapd/hostapd.conf), [wpa_supplicant.conf](https://git.w1.fi/cgit/hostap/plain/wpa_supplicant/wpa_supplicant.conf); release notes: [hostapd ChangeLog](https://git.w1.fi/cgit/hostap/plain/hostapd/ChangeLog), [wpa_supplicant ChangeLog](https://git.w1.fi/cgit/hostap/plain/wpa_supplicant/ChangeLog)
 - iwd: <https://iwd.wiki.kernel.org>
-- wireless-regdb: <https://git.kernel.org/pub/scm/linux/kernel/git/wens/wireless-regdb.git>
-- Device tree bindings: `Documentation/devicetree/bindings/net/wireless/` (e.g. `brcm,bcm4329-fmac.yaml`), `Documentation/devicetree/bindings/mmc/mmc-pwrseq-simple.yaml`
+- wireless-regdb: <https://git.kernel.org/pub/scm/linux/kernel/git/wens/wireless-regdb.git>; kernel certificates in `net/wireless/certs/`
+- Device tree bindings: `Documentation/devicetree/bindings/net/wireless/brcm,bcm4329-fmac.yaml`, `Documentation/devicetree/bindings/mmc/mmc-pwrseq-simple.yaml`
 - Radiotap: <https://www.radiotap.org>
 - Wireshark, decrypting 802.11: <https://wiki.wireshark.org/HowToDecrypt802.11>
 - `iw help`, `man wpa_supplicant`, `man wpa_supplicant.conf`, `man wpa_cli`, `man hostapd`, `man iwd`, `man nmcli`
+
+Vendor guidance used for certification requirements (secondary source; the Wi-Fi Alliance test plans are the primary one):
+
+- Cisco, *Migrate to Wi-Fi 7 and 6 GHz* (Wi-Fi 7 security and MLO requirements): <https://www.cisco.com/c/en/us/support/docs/wireless/catalyst-9800-series-wireless-controllers/223061-migrate-to-wi-fi-7-and-6ghz.html>
 
 Books:
 

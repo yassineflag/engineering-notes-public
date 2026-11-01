@@ -509,19 +509,371 @@ A 3-address frame from a client carries only one source address, and it must be 
 
 ## 8. Joining a network: scan, authenticate, associate, handshake
 
-Planned: active and passive scanning, beacons, authentication and association, the 4-way handshake, disconnection and reason codes.
+```mermaid
+sequenceDiagram
+    participant S as Board (wpa_supplicant)
+    participant A as AP (hostapd)
+    Note over S,A: 1. Scan
+    A-->>S: Beacon every 102.4 ms (SSID, channel, RSN, capabilities)
+    S->>A: Probe request (active scan)
+    A->>S: Probe response
+    Note over S,A: 2. Authentication (Open System, or SAE for WPA3)
+    S->>A: Authentication
+    A->>S: Authentication (status 0)
+    Note over S,A: 3. Association
+    S->>A: Association request (capabilities, chosen AKM and cipher)
+    A->>S: Association response (status 0, AID)
+    Note over S,A: 4. 4-way handshake (EAPOL-Key, section 9)
+    A->>S: Msg 1 (ANonce)
+    S->>A: Msg 2 (SNonce, MIC)
+    A->>S: Msg 3 (GTK, MIC, install)
+    S->>A: Msg 4 (MIC)
+    Note over S,A: 5. Port authorized: data flows, DHCP starts
+```
+
+### 1. Scanning
+
+| | Passive | Active |
+|---|---|---|
+| How | Listen for beacons on each channel | Send a probe request on each channel, collect probe responses |
+| Time per channel | At least one beacon interval (about 100 ms) | Tens of ms |
+| Used | DFS and `no IR` channels (mandatory), 6 GHz non-PSC channels | Everywhere else |
+
+A full scan of 2.4 and 5 GHz takes 1 to 3 seconds; with 6 GHz, more. The client is off its channel during each dwell, so background scans add latency and loss to an active connection.
+
+- **Beacon interval:** usually 100 TU (1 TU = 1024 µs), so 102.4 ms.
+- **Hidden SSID:** the beacon carries an empty SSID and the AP only answers probes that name it. The client must probe for it by name (`scan_ssid=1`), which advertises the SSID wherever the client goes. No security benefit.
+- **MAC randomization:** clients often probe with random MACs, and phones use a different random MAC per network. A MAC-based DHCP reservation or filter then sees a "new" device.
+
+**What beacons and probe responses carry** (information elements, also in association frames):
+
+| Element (ID) | Content |
+|---|---|
+| SSID (0) | Network name |
+| Supported rates (1), Extended supported rates (50) | Legacy rates; "basic" rates are mandatory for clients |
+| DS parameter set (3) | Primary channel |
+| TIM (5) | Which sleeping clients have buffered frames, DTIM counter (section 10) |
+| Country (7) | Country code, allowed channels and power (802.11d) |
+| RSN (48) | Security: AKMs, pairwise and group ciphers, PMF capable/required |
+| HT capabilities / operation (45 / 61) | Wi-Fi 4: streams, 40 MHz, secondary channel offset |
+| VHT capabilities / operation (191 / 192) | Wi-Fi 5: 80/160 MHz, center channel |
+| HE capabilities / operation (255, extension 35 / 36) | Wi-Fi 6: BSS color, OFDMA, TWT |
+| EHT, Multi-Link (255, extension 108, 106 / 107) | Wi-Fi 7: 320 MHz, MLO |
+| Mobility domain (54) | 802.11r FT support |
+| RM enabled capabilities (70), Extended capabilities (127) | 802.11k measurements, 802.11v BSS transition, and more |
+| Reduced neighbor report (201) | Co-located APs, for example the 6 GHz radio |
+| Vendor specific (221) | WMM parameters, WPS, Wi-Fi Direct, vendor extensions |
+
+`iw dev wlan0 scan` decodes most of them. Wireshark shows all of them under "Tagged parameters".
+
+**Choosing a BSS:** among BSSes with the wanted SSID and a compatible security configuration, the client prefers the best signal, with a bonus for 5/6 GHz and sometimes for lower load (BSS Load element). wpa_supplicant logs its choice at debug level.
+
+### 2. Authentication
+
+802.11 "authentication" is a step in the state machine, not necessarily real authentication:
+
+| Method | Frames | Used with |
+|---|---|---|
+| Open System | 2, always succeeds | Open, OWE, WPA2-PSK, 802.1X (the real authentication comes later) |
+| SAE | 4 (commit, commit, confirm, confirm) | WPA3-Personal: the password is checked here (section 9) |
+| FT | 2, carrying key material | 802.11r roaming (section 10) |
+| FILS | 2 | Fast initial link setup (rare) |
+| Shared Key | 4 | WEP only. Obsolete |
+
+### 3. Association
+
+The client sends its capabilities (rates, HT/VHT/HE, streams, power save) and the security suite it picked from the AP's RSN element. The AP replies with a **status code** (0 = success) and an **association ID** (AID), which identifies the client in the TIM. A **reassociation** is the same when moving between APs of one ESS.
+
+### 4. Handshake and port authorization
+
+With WPA2/WPA3, the 802.1X "port" stays closed after association: only EAPOL frames pass. The 4-way handshake (section 9) installs keys, then the port opens (`authorized` in `iw dev wlan0 station dump`). With Enterprise, the EAP exchange through the AP to the RADIUS server comes first. Only then does the board start DHCP ([fundamentals note, section 8](../../networking/fundamentals/fundamentals.md#8-getting-an-address-dhcp-slaac-static)).
+
+**State machine** (the AP accepts frames by class):
+
+| State | Allowed frames |
+|---|---|
+| 1. Unauthenticated, unassociated | Probe, beacon, authentication (class 1) |
+| 2. Authenticated, unassociated | + association (class 2) |
+| 3. Associated | + data (class 3), only EAPOL while the port is closed |
+| 4. Authorized | All data |
+
+A frame from a wrong state triggers a deauthentication with reason 6 or 7 (for example a client that kept sending after the AP rebooted).
+
+**Typical timings:** authentication and association take a few ms each, the handshake 10 to 50 ms, EAP 100 ms to seconds (RADIUS round trips), DHCP 10 ms to seconds. From a cached scan result, a WPA2-PSK client is connected in about 100 ms.
+
+### What a successful connection looks like
+
+wpa_supplicant (`journalctl -u wpa_supplicant@wlan0` or `wpa_supplicant -d`):
+
+```
+wlan0: SME: Trying to authenticate with 00:00:5e:00:53:a0 (SSID='Home' freq=5180 MHz)
+wlan0: Trying to associate with 00:00:5e:00:53:a0 (SSID='Home' freq=5180 MHz)
+wlan0: Associated with 00:00:5e:00:53:a0
+wlan0: WPA: Key negotiation completed with 00:00:5e:00:53:a0 [PTK=CCMP GTK=CCMP]
+wlan0: CTRL-EVENT-CONNECTED - Connection to 00:00:5e:00:53:a0 completed [id=0 id_str=]
+```
+
+The kernel (`dmesg`), for mac80211 drivers only: FullMAC drivers do this in firmware and print nothing (section 11):
+
+```
+wlan0: authenticate with 00:00:5e:00:53:a0
+wlan0: send auth to 00:00:5e:00:53:a0 (try 1/3)
+wlan0: authenticated
+wlan0: associate with 00:00:5e:00:53:a0 (try 1/3)
+wlan0: RX AssocResp from 00:00:5e:00:53:a0 (capab=0x1011 status=0 aid=2)
+wlan0: associated
+```
+
+### Leaving the network
+
+- **Deauthentication or disassociation frame** with a **reason code** (table below), sent by either side.
+- **Silently:** the client misses several beacons in a row (beacon loss) and declares the link lost; the AP stops hearing a client and removes it after an inactivity timeout (hostapd `ap_max_inactivity`, 300 s by default, after polling it with null frames), or after too many unacknowledged frames (`disassoc_low_ack=1`).
+
+wpa_supplicant reports `CTRL-EVENT-DISCONNECTED bssid=... reason=N`, with `locally_generated=1` when the client itself decided to leave.
+
+**Common reason codes** (why a connection ended):
+
+| Reason | Meaning | Usual cause |
+|---|---|---|
+| 1 | Unspecified | Anything, often AP-side policy (band steering, load) |
+| 2 | Previous authentication no longer valid | AP lost the client's state, roaming issues |
+| 3 | Station is leaving | Normal disconnect: `wpa_cli disconnect`, interface down, roam. With `locally_generated=1`, the client decided |
+| 4 | Inactivity | AP timed out an idle or unreachable client |
+| 5 | AP can't handle all associated stations | AP full |
+| 6, 7 | Class 2 / class 3 frame from a nonauthenticated / nonassociated station | State mismatch, e.g. after an AP restart |
+| 8 | Station is leaving the BSS | Disassociation, typically before a roam |
+| 14 | MIC failure | TKIP countermeasures, faulty driver |
+| 15 | 4-way handshake timeout | **Wrong passphrase**, or EAPOL frames lost |
+| 16 | Group key handshake timeout | Client asleep or out of range during a GTK rekey |
+| 17 | Element in the 4-way handshake differs from (re)association | Driver or firmware bug, transition mode mismatches |
+| 23 | 802.1X authentication failed | Enterprise: wrong credentials or certificate |
+| 34 | Too many frames not acknowledged | Poor signal, client gone |
+
+**Common status codes** (why an authentication or association was refused):
+
+| Status | Meaning | Usual cause |
+|---|---|---|
+| 1 | Unspecified failure | AP policy, MAC filtering |
+| 10 | Can't support all requested capabilities | Capability mismatch, often old clients on a new AP |
+| 13 | Authentication algorithm not supported | SAE requested from a WPA2-only AP, or the reverse |
+| 17 | AP can't handle more stations | AP full (`max_num_sta`) |
+| 30 | Rejected temporarily, try later | PMF: the AP still has a protected association with this client and runs an SA Query first |
+| 31 | Robust management frame policy violation | PMF required by one side and not supported by the other |
+| 40, 41, 42, 43 | Invalid element / group cipher / pairwise cipher / AKM | Security configuration mismatch |
+| 53 | Invalid PMKID | Stale PMKSA cache entry, usually recovers by itself |
+| 77 | Finite cyclic group not supported | SAE group mismatch (`sae_groups`) |
 
 ---
 
 ## 9. Security: WPA2, WPA3, Enterprise and known attacks
 
-Planned: key hierarchy, PSK and SAE, PMF, OWE, 802.1X/EAP, AKM and cipher suites, transition modes, attacks and what stops them.
+### Generations
+
+| Mode | Authentication | Encryption | Status |
+|---|---|---|---|
+| Open | None | None | Only for captive portals, or use OWE |
+| WEP | Shared key | RC4 | Broken since 2001, never use |
+| WPA (TKIP) | PSK or 802.1X | RC4 with TKIP | Deprecated; HT/VHT rates aren't allowed with TKIP |
+| WPA2 | PSK or 802.1X | AES-CCMP-128 | Still everywhere. PSK mode is open to offline guessing |
+| WPA3-Personal | SAE | AES-CCMP-128 (GCMP-256 in newer modes), PMF required | Default for new deployments, mandatory on 6 GHz |
+| WPA3-Enterprise | 802.1X | CCMP-128, or GCMP-256 in 192-bit mode | PMF required |
+| Enhanced Open (OWE) | None, but a Diffie-Hellman exchange at association | CCMP-128 | Encrypted "open" networks |
+
+**Personal vs Enterprise:** Personal uses one shared secret for everyone (passphrase). Enterprise authenticates each user or device separately through 802.1X/EAP against a RADIUS server, and gives each its own keys.
+
+### Key hierarchy
+
+| Key | Scope | Where it comes from | Used for |
+|---|---|---|---|
+| PMK (pairwise master key) | One client and the network | WPA2-PSK: PBKDF2-SHA1(passphrase, SSID, 4096 iterations). SAE: fresh from each SAE exchange. 802.1X: from the EAP session (MSK) | Input to the 4-way handshake. Cached as a PMKSA |
+| PTK (pairwise transient key) | One client, one association | Derived from PMK, both MACs, ANonce and SNonce | Split into KCK (MIC on handshake frames), KEK (encrypts the GTK in message 3), TK (encrypts unicast data) |
+| GTK (group temporal key) | All clients of a BSS | Generated by the AP, sent in message 3, rotated (group key handshake) | Broadcast and multicast data |
+| IGTK | All clients | AP | Protects broadcast management frames (PMF) |
+| BIGTK | All clients | AP | Beacon protection (newer WPA3 option) |
+
+### The 4-way handshake
+
+| Message | Direction | Content | What it achieves |
+|---|---|---|---|
+| 1 | AP → client | ANonce | The client now has everything to derive the PTK |
+| 2 | Client → AP | SNonce, client's RSN element, MIC | AP derives the PTK; a valid MIC proves the client knows the PMK |
+| 3 | AP → client | ANonce, AP's RSN element, GTK (encrypted with KEK), MIC, "install" | Proves the AP knows the PMK; the client checks the RSN element matches the beacon (downgrade protection) |
+| 4 | Client → AP | MIC | Both sides install the keys, the port opens |
+
+**Wrong passphrase:** the client derives another PMK, so the MIC of message 2 is wrong. The AP silently ignores it and resends message 1 a few times, then deauthenticates with reason 15. wpa_supplicant logs `WPA: 4-Way Handshake failed - pre-shared key may be incorrect` and `CTRL-EVENT-SSID-TEMP-DISABLED ... reason=WRONG_KEY`, then waits longer and longer before retrying.
+
+**WPA2-PSK weaknesses:**
+- **Offline guessing:** anyone who captures messages 1 and 2 of one handshake (or just the PMKID some APs put in message 1) can test passphrases offline with a GPU, at high speed. A passphrase is only as strong as its randomness: use 20+ random characters.
+- **No forward secrecy:** anyone who knows the passphrase and captured a client's handshake can decrypt that client's traffic, including past captures.
+- **Everyone with the passphrase can run a fake AP** with the same SSID: PSK doesn't authenticate the network.
+
+### SAE (WPA3-Personal)
+
+SAE (simultaneous authentication of equals, from the Dragonfly key exchange) is a password-authenticated key exchange done in the authentication frames:
+
+- **No offline guessing:** each password guess needs a live exchange with the AP.
+- **Forward secrecy:** each session gets a fresh PMK; knowing the password later doesn't decrypt old captures.
+- **PMF is mandatory.**
+- **Password element derivation:** the original "hunting and pecking" loop leaked timing information (the Dragonblood attacks, 2019). **Hash-to-element** (H2E) fixes it and is required on 6 GHz: hostapd and wpa_supplicant `sae_pwe=1` (H2E only) or `2` (both).
+- **Groups:** elliptic curve group 19 (P-256) by default (`sae_groups`).
+- SAE needs the **passphrase itself**: the 64-hex-digit PSK that `wpa_passphrase` produces works for WPA2 only.
+- Anti-clogging tokens protect the AP against floods of commit messages (the computation is expensive, noticeable on small CPUs).
+
+### PMF (802.11w)
+
+Without PMF, deauthentication and disassociation frames aren't authenticated: anyone can disconnect any client with a forged frame (the classic "deauth attack", also used to capture WPA2 handshakes). PMF encrypts or signs these frames (unicast with the TK, broadcast with the IGTK) and adds an SA Query so that a forged association can't tear down a protected one.
+
+| `ieee80211w` | Meaning |
+|---|---|
+| 0 | Disabled |
+| 1 | Optional: used with clients that support it |
+| 2 | Required: clients without PMF can't connect |
+
+WPA3 requires it, and Wi-Fi 6 certification requires support for it. Beacons and probe responses stay unprotected unless beacon protection (`beacon_prot=1`) is on.
+
+### Enhanced Open (OWE)
+
+For networks without a password (cafés, guest networks): a Diffie-Hellman exchange in the association frames gives each client its own keys. It stops passive eavesdropping, not a fake AP. In **OWE transition mode**, the AP runs an open SSID plus a hidden OWE BSS, and OWE-capable clients switch to it.
+
+### Enterprise: 802.1X and EAP
+
+```
+Board (supplicant)  ──EAPOL──►  AP (authenticator)  ──RADIUS──►  Authentication server (e.g. FreeRADIUS)
+ wpa_supplicant                   hostapd                          checks credentials, sends the PMK to the AP
+```
+
+| EAP method | Credentials | Notes |
+|---|---|---|
+| EAP-TLS | Client certificate and private key | Strongest, no password. Best fit for fleets of devices: one certificate per device, provisioned at manufacturing |
+| PEAP (MSCHAPv2) | Username and password inside a TLS tunnel | Common in companies. Without server certificate validation, a fake AP collects crackable password hashes |
+| EAP-TTLS (PAP, MSCHAPv2) | Username and password inside a TLS tunnel | Similar to PEAP |
+| EAP-SIM, EAP-AKA, EAP-AKA' | SIM card | Carrier Wi-Fi, Passpoint |
+| EAP-PWD | Password, no certificates | Rare |
+
+**Always validate the server:** set the CA certificate and the expected server name (`ca_cert` and `domain_suffix_match` in wpa_supplicant, section 13). A device that accepts any server certificate gives its credentials to anyone running an AP with the same SSID.
+
+**WPA3-Enterprise 192-bit mode** (CNSA suite): EAP-TLS with specific cipher suites, GCMP-256, BIP-GMAC-256, for high-security environments.
+
+**Reconnect and roam faster:** the PMK can be cached (PMKSA caching) to skip EAP on reconnection to the same AP. Opportunistic key caching (OKC) and 802.11r extend this across APs (section 10).
+
+### Suites in config files and captures
+
+The RSN element lists suites by number (OUI `00-0F-AC`), and Wireshark shows them that way:
+
+| AKM | Name | hostapd / wpa_supplicant `key_mgmt` |
+|---|---|---|
+| 1 | 802.1X | `WPA-EAP` |
+| 2 | PSK | `WPA-PSK` |
+| 3 / 4 | FT over 802.1X / FT with PSK | `FT-EAP` / `FT-PSK` |
+| 5 / 6 | 802.1X / PSK with SHA-256 | `WPA-EAP-SHA256` / `WPA-PSK-SHA256` |
+| 8 / 9 | SAE / FT with SAE | `SAE` / `FT-SAE` |
+| 12 | 802.1X Suite B 192-bit | `WPA-EAP-SUITE-B-192` |
+| 18 | OWE | `OWE` |
+| 24 / 25 | SAE with group-dependent hash / FT variant | `SAE-EXT-KEY` / `FT-SAE-EXT-KEY` (used with Wi-Fi 7 and GCMP-256) |
+
+| Cipher | Name | Config value |
+|---|---|---|
+| 2 | TKIP | `TKIP` (avoid) |
+| 4 | CCMP-128 | `CCMP` (the default) |
+| 8 / 9 | GCMP-128 / GCMP-256 | `GCMP` / `GCMP-256` |
+| 6 / 11 / 12 | BIP-CMAC-128 / BIP-GMAC-128 / BIP-GMAC-256 (management frames) | `group_mgmt_cipher=AES-128-CMAC` ... |
+
+### Transition modes
+
+| Mode | Pitfalls |
+|---|---|
+| WPA2/WPA3 (`WPA-PSK SAE`, PMF optional) | An attacker can push a WPA3-capable client into WPA2 with a fake AP (downgrade). WPA3 clients that support "transition disable" refuse WPA2 once they have seen WPA3 on that network (hostapd `transition_disable=0x01`). Some old clients don't connect at all to a mixed network |
+| WPA2 with and without FT (`WPA-PSK FT-PSK`) | Some old clients fail when they see the FT AKM |
+| Open + OWE | Fine, clients pick the best they support |
+
+When old devices misbehave, give them a separate WPA2-only SSID (like `Home-IoT` in the [gateway note](../../networking/gateway/gateway.md#10-wi-fi-access-point-hostapd)) rather than weakening the main one.
+
+### Known attacks
+
+| Attack | Year | What it does | Defense |
+|---|---|---|---|
+| WEP key recovery (FMS, PTW) | 2001-2007 | Recovers the key from captured traffic in minutes | Don't use WEP |
+| TKIP attacks (Beck-Tews) | 2008 | Decrypts and injects short packets | CCMP only |
+| Deauthentication | Always | Disconnects clients, forces handshakes to capture | PMF |
+| Offline dictionary on WPA2-PSK | Always | Guesses the passphrase from a handshake capture | Long random passphrase, or SAE |
+| PMKID attack | 2018 | Same, without needing a client: the AP's message 1 is enough | Same |
+| KRACK (key reinstallation) | 2017 | Replays handshake messages to make clients reuse nonces | Patched clients (wpa_supplicant 2.7+), keep it updated |
+| Dragonblood | 2019 | Side channels and downgrades against early SAE | H2E, patched hostap, transition disable |
+| FragAttacks | 2021 | Fragmentation and aggregation design flaws: inject or leak frames | Patched drivers, firmware and kernel (2021+) |
+| Kr00k | 2020 | Some Broadcom/Cypress chips sent frames with an all-zero key after a disassociation | Firmware update |
+| Evil twin | Always | A fake AP with the same SSID | Enterprise with server certificate validation. Not prevented by PSK or OWE |
+
+**For a product:**
+- Keep `wpa_supplicant`, `hostapd`, the kernel and the Wi-Fi firmware updatable: most of these were fixed by updates, not by configuration.
+- Credentials files `0600`, owned by root. Storing the 64-hex PSK instead of the passphrase hides the passphrase, not the network: for WPA2 the PSK is all an attacker needs.
+- Prefer per-device credentials: EAP-TLS, or per-device passphrases on your own APs (hostapd `wpa_psk_file`, or several `sae_password=...|mac=...` lines).
 
 ---
 
 ## 10. Power save, roaming and multi-AP networks
 
-Planned: power save mechanisms (TIM/DTIM, U-APSD, TWT), roaming (802.11k/v/r), mesh, Wi-Fi Direct, multi-link operation.
+### Power save
+
+A Wi-Fi radio receiving draws about as much as one transmitting (tens to hundreds of mW). Power save means turning the receiver off most of the time, with the AP buffering what arrives meanwhile.
+
+| Mechanism | How it works |
+|---|---|
+| PM bit | The client sets the Power Management bit in a frame (often a null frame) to tell the AP it goes to sleep. The AP buffers its unicast frames |
+| TIM | Each beacon lists, by AID, the sleeping clients with buffered frames |
+| Listen interval | How many beacon intervals the client may sleep (announced at association) |
+| DTIM | Every DTIM period beacons (often 1 to 3), the AP sends buffered broadcast and multicast frames. Every sleeping client must wake for it |
+| PS-Poll | Legacy: the client asks for its buffered frames one by one |
+| U-APSD (WMM power save) | The client's uplink frames trigger delivery of buffered downlink frames: good for VoIP |
+| TWT (Wi-Fi 6) | Client and AP agree on wake times: the client can sleep for seconds or more, the AP schedules traffic. Big gains for battery IoT devices |
+
+Linux clients use **dynamic power save**: the radio stays awake for a timeout after any traffic, and only sleeps when idle. Steady flows aren't affected; sparse traffic is. **Latency cost:** a packet arriving for a sleeping client waits for the next beacon the client listens to: up to 102.4 ms × listen interval for unicast, and up to beacon interval × DTIM period for broadcast/multicast (307 ms with DTIM 3). A board answering a ping every second shows 50-300 ms round trips; ARP requests and IPv6 neighbor solicitations wait for the DTIM too. Settings and measurements are in section 17.
+
+### Roaming
+
+**The client decides** when and where to roam. The AP can only help or push. Steps:
+
+| Step | Without help | With help |
+|---|---|---|
+| 1. Trigger | The signal falls below a threshold, or beacons are lost | AP sends an 802.11v BSS transition request ("please move") |
+| 2. Find candidates | Background scans of all channels (seconds of off-channel time) | 802.11k neighbor report: the AP lists its neighbors and their channels, the client scans only those |
+| 3. Choose | Best signal, band preference | Candidate list from the 802.11v request |
+| 4. Reconnect | Full authentication: SAE or 802.1X, then the 4-way handshake (100 ms to over 1 s with RADIUS) | 802.11r fast transition: keys derived from the previous association, in 2 frames + reassociation (tens of ms). PMKSA caching / OKC skip EAP |
+
+**802.11r (FT):** APs of one **mobility domain** share key material. With PSK, each AP can derive it from the passphrase on its own; with SAE or 802.1X, the APs must exchange keys (R0KH/R1KH configuration in hostapd). `ft_over_ds=0` (over the air) is the more compatible choice. Configuration is in section 14.
+
+**Sticky clients:** many clients hold on to a weak AP far too long. The AP can send an 802.11v request, or (crudely) deauthenticate clients below a signal threshold; the client then picks another AP. On the client side, Linux lets you set the scan threshold (section 13: `bgscan`).
+
+**Who roams on Linux:** with mac80211 drivers, wpa_supplicant (or iwd) decides. Many FullMAC chips roam in firmware by default, invisibly to wpa_supplicant (brcmfmac: module parameter `roamoff=1` hands it back to the host).
+
+**Band steering:** dual-band APs try to push capable clients to 5/6 GHz (delaying 2.4 GHz probe responses, 802.11v). Not standard: vendor features, or `usteer`/DAWN on OpenWrt.
+
+### Multi-AP networks
+
+| Topology | How APs interconnect | Notes |
+|---|---|---|
+| Wired backhaul | Ethernet to a common LAN (`br-lan`) | Best: no airtime spent on backhaul. Same SSID and security everywhere, non-overlapping channels |
+| WDS / 4-address | An AP connects to another AP as a 4-address client and bridges | Simple, Linux to Linux (section 7) |
+| 802.11s mesh | Mesh points on one channel form a self-routing mesh (HWMP), often with batman-adv on top | `iw dev wlan0 interface add mesh0 type mp`, `iw dev mesh0 mesh join <id>`, secure with SAE through wpa_supplicant |
+| Wi-Fi EasyMesh | Wi-Fi Alliance standard: one controller manages agents (channels, steering, backhaul) | prplMesh is an open implementation |
+| Vendor mesh systems | Proprietary controller and backhaul | Can't mix brands |
+
+Each wireless backhaul hop on the same radio halves the throughput at best: use a separate radio (often 5 GHz high channels or 6 GHz) or cable.
+
+### Wi-Fi Direct (P2P)
+
+Two devices connect without an AP: one becomes **group owner** (a soft AP) after a negotiation, the other joins as a client, with WPA2 security. Used by Miracast, printers and phone-to-device setup. wpa_supplicant implements it (`p2p_find`, `p2p_connect`, `p2p_group_add`) on a dedicated P2P device interface; check `iw list` for `P2P-client` and `P2P-GO` support.
+
+### Multi-link operation (Wi-Fi 7)
+
+A **multi-link device** (MLD) has one MLD MAC address seen by upper layers and one link per band (2.4, 5, 6 GHz), each with its own MAC.
+
+| Mode | Behavior |
+|---|---|
+| STR (simultaneous transmit and receive) | Several radios, links used at the same time: more throughput, redundancy. Mostly APs |
+| EMLSR (enhanced multi-link single radio) | Listens on several links, switches the radio to whichever link has traffic. Common in phones and laptops: lower latency, no extra radio |
+| NSTR | Several links, but they can't transmit and receive at the same time on close bands |
+
+MLO helps latency and reliability (traffic goes over whichever link is free). It requires WPA3 and PMF. Linux support (mac80211 MLO, hostapd and wpa_supplicant) is recent and depends on the driver: check your kernel, hostap version and driver before counting on it.
 
 ---
 

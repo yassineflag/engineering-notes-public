@@ -18,6 +18,7 @@ Every note aims to be practical, so you'll find configs and commands you can reu
 
 ## Latest notes
 
+- [Wi-Fi for Embedded Linux Engineers](wireless-protocols-and-connectivity/wifi/wifi.md)
 - [Networking Fundamentals for Embedded Linux Engineers](networking/fundamentals/fundamentals.md)
 - [Networking on OpenWrt](networking/openwrt/openwrt.md)
 - [Building a Home Gateway on Linux](networking/gateway/gateway.md)

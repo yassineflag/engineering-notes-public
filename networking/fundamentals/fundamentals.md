@@ -1432,7 +1432,7 @@ The kernel names interfaces by type and probe order; on systemd images, udev ren
 | Name | Created by | Notes |
 |---|---|---|
 | `eth0`, `end0`, `enp1s0` | NIC drivers; renamed by systemd-udevd | `end0`: device-tree based controller (naming scheme v252 and later). `enp1s0`: PCIe NIC |
-| `wlan0` | Wi-Fi driver | Out of scope here |
+| `wlan0` | Wi-Fi driver | See [Wi-Fi for Embedded Linux Engineers](../../wireless-protocols-and-connectivity/wifi/wifi.md) |
 | `wwan0` | `qmi_wwan`, `cdc_mbim` (USB modems), or links of the kernel's WWAN framework | Cellular data, often raw-IP |
 | `qmimux0` | `qmi_wwan` with QMAP multiplexing enabled | One per multiplexed data session |
 | `rmnet_data0` (name chosen at creation; a Qualcomm convention) | `rmnet` on top of `qmi_wwan`, MHI or IPA | Qualcomm MAP sessions |
@@ -2032,7 +2032,7 @@ Topics for separate, more advanced notes:
 - **Kernel network stack internals**: `sk_buff`, NAPI, GRO/GSO, XDP and eBPF, socket buffers and their sysctls.
 - **Network driver development**: MAC drivers, PHY and MDIO, `phylink`, DSA switch drivers, WWAN drivers ([linux-kernel-device-driver-development/](../../linux-kernel-device-driver-development/)).
 - **Network boot**: U-Boot networking, TFTP, NFS root, `ip=` in detail.
-- **Wireless links**: Wi-Fi, cellular radio protocols, GNSS ([wireless-protocols-and-connectivity/](../../wireless-protocols-and-connectivity/)).
+- **Wireless links**: Wi-Fi (now in [its own note](../../wireless-protocols-and-connectivity/wifi/wifi.md)), cellular radio protocols, GNSS ([wireless-protocols-and-connectivity/](../../wireless-protocols-and-connectivity/)).
 - **IPv6 in depth**: privacy addresses, DHCPv6 details, MLD, multicast routing.
 - **QoS design**: HTB hierarchies, DSCP marking, `cake` tuning for variable-rate links.
 - **Device security**: TLS client certificates and provisioning, WireGuard, hardening network services.

@@ -1682,16 +1682,110 @@ Triggers include `any`, `disconnect`, `magic-packet`, `patterns` (byte patterns 
 
 ## 18. Troubleshooting
 
-Planned: layer-by-layer method, symptom table, reason and status codes, driver and firmware errors.
+### Method
+
+Work up from the hardware, and don't go further until a step passes. Each step's failure has different causes:
+
+| Step | Question | Commands |
+|---|---|---|
+| 0. Hardware, driver | Does `wlan0` exist? Firmware loaded? Not blocked? | `ip -br link`, `dmesg`, `rfkill list`, `ethtool -i wlan0`, `iw list` |
+| 1. Regulatory | Right country? Is the AP's channel allowed? | `iw reg get`, `iw list` (Frequencies) |
+| 2. Scan | Does the device see the AP, at what signal, with which security? | `sudo iw dev wlan0 scan`, `wpa_cli scan_results` |
+| 3. Authentication, association | Accepted? Which status code? | `wpa_supplicant -dd`, `iw event -t -f`, hostapd log on the AP |
+| 4. Handshake | Keys installed, port authorized? | `wpa_cli status` (`wpa_state=COMPLETED`), `station dump` (`authorized: yes`), `tcpdump -eni wlan0 ether proto 0x888e` |
+| 5. IP | Address, route, DNS? | The [fundamentals note](../../networking/fundamentals/fundamentals.md#22-troubleshooting) |
+| 6. Quality | Signal, retries, rates, channel load? | `station dump`, `survey dump`, `iperf3` (section 17) |
+
+Look at **both ends**: the AP's log (hostapd, or the vendor AP's log) often says plainly what the client only sees as a timeout. When both ends disagree, a monitor-mode capture (section 15) settles it.
+
+### Symptoms
+
+| Symptom | Where to look first |
+|---|---|
+| No `wlan0` | Bus enumeration (`dmesg | grep mmc`, `lspci`, `lsusb`), power sequencing and LPO clock, driver loaded (`lsmod`), firmware errors (`-2`) |
+| `Operation not possible due to RF-kill` | `rfkill list`: soft block → `rfkill unblock wifi`; hard block → switch, BIOS, a GPIO, or the platform driver |
+| Scan returns nothing | Interface down, regulatory domain `00` (passive scanning only), antenna not connected, another manager holding the interface |
+| AP missing from the scan, a phone sees it | Its channel isn't allowed by your country setting (12-13 in the US, 149-165 or DFS in some EU configurations), the AP is on 6 GHz or 5 GHz and the module isn't, hidden SSID (`scan_ssid=1`), DFS channel heard only passively |
+| Much weaker signal than a phone at the same spot | Antenna, cable or connector, wrong NVRAM or board data, enclosure, a single chain working (per-chain `signal` values) |
+| Authentication or association rejected | The status code (section 8): security mismatch (SAE vs PSK, PMF required, cipher). Compare `wpa_cli scan_results` flags with your network block |
+| `reason=15`, `WRONG_KEY` | Wrong passphrase. If it's right: a hashed PSK used for SAE, shell quoting in `wpa_cli set_network`, a PSK hashed with another SSID, handshake frames lost at the cell edge |
+| Connects, then drops every few minutes | Reason 16 (group rekey missed while asleep), beacon loss (signal), AP inactivity timeout (reason 4), roaming back and forth between two APs, DFS radar events, firmware crashes in `dmesg` |
+| Connected but no IP address | Port not authorized (`wpa_state` not `COMPLETED`), AP bridged to the wrong network or VLAN, DHCP issues ([fundamentals](../../networking/fundamentals/fundamentals.md#8-getting-an-address-dhcp-slaac-static)), MAC randomization vs DHCP reservations |
+| Works, then stalls under load | Bus or firmware errors in `dmesg` (SDIO CRC errors, timeouts): lower the SDIO `max-frequency`, check power supply droops under TX, temperature |
+| Slow | Section 17: radio, contention, bus, CPU, TCP, the other side |
+| Ping spikes, laggy SSH | Power save, background scans, a busy channel, deep firmware queues |
+| mDNS or discovery fails over Wi-Fi only | `ap_isolate`, multicast lost or delayed (DTIM, low basic rate), multicast snooping on the AP's bridge |
+| hostapd won't start | `iw list`: no `AP` mode or `no IR` on the channel; options the card doesn't support (`ht_capab`, VHT/HE settings); DFS CAC still running; NetworkManager holding the interface (`nmcli dev set wlan0 managed no`) |
+| Clients don't roam, or stick to a far AP | `bgscan` missing or thresholds too low, firmware roaming, 802.11k/v not enabled, AP TX power too high |
+| Fine on the bench, poor in the product | Antenna detuned by the enclosure, metal, cables near the antenna, board noise. Test in the final enclosure |
+| No Wi-Fi after suspend | `keep-power-in-suspend`, wake interrupt, firmware reload on resume. Unloading and reloading the module confirms a driver suspend bug |
+
+### Messages and what they mean
+
+| Message | Meaning |
+|---|---|
+| `Direct firmware load for brcm/... failed with error -2` | File not found. brcmfmac tries board-specific names first: the error is harmless if a later name loads (look for the firmware version line) |
+| `mmc1: error -110 whilst initialising SDIO card` | The card doesn't answer: power, `WL_REG_ON`, pwrseq delays, clock, wiring |
+| `brcmf_sdio_htclk: HT Avail timeout` | The chip doesn't start its clock: LPO clock, supply, firmware or NVRAM mismatch |
+| `ath10k_pci ...: failed to fetch board data` | `board-2.bin` missing or has no entry for this board ID |
+| `iwlwifi ...: Microcode SW error detected. Restarting` | Firmware crash: update firmware and kernel, report with the dump |
+| `wlan0: deauthenticated from ... (Reason: 15=4WAY_HANDSHAKE_TIMEOUT)` | mac80211 decodes reason codes in `dmesg` (section 8) |
+| `nl80211: kernel reports: Match already configured` | Two programs manage the interface (two wpa_supplicants, or NetworkManager plus yours) |
+| `ctrl_iface exists and seems to be in use - cannot override it` | wpa_supplicant already runs on this interface |
+| `CTRL-EVENT-SSID-TEMP-DISABLED ... reason=CONN_FAILED` | Repeated authentication or association failures: look at the status codes above it |
+| hostapd: `Could not set channel for kernel driver` | Channel not allowed (regulatory, `no IR`) or unsupported width |
+| hostapd: `DFS-CAC-START` then nothing for a minute | Normal on DFS channels: the channel availability check (section 4) |
+
+The [gateway note](../../networking/gateway/gateway.md#14-troubleshooting) covers the router side (bridges, firewall, DHCP), and the [OpenWrt note](../../networking/openwrt/openwrt.md#playbooks) its OpenWrt equivalents.
 
 ---
 
 ## 19. Not covered here
 
-Planned: topics for later notes.
+Topics for separate notes:
+
+- **Wi-Fi driver development:** writing a mac80211 or cfg80211 driver, firmware interfaces, nl80211 vendor commands ([linux-kernel-device-driver-development/](../../linux-kernel-device-driver-development/)).
+- **RF design and measurements:** antenna design and matching, conducted and radiated tests, spectrum analyzers ([hardware/rf/](../../hardware/rf/)).
+- **The PHY in depth:** OFDM signal processing, LDPC coding, channel estimation, beamforming math ([hardware/baseband/](../../hardware/baseband/), [hardware/sdr/](../../hardware/sdr/)).
+- **Passpoint (Hotspot 2.0)**, ANQP and carrier Wi-Fi offload.
+- **Wi-Fi location and sensing:** fine timing measurement (802.11mc/az), CSI-based sensing.
+- **802.11ah (HaLow)** and 60 GHz (802.11ad/ay).
+- **Enterprise deployments:** FreeRADIUS, certificate provisioning for fleets, dynamic VLANs.
+- **Mesh in depth:** 802.11s, batman-adv, EasyMesh.
+- **Wi-Fi 7 MLO on Linux** in practice, once driver support settles.
+- **Bluetooth** and **cellular** ([wireless-protocols-and-connectivity/](../)).
 
 ---
 
 ## References
 
-Planned: standards, Linux and hostap documentation, books.
+Standards and specifications:
+
+| Topic | Document |
+|---|---|
+| 802.11 (all amendments merged) | IEEE 802.11-2020, IEEE 802.11-2024. Free to download through the IEEE GET program on <https://ieeexplore.ieee.org> |
+| Wi-Fi 6, Wi-Fi 7 | IEEE 802.11ax-2021, IEEE 802.11be |
+| WPA3, Enhanced Open, Easy Connect, WMM | Wi-Fi Alliance specifications: <https://www.wi-fi.org/discover-wi-fi/specifications> |
+| EAP, EAP-TLS (TLS 1.2, 1.3) | [RFC 3748](https://www.rfc-editor.org/rfc/rfc3748), [RFC 5216](https://www.rfc-editor.org/rfc/rfc5216), [RFC 9190](https://www.rfc-editor.org/rfc/rfc9190) |
+| RADIUS, RADIUS for 802.1X | [RFC 2865](https://www.rfc-editor.org/rfc/rfc2865), [RFC 3580](https://www.rfc-editor.org/rfc/rfc3580) |
+| Dragonfly (SAE's ancestor), OWE | [RFC 7664](https://www.rfc-editor.org/rfc/rfc7664), [RFC 8110](https://www.rfc-editor.org/rfc/rfc8110) |
+| DSCP to 802.11 user priority | [RFC 8325](https://www.rfc-editor.org/rfc/rfc8325) |
+| Documentation MAC addresses | [RFC 7042](https://www.rfc-editor.org/rfc/rfc7042) |
+
+Linux and tools:
+
+- Linux wireless documentation (successor of the wireless wiki): <https://wireless.docs.kernel.org>
+- Kernel 802.11 driver API (cfg80211, mac80211): <https://docs.kernel.org/driver-api/80211/index.html>
+- hostapd and wpa_supplicant: <https://w1.fi>. The annotated example configurations are the real reference for every option: [hostapd.conf](https://w1.fi/cgit/hostap/plain/hostapd/hostapd.conf), [wpa_supplicant.conf](https://w1.fi/cgit/hostap/plain/wpa_supplicant/wpa_supplicant.conf)
+- iwd: <https://iwd.wiki.kernel.org>
+- wireless-regdb: <https://git.kernel.org/pub/scm/linux/kernel/git/wens/wireless-regdb.git>
+- Device tree bindings: `Documentation/devicetree/bindings/net/wireless/` (e.g. `brcm,bcm4329-fmac.yaml`), `Documentation/devicetree/bindings/mmc/mmc-pwrseq-simple.yaml`
+- Radiotap: <https://www.radiotap.org>
+- Wireshark, decrypting 802.11: <https://wiki.wireshark.org/HowToDecrypt802.11>
+- `iw help`, `man wpa_supplicant`, `man wpa_supplicant.conf`, `man wpa_cli`, `man hostapd`, `man iwd`, `man nmcli`
+
+Books:
+
+- Matthew S. Gast, *802.11 Wireless Networks: The Definitive Guide* (2nd edition) and *802.11ac: A Survival Guide*: the MAC and frames, clearly explained.
+- Eldad Perahia and Robert Stacey, *Next Generation Wireless LANs* (2nd edition): the PHY of 802.11n and 802.11ac, by two of the standard's authors.
+- The CWNA official study guide: vendor-neutral design, RF and troubleshooting.

@@ -879,43 +879,804 @@ MLO helps latency and reliability (traffic goes over whichever link is free). It
 
 ## 11. The Linux wireless stack
 
-Planned: nl80211, cfg80211, mac80211, FullMAC vs SoftMAC, firmware, regulatory database, interface types, driver families.
+```
+ User space   wpa_supplicant   hostapd   iwd   NetworkManager / ConnMan   iw
+                    │              │        │           │                  │
+                    └──────────────┴────────┴─── nl80211 (generic netlink) ┘
+ ─────────────────────────────────────────────────────────────────────────────────
+ Kernel                          cfg80211
+                    configuration API, regulatory, scan results, wiphy/wdev
+                       │                                         │
+                    mac80211 (SoftMAC framework)             FullMAC drivers
+                    MLME, frame building, rate control,      (brcmfmac, mwifiex,
+                    aggregation, crypto, power save,          wilc1000...)
+                    per-station TX queues                        │
+                       │                                         │
+                    mac80211 drivers                             │
+                    (ath9k/10k/11k/12k, mt76, iwlwifi, rtw88/89) │
+ ─────────────────────────────────────────────────────────────────────────────────
+ Firmware        timing-critical MAC, often more          MLME, roaming, often
+                                                          handshake offload
+ Hardware        radio, baseband, RF front end, antennas
+```
+
+| Layer | Role |
+|---|---|
+| **nl80211** | The netlink API between user space and the kernel: scan, connect, start an AP, set keys, events. `iw` is a thin client of it |
+| **cfg80211** | Common configuration layer for every driver: regulatory enforcement, the scan result (BSS) list, wiphy and interface objects |
+| **mac80211** | Shared 802.11 implementation for SoftMAC drivers: authentication and association state machine (MLME), frame handling, Minstrel-HT, Block Ack sessions, software crypto, AP-side power save buffering, fq_codel TX queues and AQL |
+| **Driver** | Talks to the chip over its bus, loads firmware. mac80211 drivers implement `ieee80211_ops`, FullMAC drivers implement `cfg80211_ops` directly |
+| **Firmware** | Runs on the chip's own CPU. Its share of the work keeps growing, even for mac80211 drivers |
+| **WEXT** | The pre-2007 API used by `iwconfig`/`iwlist`. Only a compatibility layer now (`CONFIG_CFG80211_WEXT`): no 80 MHz, no WPA3. Some out-of-tree drivers still only speak WEXT (`wpa_supplicant -D wext`): avoid them |
+
+**SoftMAC vs FullMAC:**
+
+| | mac80211 driver | FullMAC driver |
+|---|---|---|
+| Authentication, association | Kernel (mac80211) | Firmware |
+| Rate control | Minstrel-HT or firmware | Firmware |
+| Visibility | Kernel logs, per-station debugfs, tracepoints | Mostly opaque, vendor debug tools |
+| AP, mesh, monitor modes | Usually supported | Whatever the firmware implements |
+| Examples | ath9k, ath10k, ath11k, ath12k, mt76, iwlwifi, rtw88, rtw89 | brcmfmac, mwifiex, wilc1000 |
+
+FullMAC firmware can also **offload** work that wpa_supplicant normally does: the 4-way handshake, SAE (or the opposite: "external authentication", where the driver asks wpa_supplicant to run SAE), roaming, scans, GTK rekeying and ARP replies during suspend. Offloads explain many "wpa_supplicant says X, the chip does Y" puzzles.
+
+### Objects: wiphy, wdev, netdev
+
+- **wiphy** (`phy0`, `/sys/class/ieee80211/phy0`): one radio and its capabilities (`iw phy phy0 info`, or `iw list` for all).
+- **wdev/netdev** (`wlan0`): a virtual interface on that radio, with a type. `/sys/class/net/wlan0/phy80211` links back to its wiphy. A P2P device is a wdev without a netdev.
+
+| Interface type (`iw` name) | Use |
+|---|---|
+| `managed` | Station (client) |
+| `AP`, `AP/VLAN` | Access point (created by hostapd), per-station VLAN interfaces |
+| `monitor` | Raw 802.11 capture and injection (section 15) |
+| `mesh point` (`mp`) | 802.11s mesh |
+| `IBSS` | Ad hoc |
+| `P2P-client`, `P2P-GO`, `P2P-device` | Wi-Fi Direct |
+| `outside context of a BSS` (`ocb`) | 802.11p, vehicles |
+
+Several interfaces on one radio share its channel (or a few channels), within the limits listed under `valid interface combinations` in `iw list` (section 14).
+
+### Regulatory implementation
+
+- **wireless-regdb:** `/lib/firmware/regulatory.db` and its signature `regulatory.db.p7s`, loaded by cfg80211 (since kernel 4.15; the old `crda` helper isn't needed anymore). With `CONFIG_CFG80211_REQUIRE_SIGNED_REGDB`, the kernel checks the signature against built-in keys; to ship a database you rebuilt and signed yourself, add your certificate with `CONFIG_CFG80211_EXTRA_REGDB_KEYDIR`.
+- **Setting the country:** `iw reg set FR`, the `cfg80211.ieee80211_regdom=FR` module parameter, `country=FR` in wpa_supplicant, `country_code=FR` in hostapd, or a beacon's country element.
+- **Drivers add their own rules**, and the most restrictive combination wins:
+
+| Model | Examples | What you see |
+|---|---|---|
+| cfg80211 rules only | mt76, ath9k with an unset EEPROM | `iw reg get` shows `global` with your country |
+| Country programmed in the card's EEPROM, intersected with the user setting | ath9k/ath10k cards | You can restrict, not extend |
+| Self-managed: the driver or firmware owns regulatory | iwlwifi (location-aware regulatory), brcmfmac (CLM blob), some Realtek | `iw reg get` shows `phy#0 (self-managed)` with its own country |
+
+### Firmware
+
+Drivers load firmware from `/lib/firmware` with `request_firmware()` when they probe.
+
+- **Error -2** (`ENOENT`) in `dmesg`: file not found. Usual cause on embedded boards: the driver is **built into the kernel** and probes before the root filesystem is mounted. Build it as a module, put the firmware in the initramfs, or embed it (`CONFIG_EXTRA_FIRMWARE`).
+- File names, board data and NVRAM are per chip family (section 16).
+- `ethtool -i wlan0` shows the driver and the firmware version. Keep the firmware version in your bug reports: many Wi-Fi bugs are firmware bugs.
+
+### Driver families
+
+| Vendor | Driver(s) | Type | Buses | Notes |
+|---|---|---|---|---|
+| Intel | `iwlwifi` | mac80211 + firmware | PCIe (M.2) | Laptops. Client-focused: AP mode is limited, often 2.4 GHz only |
+| Qualcomm (Atheros) | `ath9k` (Wi-Fi 4), `ath10k` (5), `ath11k` (6), `ath12k` (7) | mac80211 | PCIe, AHB (on router SoCs), SDIO/USB for some | Strong AP support. Board data files (`board-2.bin`) per design |
+| MediaTek | `mt76` family: `mt7601u`, `mt76x2`, `mt7615`, `mt7915`, `mt7921`, `mt7925`, `mt7996` | mac80211 | PCIe, USB, SDIO, AHB | Very good AP and monitor support, upstream-first. Common on OpenWrt devices and USB adapters |
+| Realtek | `rtw88` (Wi-Fi 5), `rtw89` (6/7), `rtl8xxxu`, `rtlwifi`; many out-of-tree vendor drivers | mac80211 (in tree) | PCIe, USB, SDIO | Prefer in-tree drivers; vendor drivers are often WEXT-era and break with new kernels |
+| Infineon (Cypress, Broadcom) | `brcmfmac` | FullMAC | SDIO, PCIe, USB | Raspberry Pi and many modules (CYW43455, CYW4373...). Firmware, NVRAM and CLM files per module |
+| NXP (Marvell) | `mwifiex` in tree; vendor `moal`/`mlan` for newer IW4xx/IW6xx chips | FullMAC | SDIO, PCIe, USB | i.MX reference designs |
+| Microchip | `wilc1000` | FullMAC | SDIO, SPI | Low-power IoT |
+| TI | `wlcore` / `wl18xx` | mac80211 | SDIO | WL18xx modules, older designs |
 
 ---
 
 ## 12. Tools: iw, wpa_cli, hostapd_cli and friends
 
-Planned: daily commands, reading `iw` output, the `iwconfig` to `iw` mapping, rfkill, debugfs.
+### iw
+
+| Command | Shows or does |
+|---|---|
+| `iw dev` | Interfaces per radio: type, channel, width, TX power |
+| `iw list`, `iw phy phy0 info` | Radio capabilities: bands, channels and their limits, interface modes and combinations, HT/VHT/HE capabilities, ciphers, supported commands |
+| `iw dev wlan0 link` | Current connection: BSSID, SSID, frequency, signal, rates |
+| `iw dev wlan0 station dump` | Per-peer statistics: on a client the AP, on an AP every client (section 17) |
+| `sudo iw dev wlan0 scan` | Trigger a scan and print every BSS with its decoded elements. `scan dump` prints the cached results |
+| `iw dev wlan0 survey dump` | Per-channel noise and busy time (section 17) |
+| `iw reg get`, `sudo iw reg set FR` | Regulatory domain |
+| `iw event -t -f` | Live nl80211 events with timestamps: scans, auth, assoc, disconnects with reason codes |
+| `sudo iw dev wlan0 set power_save off` | Power save (section 17) |
+| `sudo iw dev wlan0 set txpower fixed 1500` | TX power in mBm (15 dBm); `auto` to reset |
+| `sudo iw phy phy0 interface add mon0 type monitor` | Add a monitor interface (section 15) |
+| `iw phy phy0 wowlan show` | Wake-on-WLAN triggers (section 17) |
+
+```
+$ iw dev
+phy#0
+	Interface wlan0
+		ifindex 3
+		wdev 0x1
+		addr 00:00:5e:00:53:15
+		ssid Home
+		type managed
+		channel 36 (5180 MHz), width: 80 MHz, center1: 5210 MHz
+		txpower 20.00 dBm
+
+$ iw dev wlan0 link
+Connected to 00:00:5e:00:53:a0 (on wlan0)
+	SSID: Home
+	freq: 5180.0
+	RX: 18232110 bytes (21422 packets)
+	TX: 2310991 bytes (9122 packets)
+	signal: -57 dBm
+	rx bitrate: 390.0 MBit/s VHT-MCS 8 80MHz short GI VHT-NSS 1
+	tx bitrate: 292.5 MBit/s VHT-MCS 6 80MHz short GI VHT-NSS 1
+	bss flags:	short-slot-time
+	dtim period:	2
+	beacon int:	100
+```
+
+Reading it: channel 36 with an 80 MHz block centered at 5210 MHz (channel 42), one spatial stream (`VHT-NSS 1`), the AP sends at MCS 8 while the board sends at MCS 6: the uplink is weaker (section 5). The fields shown depend on the driver; FullMAC drivers report fewer.
+
+**From the old tools to `iw`:**
+
+| wireless-tools (WEXT) | iw |
+|---|---|
+| `iwconfig` | `iw dev`, `iw dev wlan0 link` |
+| `iwlist wlan0 scan` | `iw dev wlan0 scan` |
+| `iwlist wlan0 freq` | `iw list` (Frequencies section) |
+| `iwconfig wlan0 essid Home` | `iw dev wlan0 connect Home` (open networks only; use wpa_supplicant otherwise) |
+| `iwconfig wlan0 txpower 15` | `iw dev wlan0 set txpower fixed 1500` |
+| `iwconfig wlan0 power off` | `iw dev wlan0 set power_save off` |
+| `iwconfig wlan0 mode monitor` | `iw dev wlan0 set type monitor` (interface down first) |
+| `cat /proc/net/wireless` | `iw dev wlan0 station dump` |
+
+### wpa_cli and hostapd_cli
+
+Both talk to their daemon over a control socket (`ctrl_interface`, usually `/run/wpa_supplicant` and `/run/hostapd`). Without arguments they open an interactive shell that also prints events live.
+
+| `wpa_cli -i wlan0 ...` | Does |
+|---|---|
+| `status` | State (`wpa_state=COMPLETED` when connected), BSSID, frequency, key management, IP |
+| `scan`, then `scan_results` | Scan and list BSSes with signal and flags (`[WPA2-PSK-CCMP][SAE]...`) |
+| `list_networks`, `select_network <id>`, `enable_network <id>` | Manage configured networks |
+| `signal_poll` | RSSI, link speed, noise, frequency |
+| `bss <bssid>` | Everything known about one BSS |
+| `reassociate`, `reconnect`, `disconnect` | Force connection changes |
+| `roam <bssid>` | Roam to a given BSS of the same ESS |
+| `log_level debug` | Raise the log level without restarting |
+
+| `hostapd_cli -i wlan0 ...` | Does |
+|---|---|
+| `status` | State, channel, width, number of stations, DFS state |
+| `all_sta`, `sta <mac>` | Associated clients with flags (`[AUTH][ASSOC][AUTHORIZED][WMM][MFP][HT][VHT][HE]`), signal, rates, AKM |
+| `deauthenticate <mac>`, `disassociate <mac>` | Kick a client |
+| `bss_tm_req <mac> ...` | Send an 802.11v BSS transition request |
+| `chan_switch <count> <freq> ...` | Move the BSS to another channel with CSA |
+| `reload`, `disable`, `enable` | Apply a changed configuration |
+
+### Higher-level managers
+
+```bash
+# NetworkManager
+nmcli dev wifi list
+nmcli dev wifi connect Home password 'change-me-long-passphrase'
+nmcli -f GENERAL,WIFI-PROPERTIES dev show wlan0
+
+# iwd
+iwctl station wlan0 scan
+iwctl station wlan0 get-networks
+iwctl station wlan0 connect Home
+```
+
+### rfkill and debugfs
+
+- **rfkill** blocks radios in software (`soft`) or from a switch or firmware (`hard`). `rfkill list`; `sudo rfkill unblock wifi`. A blocked radio refuses to come up with `Operation not possible due to RF-kill`.
+- **debugfs** (`mount -t debugfs none /sys/kernel/debug`): `/sys/kernel/debug/ieee80211/phy0/` has mac80211 counters, per-station directories (`netdev:wlan0/stations/<mac>/`, with Minstrel's `rc_stats` when it is used), AQL and airtime settings, and a driver directory (`ath10k/`, `mt76/`, ...) with firmware statistics. Needs `CONFIG_MAC80211_DEBUGFS`.
+- **Tracepoints:** `trace-cmd record -e cfg80211 -e mac80211` records every nl80211 call and mac80211 event, for bugs between wpa_supplicant and the driver.
 
 ---
 
 ## 13. Station mode: connecting a device
 
-Planned: wpa_supplicant configurations (WPA2, WPA3, Enterprise, hidden, open/OWE), running it under systemd or BusyBox, events, iwd and NetworkManager.
+### wpa_supplicant configuration
+
+`/etc/wpa_supplicant/wpa_supplicant-wlan0.conf` (file name used by Debian's `wpa_supplicant@wlan0.service`; other systems use `/etc/wpa_supplicant.conf`):
+
+```ini
+ctrl_interface=DIR=/run/wpa_supplicant GROUP=netdev
+# Let wpa_cli save_config rewrite this file
+update_config=1
+country=FR
+# PMF: use it when the AP supports it (per-network ieee80211w overrides)
+pmf=1
+# SAE: accept hash-to-element and hunting-and-pecking
+sae_pwe=2
+
+# Home network, WPA2 or WPA3 depending on the AP
+network={
+    ssid="Home"
+    psk="change-me-long-passphrase"
+    key_mgmt=WPA-PSK WPA-PSK-SHA256 SAE
+    ieee80211w=1
+    priority=10
+    # Scan every 30 s below -70 dBm, every hour above, to find a better AP
+    bgscan="simple:30:-70:3600"
+}
+
+# A WPA3-only network: PMF required
+network={
+    ssid="Lab"
+    sae_password="another-long-passphrase"
+    key_mgmt=SAE
+    ieee80211w=2
+    priority=5
+}
+```
+
+Other common network blocks:
+
+```ini
+# Hidden SSID: probe for it by name
+network={
+    ssid="Hidden-Lab"
+    scan_ssid=1
+    psk="..."
+}
+
+# Open network, and Enhanced Open
+network={
+    ssid="Cafe"
+    key_mgmt=NONE
+}
+network={
+    ssid="Cafe-OWE"
+    key_mgmt=OWE
+    ieee80211w=2
+}
+
+# Enterprise, EAP-TLS with a device certificate
+network={
+    ssid="Corp"
+    key_mgmt=WPA-EAP WPA-EAP-SHA256
+    eap=TLS
+    identity="device-0042@example.com"
+    ca_cert="/etc/wifi/ca.pem"
+    client_cert="/etc/wifi/device-0042.pem"
+    private_key="/etc/wifi/device-0042.key"
+    # Accept only this RADIUS server name (in the server certificate)
+    domain_suffix_match="radius.example.com"
+    ieee80211w=1
+}
+
+# Enterprise, PEAP with a password
+network={
+    ssid="Corp"
+    key_mgmt=WPA-EAP
+    eap=PEAP
+    identity="jdoe"
+    password="..."
+    phase2="auth=MSCHAPV2"
+    ca_cert="/etc/wifi/ca.pem"
+    domain_suffix_match="radius.example.com"
+}
+```
+
+| Option | Use |
+|---|---|
+| `priority=` | Higher number wins when several configured networks are in range |
+| `bssid=` | Lock to one AP (testing; it disables roaming) |
+| `freq_list=5180 5200` | Only scan and connect on these frequencies: faster connections |
+| `bgscan="simple:<short>:<dBm>:<long>"` | Background scanning for roaming. Without it, a stationary client never looks for a better AP |
+| `mac_addr=` (global) / `mac_addr=` (per network) | MAC randomization: 0 = real MAC, 1 = random per connection, 2 = random per network (persistent) |
+| `psk=<64 hex digits>` | Hashed PSK from `wpa_passphrase "Home" passphrase`: hides the passphrase, works for WPA2 only (not SAE) |
+
+### Running it
+
+**systemd (Debian, Yocto with systemd):**
+
+```bash
+sudo chmod 600 /etc/wpa_supplicant/wpa_supplicant-wlan0.conf
+sudo systemctl enable --now wpa_supplicant@wlan0
+```
+
+`/etc/systemd/network/30-wlan0.network`:
+
+```ini
+[Match]
+Name=wlan0
+
+[Network]
+DHCP=yes
+# Keep the addresses during the short carrier loss of a roam
+IgnoreCarrierLoss=3s
+```
+
+**BusyBox init (Buildroot):** start wpa_supplicant in the background and let `wpa_cli` run a script on connection events:
+
+```sh
+wpa_supplicant -B -i wlan0 -c /etc/wpa_supplicant.conf -P /run/wpa_supplicant.wlan0.pid
+wpa_cli -i wlan0 -a /etc/wifi-action.sh -B
+```
+
+`/etc/wifi-action.sh`:
+
+```sh
+#!/bin/sh
+# Called by wpa_cli -a with: $1 = interface, $2 = CONNECTED or DISCONNECTED
+pid=/run/udhcpc.$1.pid
+case "$2" in
+CONNECTED)
+    if [ -f "$pid" ] && kill -0 "$(cat "$pid")" 2>/dev/null; then
+        kill -USR1 "$(cat "$pid")"     # already running (reconnect, roam): renew the lease
+    else
+        udhcpc -i "$1" -b -p "$pid"
+    fi
+    ;;
+DISCONNECTED)
+    # Keep the address: most disconnections are short (roaming, AP reboot)
+    ;;
+esac
+```
+
+**By hand, for debugging:** stop every other manager first (NetworkManager, connman, a systemd unit), or they fight over the interface:
+
+```bash
+sudo wpa_supplicant -dd -t -i wlan0 -c /etc/wpa_supplicant.conf    # foreground, full debug
+```
+
+**Adding a network at runtime** (for example from a provisioning app). Note the double quoting: strings are quoted inside the shell quotes, hex values aren't.
+
+```bash
+wpa_cli -i wlan0 add_network                       # prints the new id, e.g. 1
+wpa_cli -i wlan0 set_network 1 ssid '"Home"'
+wpa_cli -i wlan0 set_network 1 psk '"change-me-long-passphrase"'
+wpa_cli -i wlan0 set_network 1 key_mgmt 'WPA-PSK SAE'
+wpa_cli -i wlan0 enable_network 1
+wpa_cli -i wlan0 save_config                       # needs update_config=1
+```
+
+**Events** an application can wait for (from `wpa_cli` in interactive mode, or the control socket):
+
+| Event | Meaning |
+|---|---|
+| `CTRL-EVENT-SCAN-RESULTS` | Scan finished |
+| `CTRL-EVENT-NETWORK-NOT-FOUND` | No configured network in the scan results |
+| `CTRL-EVENT-CONNECTED` | Associated and keys installed (the port is open) |
+| `CTRL-EVENT-DISCONNECTED bssid=... reason=N [locally_generated=1]` | Disconnected, with the reason code (section 8) |
+| `CTRL-EVENT-ASSOC-REJECT bssid=... status_code=N` | Association refused, with the status code |
+| `CTRL-EVENT-SSID-TEMP-DISABLED id=... reason=WRONG_KEY` | Network paused after failures, here a wrong passphrase |
+| `CTRL-EVENT-REGDOM-CHANGE` | Regulatory domain changed |
+
+### Choosing a connection manager
+
+| | wpa_supplicant | iwd | NetworkManager | ConnMan |
+|---|---|---|---|---|
+| Role | Supplicant only (plus AP, mesh, P2P) | Supplicant, optional DHCP | Full manager (Wi-Fi, Ethernet, cellular, VPN) | Full manager, lighter |
+| Wi-Fi backend | itself | itself | wpa_supplicant or iwd | wpa_supplicant or iwd |
+| Footprint | Small, configurable at build time | Small, uses kernel crypto (needs several `CONFIG_CRYPTO_USER_API_*` and keyctl options) | Large (D-Bus, GLib) | Medium |
+| Good for | Everything; the default on embedded | Fast connects and roaming on desktop-like devices | Devices with a UI, many connection types | Small images with a manager API |
+
+iwd keeps credentials in `/var/lib/iwd/<SSID>.psk`:
+
+```ini
+[Security]
+Passphrase=change-me-long-passphrase
+```
+
+and does DHCP itself with `EnableNetworkConfiguration=true` in the `[General]` section of `/etc/iwd/main.conf`. NetworkManager stores connections in `/etc/NetworkManager/system-connections/*.nmconnection` (mode `0600`).
 
 ---
 
 ## 14. Access point mode and provisioning
 
-Planned: what to add to the gateway note's hostapd config (Wi-Fi 6/6E, roaming, ACS, DFS), AP+STA concurrency, onboarding a headless device.
+The [gateway note](../../networking/gateway/gateway.md#10-wi-fi-access-point-hostapd) has a complete hostapd configuration (5 GHz, WPA2/WPA3, guest SSID, bridges) and how to check AP support with `iw list`. This section adds what you need beyond it.
+
+### Wi-Fi 6 on 5 GHz
+
+Add to the gateway's 80 MHz configuration on channel 36:
+
+```ini
+ieee80211ax=1
+he_oper_chwidth=1
+he_oper_centr_freq_seg0_idx=42
+he_su_beamformer=1
+he_bss_color=17
+```
+
+### 6 GHz
+
+A separate radio or BSS, WPA3 only (section 4):
+
+```ini
+interface=wlan2
+bridge=br-lan
+driver=nl80211
+country_code=FR
+ieee80211d=1
+hw_mode=a
+# Operating class 133 = 6 GHz, 80 MHz. Channel 37 is a PSC, block 33-45, center 39
+op_class=133
+channel=37
+ieee80211ax=1
+he_oper_chwidth=1
+he_oper_centr_freq_seg0_idx=39
+ssid=Home
+wpa=2
+wpa_key_mgmt=SAE
+rsn_pairwise=CCMP
+sae_password=change-me-long-passphrase
+sae_pwe=1
+ieee80211w=2
+beacon_prot=1
+```
+
+6 GHz operating classes: 131 (20 MHz), 132 (40), 133 (80), 134 (160), 137 (320). For clients to find this BSS without scanning, the 5 GHz radio of the same device should advertise it (reduced neighbor report, handled by hostapd when both BSSes run in one hostapd process).
+
+### Roaming between the two APs
+
+On both APs (same SSID, passphrase and `mobility_domain`), with only `nas_identifier` different:
+
+```ini
+wpa_key_mgmt=WPA-PSK FT-PSK
+mobility_domain=4f57
+nas_identifier=ap1.home.example
+ft_over_ds=0
+# FT with PSK: derive the FT keys locally, no key exchange between APs
+ft_psk_generate_local=1
+# 802.11k neighbor and beacon reports, 802.11v BSS transition
+rrm_neighbor_report=1
+rrm_beacon_report=1
+bss_transition=1
+```
+
+- Keep `WPA-PSK` next to `FT-PSK` for clients without FT.
+- `ft_psk_generate_local` covers PSK only. FT with SAE or 802.1X needs `r0kh`/`r1kh` entries and a shared key between the APs (see `hostapd.conf`).
+- Each AP must know its neighbors for 802.11k: `hostapd_cli show_neighbor` on one AP prints its own neighbor report entry, `hostapd_cli set_neighbor <bssid> ssid=\"Home\" nr=<hex>` adds it to the other. OpenWrt's usteer and DAWN automate this.
+- Check with the board: `wpa_cli status` shows `key_mgmt=FT-PSK`, and a roam (`wpa_cli roam 00:00:5e:00:53:a1`) logs an FT authentication instead of a full handshake.
+
+### Other useful options
+
+| Option | Effect |
+|---|---|
+| `channel=0` (with `acs_num_scans=5`) | Automatic channel selection from a survey. Needs survey support in the driver (`iw dev wlan0 survey dump`) |
+| `ieee80211h=1` | Enable DFS (needed for channels 52-144). hostapd logs `DFS-CAC-START`, `DFS-CAC-COMPLETED`, `DFS-RADAR-DETECTED`, `DFS-NEW-CHANNEL` |
+| `ap_isolate=1` | Clients of this BSS can't talk to each other directly |
+| `max_num_sta=32` | Limit associations (status 17 beyond it) |
+| `ap_max_inactivity=300` | Seconds before an idle client is polled and removed |
+| `disassoc_low_ack=1` | Drop clients that stop acknowledging frames |
+| `multicast_to_unicast=1` | Send multicast as unicast to each client (section 6) |
+| `proxy_arp=1` | The AP answers ARP for its clients (needs a bridge) |
+| `wpa_psk_file=/etc/hostapd/wlan0.psk` | Per-client passphrases, optionally with a VLAN per entry (`vlanid=`) |
+| `dtim_period=2` | Broadcast delivery every 2 beacons: power vs multicast latency (section 10) |
+| `ctrl_interface=/run/hostapd` | Enables `hostapd_cli` |
+
+hostapd events to watch (`hostapd_cli` interactive, or `journalctl -u hostapd`): `AP-ENABLED`, `AP-STA-CONNECTED <mac>`, `EAPOL-4WAY-HS-COMPLETED <mac>`, `AP-STA-DISCONNECTED <mac>`.
+
+### AP and station at the same time
+
+A device that keeps its uplink while offering a setup network needs AP+STA concurrency on one radio:
+
+```
+$ iw list | grep -A 4 "valid interface combinations"
+	valid interface combinations:
+		 * #{ managed } <= 1, #{ AP } <= 1, #{ P2P-client, P2P-GO } <= 1,
+		   total <= 3, #channels <= 1
+```
+
+`#channels <= 1`: both interfaces must use the same channel, so the AP follows whatever channel the uplink AP uses. Create the AP interface and give hostapd that channel:
+
+```bash
+sudo iw dev wlan0 interface add ap0 type __ap
+iw dev wlan0 info | grep channel          # the uplink's channel
+# hostapd config: interface=ap0, same channel; restart hostapd when the uplink roams to another channel
+```
+
+### Provisioning a headless device
+
+A product without a screen needs a way to receive the Wi-Fi credentials:
+
+| Method | How | Notes |
+|---|---|---|
+| SoftAP | The device starts its own AP (`Device-1A2B`), a phone joins it and sends credentials over HTTP(S) or an app | Works with any phone. Phones may leave a network "without internet" or show a captive portal: handle both. Use WPA2 with a per-device label password, not an open AP |
+| Bluetooth LE | A phone app sends credentials over GATT | Common today. Needs BLE on the device and an app |
+| Wi-Fi Easy Connect (DPP) | The device shows or prints a QR code (its public key). A configurator (phone, AP) scans it and sends a signed configuration | Standard, no password typing. wpa_supplicant built with `CONFIG_DPP` (`dpp_bootstrap_gen`, `dpp_listen`) |
+| WPS | Push button or PIN | PIN mode is broken, push button is weak, many APs disable it. Avoid |
+| Wired or local | USB, serial console, a file on a USB stick or SD card | Simple for development and industrial devices |
+
+Whatever the method: after provisioning, stop the setup AP, store credentials with `0600` permissions, and keep a way back (factory reset button) for when the network changes.
 
 ---
 
 ## 15. Monitor mode and over-the-air captures
 
-Planned: monitor interfaces, radiotap, Wireshark filters, decrypting a capture, what a sniffer can't see.
+`tcpdump -i wlan0` on a station or AP interface shows **Ethernet** frames after decryption and conversion (section 7): no management frames, no retries, no radio information. To see the air, use a **monitor** interface, preferably on a separate adapter (an mt76 USB adapter works well), tuned to the channel and width of the network.
+
+```bash
+sudo iw phy phy1 interface add mon0 type monitor
+sudo ip link set mon0 up
+# Primary 5180 MHz (channel 36), 80 MHz block centered at 5210 MHz (channel 42)
+sudo iw dev mon0 set freq 5180 80 5210
+sudo tcpdump -i mon0 -w home-ch36.pcap
+```
+
+If NetworkManager or wpa_supplicant manage that radio, they change channels under you: `nmcli dev set wlan1 managed no`, or stop them.
+
+**Radiotap:** the driver prepends a radiotap header to each captured frame with what the radio saw: signal strength (`radiotap.dbm_antsignal`), per antenna on some drivers, channel, rate or MCS, bandwidth, flags (short GI, bad FCS).
+
+**Wireshark display filters:**
+
+| Filter | Shows |
+|---|---|
+| `wlan.addr == 00:00:5e:00:53:15` | Everything to or from the board |
+| `wlan.fc.type_subtype == 0x08` | Beacons |
+| `wlan.fc.type_subtype in {0x04 0x05}` | Probe requests and responses |
+| `wlan.fc.type_subtype in {0x00 0x01 0x0b}` | Association request, response, authentication |
+| `wlan.fc.type_subtype in {0x0a 0x0c}` | Disassociation, deauthentication (check `wlan.fixed.reason_code`) |
+| `eapol` | 4-way and group key handshakes |
+| `wlan.fc.retry == 1` | Retransmissions |
+| `wlan.fc.type_subtype == 0x0d` | Action frames (Block Ack setup, 802.11k/v/r, channel switch, SA Query) |
+| `wlan_radio.signal_dbm < -75` | Weak frames |
+
+**Decrypting a capture:** for WPA2-PSK, add `wpa-pwd` with `passphrase:SSID` in Wireshark (Preferences, Protocols, IEEE 802.11, Decryption keys) and capture **all four handshake messages** of the client you want to decrypt: reconnect it during the capture. For SAE and 802.1X, the passphrase isn't enough: you need the PMK or the TK (`wpa-psk` key type), which `hostapd -dd -K` or `wpa_supplicant -dd -K` print in their debug logs (lab use only).
+
+**A sniffer only sees what it can decode:** it must support the network's width, streams and PHY (a 1x1 80 MHz sniffer misses a 2x2 160 MHz client's data frames), it won't decode frames that were too weak where it sits, and it hears differently from the AP or client (hidden nodes). Put it next to the device you debug.
+
+**Without monitor mode:**
+- `sudo tcpdump -eni wlan0 ether proto 0x888e` shows the EAPOL handshake frames on a client or AP.
+- `iw event -t -f` shows authentication, association and disconnections with reason codes.
+- `wpa_supplicant -dd` and `hostapd -dd` log every step of the state machines.
+- `trace-cmd` with the `cfg80211` and `mac80211` events (section 12).
 
 ---
 
 ## 16. Integrating a Wi-Fi chip on a board
 
-Planned: buses (SDIO, PCIe, USB, SPI), device tree, power sequencing, firmware and NVRAM files, kernel and build-system options, antennas, coexistence, certification.
+### Buses
+
+| Bus | Practical Wi-Fi throughput | Pros | Cons |
+|---|---|---|---|
+| SDIO (3.0, 4-bit) | Typically 100-400 Mb/s, depends on the host controller | Few pins, low power, most embedded modules | Bus ceiling below Wi-Fi 6 rates, signal integrity at 100-200 MHz clocks, host controller quirks |
+| PCIe | Gigabit and above | Full Wi-Fi 6/7 rates, M.2 modules | Power, needs a PCIe controller, larger modules |
+| USB 2.0 / 3.x | About 250 Mb/s / gigabit | Easy (dongles), hot-plug | USB 2.0 caps throughput; more latency and power; USB 3 noise near 2.4 GHz |
+| SPI | Tens of Mb/s at best | Any host | Slow, FullMAC only (wilc1000, ESP32 hosted firmware) |
+
+Combo chips usually put Wi-Fi on SDIO or PCIe and Bluetooth on a UART (HCI) or USB.
+
+### Signals and power sequencing
+
+| Signal | Role |
+|---|---|
+| `WL_REG_ON` | Enables the Wi-Fi part (internal regulators). Held low = chip off. Controlled by a GPIO |
+| `BT_REG_ON` | Same for Bluetooth on combo chips |
+| `WL_HOST_WAKE` | Out-of-band interrupt from the chip (instead of SDIO in-band interrupts), and the wake source in suspend |
+| 32.768 kHz LPO | Sleep clock. Some modules need it from the host (RTC or PMIC output), and fail in strange ways without it |
+| VBAT, VDDIO | Main supply and I/O voltage. VDDIO must match the SDIO host's signaling (1.8 V for UHS modes, `vqmmc-supply`) |
+| SDIO CLK, CMD, D0-D3 | Keep short, matched, with clean ground: most "flaky Wi-Fi" on new boards is SDIO signal integrity |
+
+### Device tree (SDIO, brcmfmac example)
+
+```dts
+/ {
+	wifi_pwrseq: wifi-pwrseq {
+		compatible = "mmc-pwrseq-simple";
+		reset-gpios = <&gpio2 10 GPIO_ACTIVE_LOW>;	/* WL_REG_ON, released after power-up */
+		post-power-on-delay-ms = <200>;
+		clocks = <&pmic_clk32k>;			/* 32.768 kHz LPO, if the module needs it */
+		clock-names = "ext_clock";
+	};
+};
+
+&usdhc2 {
+	pinctrl-names = "default";
+	pinctrl-0 = <&pinctrl_usdhc2>;
+	bus-width = <4>;
+	non-removable;
+	keep-power-in-suspend;
+	mmc-pwrseq = <&wifi_pwrseq>;
+	vmmc-supply = <&reg_wifi_3v3>;
+	vqmmc-supply = <&reg_1v8>;
+	#address-cells = <1>;
+	#size-cells = <0>;
+	status = "okay";
+
+	wifi@1 {
+		compatible = "brcm,bcm43455-fmac", "brcm,bcm4329-fmac";
+		reg = <1>;
+		interrupt-parent = <&gpio1>;
+		interrupts = <5 IRQ_TYPE_LEVEL_HIGH>;	/* WL_HOST_WAKE */
+		interrupt-names = "host-wake";
+	};
+};
+```
+
+Controller, GPIO and regulator labels are examples (`usdhc2` is an i.MX SD controller). Useful extra properties when debugging: `max-frequency = <50000000>;` to rule out signal integrity, `cap-power-off-card` to let the host power the card off. PCIe and USB chips are discovered on their bus and usually need no Wi-Fi node, only the power and reset GPIOs (regulators, `reset-gpios` or a pwrseq on the PCIe controller).
+
+### Bring-up order
+
+| Step | Check | Passing looks like |
+|---|---|---|
+| 1. Power and clock | Measure VBAT, VDDIO, `WL_REG_ON` going high, the 32 kHz clock | Levels and timing from the module datasheet |
+| 2. Bus enumeration | `dmesg | grep mmc`, `ls /sys/bus/sdio/devices/`, `lspci`, `lsusb` | `mmc1: new high speed SDIO card at address 0001`; vendor `0x02d0` (Broadcom/Infineon) |
+| 3. Driver and firmware | `dmesg | grep -i -e brcmf -e firmware`, `ethtool -i wlan0` | Firmware version line, no `-2` errors |
+| 4. Radio | `iw list`, `iw reg get` | Expected bands, channels, modes, the right country |
+| 5. Scan | `iw dev wlan0 scan | grep -e SSID -e signal` | Neighbor networks at signal levels similar to a phone in the same place |
+| 6. Connect | wpa_supplicant, DHCP | Section 13 |
+| 7. Throughput, stability | iperf3 over hours, both directions (section 17) | No firmware crashes or bus errors in `dmesg` |
+| 8. Suspend, resume, reboot loops | Hundreds of cycles | The chip comes back every time |
+
+### Firmware and calibration files
+
+| Driver | Files in `/lib/firmware` | Notes |
+|---|---|---|
+| brcmfmac | `brcm/brcmfmac43455-sdio.bin` (firmware), `.clm_blob` (regulatory and power tables), `.txt` (NVRAM) | NVRAM is **board-specific**: antenna, TX power, crystal, MAC. The driver first looks for a name with the DT root `compatible` (`brcmfmac43455-sdio.raspberrypi,4-model-b.txt`). Get it from the module vendor |
+| ath10k, ath11k | `ath10k/QCA6174/hw3.0/firmware-6.bin`, `board-2.bin` (calibration per board ID) | Wrong board data: low power, poor range, or no probe |
+| iwlwifi | `iwlwifi-<chip>-<api>.ucode`, `.pnvm` on newer chips | The driver tries API versions from newest to oldest |
+| mt76 | `mediatek/WIFI_RAM_CODE_MT7961_1.bin`, `mediatek/WIFI_MT7961_patch_mcu_1_2_hdr.bin` (mt7921) | |
+
+**MAC addresses:** from the chip's OTP, the NVRAM, or the device tree (`local-mac-address`, or an NVMEM cell in an EEPROM). Check that two units of your product have different MACs: some modules' default NVRAM contains a placeholder MAC.
+
+### Kernel and build options
+
+| Kernel option | For |
+|---|---|
+| `CONFIG_CFG80211`, `CONFIG_MAC80211` | The stack (mac80211 only for SoftMAC drivers) |
+| Driver: `CONFIG_BRCMFMAC` + `CONFIG_BRCMFMAC_SDIO`, `CONFIG_ATH10K_PCI`, `CONFIG_MT7921E`... | Your chip and bus |
+| `CONFIG_RFKILL` | rfkill |
+| `CONFIG_CFG80211_WEXT` | Only for old tools that still use WEXT |
+| `CONFIG_MAC80211_DEBUGFS`, `CONFIG_CFG80211_DEBUGFS` | Debug counters (development builds) |
+| `CONFIG_CRYPTO_CCM`, `CONFIG_CRYPTO_GCM`, `CONFIG_CRYPTO_CMAC` | Software crypto for mac80211 when the hardware can't |
+
+| Build system | Packages |
+|---|---|
+| Buildroot | `BR2_PACKAGE_WPA_SUPPLICANT` (with its `_WPA3`, `_AUTOSCAN`, `_CLI` options), `BR2_PACKAGE_HOSTAPD`, `BR2_PACKAGE_IW`, `BR2_PACKAGE_WIRELESS_REGDB`, `BR2_PACKAGE_LINUX_FIRMWARE` with the per-chip options |
+| Yocto | `wpa-supplicant`, `hostapd`, `iw`, `wireless-regdb-static`, `linux-firmware-<chip>` (split packages such as `linux-firmware-bcm43455`), `DISTRO_FEATURES` containing `wifi` |
+
+Package and option names change between releases: check them in your version.
+
+### Antennas and RF
+
+- **Types:** PCB trace or chip antennas (cheap, need a ground plane and a keep-out area, sensitive to nearby metal), external antennas on u.FL/MHF connectors (small cables lose a few dB per meter at 5 GHz).
+- **Placement:** away from metal, batteries, displays, DDR and switching regulators; not inside a metal enclosure without an external antenna.
+- **Two chains, two antennas:** compare per-chain signals in `iw dev wlan0 station dump` (`signal: -52 [-54, -57] dBm`). A chain much weaker than the other points to an antenna, cable or connector problem.
+- **Noise from your own board:** USB 3.0, HDMI, DDR and DC-DC converters raise the noise floor. Compare `noise` in `iw dev wlan0 survey dump` with the interferer on and off.
+- **Coexistence:** on combo chips, Wi-Fi on 2.4 GHz and Bluetooth share the band and often the antenna, arbitrated by the chip (PTA). Bluetooth audio plus 2.4 GHz Wi-Fi throughput suffer together: put Wi-Fi on 5 GHz when possible. A cellular modem on nearby bands (LTE bands 7, 40, 41) needs filtering and antenna separation.
+
+### Certification and regulatory
+
+- **Use a pre-certified module** (modular approval: FCC ID, ISED, CE RED, MIC...). The approval holds only if you follow the module's integration rules: listed antenna types and maximum gains, trace layout, labeling.
+- **The end product still needs its own tests and declarations** (EU RED, FCC unintentional emitter, ...), and test labs need **test modes**: continuous transmission on a given channel, rate and power. They come from the vendor (manufacturing tools, special firmware, `nl80211` testmode): ask for them early.
+- **Lock regulatory settings:** users must not choose a country or TX power outside the certified ones. Ship the matching regulatory data (CLM blob, board data, regdb) and set the country per product SKU.
+- **EU RED cybersecurity:** since 1 August 2025, internet-connected radio equipment sold in the EU must meet the RED delegated act requirements (harmonized standards EN 18031-1/2/3): no universal default passwords, protected credentials, secure updates.
 
 ---
 
 ## 17. Performance, power and tuning
 
-Planned: measuring with iperf3, reading `station dump` and `survey dump`, bus and CPU limits, power save vs latency, WoWLAN.
+### Measuring throughput
+
+Run an `iperf3` server on a wired host (the dev laptop on Ethernet, not over the same Wi-Fi), so the test measures one wireless hop:
+
+```bash
+iperf3 -s                                     # on the wired host
+iperf3 -c 192.168.10.100 -t 30                # board → host (uplink)
+iperf3 -c 192.168.10.100 -t 30 -R             # host → board (downlink)
+iperf3 -c 192.168.10.100 -t 30 -P 4           # 4 parallel streams
+iperf3 -c 192.168.10.100 -u -b 150M -t 30     # UDP at a fixed rate: loss and jitter, no TCP effects
+```
+
+Typical TCP throughput close to the AP, on a clean channel:
+
+| Link (PHY rate) | TCP throughput |
+|---|---|
+| 1x1 Wi-Fi 4, 20 MHz (72 Mb/s) | 40-55 Mb/s |
+| 1x1 Wi-Fi 5, 80 MHz (433 Mb/s) | 200-300 Mb/s, less if SDIO limits it |
+| 2x2 Wi-Fi 5, 80 MHz (867 Mb/s) | 450-650 Mb/s |
+| 2x2 Wi-Fi 6, 80 MHz (1201 Mb/s) | 650-900 Mb/s |
+| 2x2 Wi-Fi 6, 160 MHz (2402 Mb/s) | 1.2-1.8 Gb/s |
+
+### Reading `station dump` and `survey dump`
+
+```
+$ iw dev wlan0 station dump
+Station 00:00:5e:00:53:a0 (on wlan0)
+	inactive time:	120 ms
+	rx bytes:	182331223
+	rx packets:	134210
+	tx bytes:	9210331
+	tx packets:	61002
+	tx retries:	4211
+	tx failed:	12
+	beacon loss:	0
+	signal:  	-57 [-57] dBm
+	signal avg:	-58 [-58] dBm
+	tx bitrate:	292.5 MBit/s VHT-MCS 6 80MHz short GI VHT-NSS 1
+	rx bitrate:	390.0 MBit/s VHT-MCS 8 80MHz short GI VHT-NSS 1
+	expected throughput:	180.5Mbps
+	authorized:	yes
+	authenticated:	yes
+	associated:	yes
+	WMM/WME:	yes
+	MFP:		yes
+	connected time:	3600 seconds
+```
+
+| Field | What to look for |
+|---|---|
+| `signal`, `signal avg` (per chain in brackets) | Section 5 levels; chains within a few dB of each other |
+| `tx retries` / `tx packets` | Under about 10% is healthy; above 30%, interference, weak uplink or hidden nodes |
+| `tx failed` | Frames dropped after all retries: should stay near zero |
+| `tx bitrate` vs `rx bitrate` | Large asymmetry: the device's uplink (TX power, antenna) is the weak side |
+| `expected throughput` | mac80211's estimate from rate control: compare with iperf3 |
+| `beacon loss` | Missed beacons: weak signal, interference or firmware trouble |
+| `authorized`, `MFP` | The handshake completed; PMF in use |
+
+```
+$ iw dev wlan0 survey dump
+Survey data from wlan0
+	frequency:			5180 MHz [in use]
+	noise:				-92 dBm
+	channel active time:		52000 ms
+	channel busy time:		14820 ms
+	channel receive time:		12100 ms
+	channel transmit time:		1900 ms
+```
+
+**Channel utilization** = busy / active = 28% here. Above about 50%, the channel is congested: change channel (or band) before tuning anything else. The other channels' values appear when the driver surveys during scans. The noise value is the place to spot local interference (section 16).
+
+### What limits throughput
+
+| Limit | How to check |
+|---|---|
+| Radio: signal, width, streams | `iw dev wlan0 link`: MCS, width, NSS |
+| Contention, neighbors | `survey dump` busy time, `scan` for networks on the same channel |
+| Bus | SDIO clock in `dmesg` or `/sys/kernel/debug/mmc1/ios`; a fixed ceiling whatever the signal |
+| CPU | `mpstat -P ALL 1` or `top` during iperf3: one core at 100% in softirq or `ksoftirqd`. Software crypto when the chip doesn't do it |
+| TCP | Single stream lower than `-P 4`: window or latency limited |
+| The other side | Run the same test on the wired side, and from a laptop over Wi-Fi |
+
+### Tuning checklist
+
+- **Set the country:** the default world domain disables channels and power.
+- **Pick the channel** from `survey dump` and a scan, not by default. 2.4 GHz: 1, 6 or 11 at 20 MHz. 5 GHz: 80 MHz.
+- **Disable power save** where latency matters (below).
+- **Avoid background scans** on stationary devices: no `bgscan`, or fewer scans from the manager (NetworkManager scans periodically while connected).
+- **Don't maximize the AP's TX power:** clients hear it from far away but can't answer; it also delays roaming.
+- **Drop legacy 802.11b rates** on the AP, and convert multicast to unicast (section 6).
+- **Update the firmware and driver:** performance and stability fixes are frequent.
+
+### Power save and latency
+
+```bash
+iw dev wlan0 get power_save
+sudo iw dev wlan0 set power_save off       # not persistent: set it at each connection
+```
+
+| Where | Persistent setting |
+|---|---|
+| NetworkManager | `nmcli con modify Home 802-11-wireless.powersave 2` (2 = disable, 3 = enable) |
+| systemd-networkd / wpa_supplicant | A unit or the `wpa_cli` action script running `iw ... set power_save off` after connection |
+| brcmfmac | Power save is on by default; set it off as above |
+| iwlwifi | `iwlmvm` module parameter `power_scheme` (1 = active, 2 = balanced, 3 = low power) |
+
+Measure the effect: `ping -i 0.2 192.168.10.21` from the laptop with power save on and off. With it on, round trips jump to 50-300 ms when the board is idle (section 10).
+
+**Battery-powered devices** go the other way: keep power save on, raise the AP's `dtim_period` and the client's listen interval if multicast latency is acceptable, use TWT when both sides support it, and filter useless broadcast traffic at the AP (proxy ARP, multicast-to-unicast). Datasheets give the current per state (TX, RX, power save idle, deep sleep): the radio state usually dominates the device's consumption.
+
+### Wake on WLAN
+
+The chip stays associated while the host suspends, and wakes it on a trigger:
+
+```bash
+iw phy phy0 wowlan show
+sudo iw phy phy0 wowlan enable magic-packet disconnect
+echo mem | sudo tee /sys/power/state
+# From the laptop: send a magic packet to 00:00:5e:00:53:15 (wakeonlan, etherwake)
+```
+
+Triggers include `any`, `disconnect`, `magic-packet`, `patterns` (byte patterns in received packets), `gtk-rekey-failure` and `net-detect` (wake when a known network appears). Hardware requirements: `WL_HOST_WAKE` on a wake-capable GPIO, `wakeup-source` or the interrupt in the device tree, `keep-power-in-suspend` on the SDIO host. The firmware keeps the link alive meanwhile (GTK rekeys, ARP replies), if it supports those offloads.
 
 ---
 

@@ -1195,13 +1195,102 @@ TCP keepalives and NAT behavior are covered in the [fundamentals note](../../net
 
 ## 15. Cellular IoT: LTE-M, NB-IoT and RedCap
 
-Planned: what each one removes, coverage enhancement and repetitions, CIoT optimizations, release assistance, availability and roaming, choosing between them.
+LTE and NR were designed for phones. Cellular IoT variants remove what small devices don't need (bandwidth, MIMO, high-order modulation) in exchange for cost, coverage and battery life.
+
+| | LTE Cat 1 / 1bis | LTE-M (Cat M1) | NB-IoT (Cat NB1/NB2) | NR RedCap |
+|---|---|---|---|---|
+| Release | Rel-8 / Rel-13 | Rel-13 | Rel-13 | Rel-17 |
+| Bandwidth | Up to 20 MHz | 1.4 MHz (6 RBs) inside an LTE carrier; 5 MHz for Cat M2 | 180 kHz (1 RB): inside an LTE carrier, in its guard band, or standalone (a former GSM carrier) | 20 MHz (FR1) |
+| Duplex | Full-duplex FDD, TDD | FDD (mostly half-duplex in modules), TDD | Half-duplex FDD (TDD from Rel-15) | FDD (half-duplex optional), TDD |
+| Receive antennas | 2 / 1 | 1 | 1 | 1 or 2 |
+| Peak rate (down / up) | 10 / 5 Mb/s | About 1 / 1 Mb/s (300 / 375 kb/s half-duplex) | About 26 / 62 kb/s (NB1), 127 / 159 kb/s (NB2) | About 150 / 50 Mb/s |
+| Latency (rule of thumb) | Like LTE | 50-200 ms | 1-10 s | Like NR |
+| Coverage (MCL) | About 140 dB | 155.7 dB | 164 dB | Like NR, minus a few dB per missing antenna |
+| Mobility | Full | Handover in connected mode | Reselection only (no handover in Rel-13): a moving device re-establishes | Full |
+| Voice | VoLTE | VoLTE possible | No | VoNR possible |
+| Core | EPC | EPC (5GC in later releases) | EPC (5GC in later releases) | 5GC only (SA) |
+
+### Coverage enhancement
+
+LTE-M and NB-IoT reach deeper by **repeating** each transmission many times and combining the copies at the receiver: LTE-M has CE mode A (up to 32 repetitions) and mode B (up to 2048); NB-IoT has **coverage enhancement levels** 0 to 2, chosen by the UE from RSRP thresholds broadcast by the cell, with up to 2048 downlink and 128 uplink repetitions. NB-IoT can also send its uplink on a single 3.75 or 15 kHz subcarrier, concentrating all 23 dBm into it.
+
+The price is airtime, latency and energy: a device in a basement at the highest CE level can spend seconds transmitting a few hundred bytes, and its battery life drops by an order of magnitude compared with the same device near a window. **Measure battery life at the coverage the device will really have**, not on a desk.
+
+### CIoT optimizations
+
+Rel-13 and later add procedures that avoid the overhead of setting up a full connection for a few bytes:
+
+| Feature | What it does |
+|---|---|
+| **Control plane CIoT optimization** ("data over NAS") | Small IP or non-IP packets travel inside NAS messages on the signaling path: no data radio bearer, no AS security setup. Mandatory for NB-IoT devices. AT: `AT+CSODCP` (send), `AT+CRTDCP` (receive) |
+| **User plane CIoT optimization** | RRC **suspend and resume**: the radio context is kept while idle, so the next connection skips most of the setup (the ancestor of NR's RRC inactive) |
+| **Attach without PDN connection** | Register without an IP session (SMS-only or occasional data) |
+| **Non-IP data delivery** (NIDD) | Opaque payloads delivered to an application server through the SCEF (NEF in 5G), with no IP stack on the device |
+| **Release assistance indication** (RAI) | The UE tells the network "no more data" or "only one reply expected": the network releases the connection at once instead of waiting for the inactivity timer, which removes the energy tail |
+| **Early data transmission** (EDT, Rel-15) | Uplink data sent in Msg3 of random access: the connection never fully starts |
+| **Wake-up signal** (WUS, Rel-15) | A short signal before a paging occasion: the UE only decodes the paging channel when it's present |
+| **Preconfigured uplink resources** (PUR, Rel-16) | A stationary device sends in reserved resources without random access |
+
+Support varies: each feature must be in the module, enabled in the network, and often in the subscription. Ask the operator which ones are active.
+
+**Rate control:** networks can limit how many messages an NB-IoT device may send (serving PLMN rate control, APN rate control), and IoT plans often cap messages or bytes per day.
+
+### Choosing
+
+| Need | Choice |
+|---|---|
+| Static device, small rare messages, deep indoor (meters, parking sensors) | NB-IoT, if every target market has it |
+| Moving device, or voice, or regular firmware updates (trackers, wearables, alarms) | LTE-M |
+| Tens of Mb/s, video, routers, gateways | LTE Cat 4 or above, RedCap for new 5G designs |
+| Moderate rates on the full LTE network, roaming everywhere LTE goes | Cat 1 or Cat 1bis |
+| A product that must work for 10+ years | LTE-M, NB-IoT and Cat 1bis on networks with long-term commitments; check each operator's plans |
+
+- **Availability:** LTE-M and NB-IoT are deployed per operator, and their roaming agreements lag behind LTE broadband. Many modules support both (and fall back to 2G on some models): check what the target operators actually run.
+- **Firmware updates** over NB-IoT are slow: a 1 MB image at an effective 10-20 kb/s takes many minutes of radio time at best, and much more at high CE levels. Use delta updates.
+- **Application protocols:** TCP and TLS handshakes cost several round trips, each up to seconds on NB-IoT. UDP-based protocols (CoAP, LwM2M over DTLS) or non-IP delivery fit better.
 
 ---
 
 ## 16. Beyond data: SMS, voice, positioning, slicing, NTN
 
-Planned: SMS over NAS and IMS, VoLTE and VoNR, emergency calls, cell-based positioning and GNSS assistance, network slicing, satellite access.
+### SMS
+
+| Path | Network | Notes |
+|---|---|---|
+| SMS over SGs | LTE, via the 2G/3G circuit-switched core | Needs a combined attach (section 11). Disappears with the CS core |
+| SMS over IMS | LTE, 5G | SIP MESSAGE over the IMS APN: needs IMS registration |
+| SMS over NAS | 5G (SMSF), LTE without a CS core, NB-IoT | Carried in NAS messages |
+
+An SMS carries 140 bytes (160 GSM 7-bit characters). For devices it's useful as an out-of-band **wake-up trigger**: it reaches an idle device with no IP session or NAT mapping (but not one in PSM until it wakes). IoT plans don't always include SMS, and sending one to a device goes through the operator's platform or an SMS API. AT commands for SMS are in TS 27.005 (`AT+CMGF`, `AT+CMGS`, `AT+CNMI`).
+
+### Voice: VoLTE and VoNR
+
+With no circuit-switched core, voice is VoIP over **IMS** (IP multimedia subsystem):
+
+- The UE opens a session to the **IMS APN** (default bearer QCI 5 for SIP signaling), gets the P-CSCF addresses in the PCO, and registers with SIP, authenticated by the USIM or ISIM (IMS AKA).
+- A call adds a **dedicated bearer** with QCI 1 (GBR) for the RTP voice stream (AMR-WB or EVS codecs). VoNR is the same over SA 5G.
+- IMS settings are operator-specific, live in the modem's carrier configuration, and many operators only enable VoLTE on devices they have approved. **Since 2G/3G are switching off, a device without working VoLTE has no voice and, depending on the country, may not complete emergency calls.**
+- Emergency calls have their own procedures (emergency bearers, allowed without a SIM in some countries) and in-vehicle systems (eCall in the EU, ERA-GLONASS in Russia) have their own requirements.
+
+### Positioning
+
+| Method | How | Accuracy (rule of thumb) |
+|---|---|---|
+| Cell ID | The serving cell's known location | Hundreds of m (cities) to km (rural) |
+| E-CID | Cell ID + timing advance (section 5) + neighbor measurements | Hundreds of m |
+| OTDOA (LTE), DL-TDOA (NR) | Time differences of positioning reference signals (PRS) from several cells | Tens of m, where the network supports it |
+| NR multi-RTT, angles (Rel-16 and later) | Round-trip times and beam angles | Down to meters in dedicated deployments |
+| GNSS in the module, assisted | Satellite positioning with assistance data (ephemeris, time, rough position) from the network (LPP, SUPL) or a vendor's download service | Meters, with a faster first fix |
+
+The positioning protocols are **LPP** (between the UE and the location server, E-SMLC in LTE, LMF in 5G) and **SUPL** (user-plane, over IP). Network time comes from SIB16 (LTE) or SIB9 (NR), and **NITZ** NAS messages give local time and time zone; they're not authenticated, and not every operator sends them.
+
+### Network slicing
+
+A **slice** is an end-to-end logical network with its own characteristics, identified by an **S-NSSAI**: a slice/service type (SST: 1 eMBB, 2 URLLC, 3 massive IoT, 4 V2X...) plus an optional slice differentiator (SD). The UE requests slices at registration (requested NSSAI), the network answers with the allowed ones, and each PDU session belongs to one slice. **URSP** rules (UE route selection policy), sent by the network, tell the device which application traffic goes to which slice and DNN. Slicing needs SA 5G, support in the modem and the device's OS, and an operator offer: commercial availability is still limited.
+
+### Non-terrestrial networks
+
+Rel-17 adapts NR (**NR-NTN**) and NB-IoT/LTE-M (**IoT-NTN**) to satellites: the UE pre-compensates the long and changing delay and the Doppler shift from its own GNSS position and the satellite's orbit (broadcast in system information), with longer timers and HARQ adaptations. A device needs GNSS and an antenna suited to the satellite bands. Operators also offer "direct to device" services that reuse ordinary LTE phones through satellites. Satellite access is covered in the [NTN notes](../ntn/).
 
 ---
 

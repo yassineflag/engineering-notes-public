@@ -621,12 +621,12 @@ The 13 dB between B20 and n78 come before walls, which also attenuate more at hi
 
 **Maximum coupling loss** (MCL, the total loss between the antennas' connectors, antenna gains included) is how 3GPP compares coverage:
 
-| Technology | MCL (target, TR 45.820 and TS 36 series studies) |
+| Technology | MCL (3GPP study targets: TR 36.888 for LTE-M, TR 45.820 for NB-IoT) |
 |---|---|
-| GPRS (reference) | 144 dB |
-| LTE (Cat 1 and above) | About 140 dB |
-| LTE-M (CE mode B) | 155.7 dB |
-| NB-IoT | 164 dB |
+| GPRS (reference of TR 45.820) | 144 dB |
+| LTE (Cat 1 and above, reference of TR 36.888) | About 140 dB |
+| LTE-M (CE mode B) | 155.7 dB: LTE + 15 dB |
+| NB-IoT | 164 dB: GPRS + 20 dB |
 
 Each +10 dB reaches roughly one more wall or floor deeper indoors (rule of thumb). The extra margin of LTE-M and NB-IoT comes from repetitions: more energy per bit, paid in latency and battery (section 15).
 
@@ -636,13 +636,171 @@ Each +10 dB reaches roughly one more wall or floor deeper indoors (rule of thumb
 
 ## 9. Network architecture: RAN, EPC, 5GC, NSA and SA
 
-Planned: eNB and gNB, MME, S-GW, P-GW, HSS, AMF, SMF, UPF, UDM, control and user plane stacks, GTP tunnels, NSA option 3x vs SA, where the IP packets actually go.
+```mermaid
+flowchart LR
+    ue["UE"]
+    subgraph EPS["LTE: EPS"]
+        enb["eNB"]
+        mme["MME<br/>NAS: attach, mobility,<br/>session signaling"]
+        hss["HSS<br/>subscriptions,<br/>authentication vectors"]
+        sgw["S-GW<br/>user plane anchor<br/>between eNBs"]
+        pgw["P-GW<br/>IP address, APN,<br/>policy, charging"]
+        pcrf["PCRF<br/>policy"]
+    end
+    subgraph FGS["5G: 5GS"]
+        gnb["gNB"]
+        amf["AMF<br/>registration, mobility"]
+        smf["SMF<br/>PDU sessions,<br/>IP addresses"]
+        upf["UPF<br/>user plane"]
+        udm["UDM, AUSF<br/>subscriptions,<br/>authentication"]
+        pcf["PCF<br/>policy"]
+    end
+    dn(("Data networks<br/>internet, private APNs"))
+    ue -.-|"Uu"| enb
+    ue -.-|"Uu"| gnb
+    enb ---|"S1-MME"| mme
+    enb ---|"S1-U, GTP-U"| sgw
+    mme ---|"S6a"| hss
+    mme ---|"S11"| sgw
+    sgw ---|"S5/S8, GTP"| pgw
+    pgw ---|"Gx"| pcrf
+    pgw ---|"SGi"| dn
+    gnb ---|"N2"| amf
+    gnb ---|"N3, GTP-U"| upf
+    amf --- udm
+    amf ---|"N11"| smf
+    smf ---|"N4, PFCP"| upf
+    smf --- pcf
+    upf ---|"N6"| dn
+```
+
+### Network functions
+
+| Role | LTE (EPC) | 5G (5GC) |
+|---|---|---|
+| Base station | eNB | gNB (ng-eNB for LTE attached to a 5GC) |
+| Mobility and access signaling with the UE (NAS) | MME | AMF |
+| Session management | MME + P-GW control | SMF |
+| User plane: forwarding, tunnels, the IP anchor | S-GW + P-GW | UPF (one or several in a chain) |
+| Subscriber data, authentication | HSS | UDM/UDR + AUSF |
+| Policy and charging rules | PCRF | PCF |
+| Exposure to applications, non-IP data | SCEF | NEF |
+| Slice selection, function discovery | | NSSF, NRF |
+
+- **Control and user plane are separated:** signaling goes UE → base station → MME/AMF; data goes UE → base station → S-GW/UPF → P-GW/UPF. The control functions program the user plane (GTP-C in LTE, PFCP from 5G and from later EPC versions with CUPS).
+- **5GC is service-based:** its functions expose HTTP/2 APIs to each other instead of point-to-point protocols. It changes nothing on the radio, but makes slicing (section 16) and edge deployments easier to build.
+- **Between base stations:** X2 (LTE) and Xn (NR) carry handover preparation and dual connectivity coordination.
+
+### Protocol stacks
+
+| | UE | Base station | Core |
+|---|---|---|---|
+| Control plane | NAS / RRC / PDCP / RLC / MAC / PHY | RRC ends here; NAS is relayed in S1AP or NGAP over SCTP | NAS ends at the MME or AMF |
+| User plane | IP / (SDAP) / PDCP / RLC / MAC / PHY | Radio layers end here; packets go into a GTP-U tunnel (GTP-U / UDP / IP) | GTP-U ends at the P-GW or UPF, which routes the inner IP packet |
+
+**GTP-U tunnels:** each bearer or PDU session has a tunnel between the base station and the gateway, identified by a tunnel endpoint ID (TEID). The UE's IP packets travel inside, with 36 bytes of outer IPv4 + UDP + GTP headers (56 with IPv6): one reason operators advertise a device MTU below 1500 (section 12).
+
+### Where your packets actually go
+
+```
+ Device ──radio──► eNB/gNB ══GTP-U══► S-GW ══GTP-U══► P-GW / UPF ──► CGNAT, firewall ──► internet
+ 100.72.15.9                (operator transport)        "default gateway"                   198.51.100.20
+```
+
+- The **P-GW or UPF is the first IP hop**: everything before it is a layer 2 tunnel from the IP point of view. A traceroute from the device shows the gateway (or nothing, if it doesn't answer) and then the operator's network.
+- The gateway allocates the device's address, applies per-APN policy (firewall, NAT, rate limits, zero-rating, content filtering) and is where an IoT platform's private APN connects to a customer's network (VPN or leased line).
+- **Location matters:** operators run few gateways, sometimes one per country; roaming devices with home routing reach a gateway in their home country (section 12). The server should be near the gateway, not near the device.
+- Inbound connections usually fail: CGNAT for IPv4 and often a stateful firewall for IPv6 (see the [fundamentals note](../../networking/fundamentals/fundamentals.md#13-nat-and-address-translation)). Private APNs with fixed addresses avoid both.
+
+### Non-standalone and standalone 5G
+
+| | NSA (option 3x) | SA (option 2) |
+|---|---|---|
+| Core | EPC (LTE core) | 5GC |
+| Control plane | LTE: the UE attaches over LTE, LTE RRC, LTE NAS | NR RRC, 5G NAS |
+| NR's role | Secondary node (EN-DC) adding capacity in connected mode | The only radio |
+| Idle mode | Camps on LTE; NR is added again at each connection | Camps on NR |
+| Features | Higher downlink rates | Lower latency, RRC inactive, slicing, RedCap, VoNR, better power saving |
+| What a device needs | LTE + NR bands and the right EN-DC combinations | NR bands; SA must be enabled in the modem and offered for the subscription |
+
+- Most early "5G" networks were NSA. A "5G" indicator on a device may mean that NR is available in the area (an LTE SIB flag), not that data is flowing over NR: check the modem's report of the serving cells.
+- **DSS** (dynamic spectrum sharing) runs LTE and NR on the same carrier, sharing resources dynamically: an operator's "5G on 700 MHz" may be an LTE carrier shared with NR.
+- **Interworking:** an MME and an AMF connected by **N26** let a UE move between LTE and SA 5G in connected mode while keeping its IP address (combined P-GW/SMF+UPF anchors).
+
+### Circuit-switched remnants
+
+2G and 3G had a separate circuit-switched core (MSC) for voice and SMS. LTE can still reach it for **CS fallback** (dropping to 2G/3G for a call) and **SMS over SGs** (SMS through the MME to the MSC). Both disappear with the 2G/3G sunsets, replaced by IMS (section 16).
+
+### Private networks
+
+Enterprises run their own LTE or 5G networks on dedicated spectrum (local licenses such as 3.7-3.8 GHz in Germany, CBRS in the US) with their own core and SIMs. 5G calls them **non-public networks** (NPN): standalone (SNPN, identified by a PLMN ID plus a network identifier, NID) or integrated with a public network (PNI-NPN, often through a dedicated slice or DNN). For a device, it's the same protocol with different identities and SIM credentials.
 
 ---
 
 ## 10. Identities and the SIM
 
-Planned: IMSI/SUPI/SUCI, IMEI, ICCID, MSISDN, GUTI and TMSI, the USIM and its files, PIN and PUK, form factors, eUICC and remote provisioning.
+### The identifiers
+
+| Identifier | What it identifies | Format | Assigned by | Stored in |
+|---|---|---|---|---|
+| **IMSI** (5G: SUPI) | The subscription | MCC (3 digits) + MNC (2 or 3) + MSIN, up to 15 digits: `001 01 0000012345` | Operator | USIM |
+| **SUCI** (5G) | The SUPI, encrypted for the home network | Scheme ID, home network key ID, ciphertext | Computed by the USIM or the modem at each registration | |
+| **GUTI** (5G-GUTI) | The UE at its current MME/AMF: temporary | MCC + MNC + MME group/code (AMF region/set/pointer) + 32-bit M-TMSI (5G-TMSI) | MME / AMF, changed regularly | Modem and USIM (EF_EPSLOCI) |
+| **S-TMSI** (5G-S-TMSI) | A short form of the GUTI for paging and RRC | MME code + M-TMSI | Derived | |
+| **IMEI** (5G: PEI) | The device hardware (the modem) | TAC (8 digits) + serial (6) + check digit: `49015420 323751 8` | Device manufacturer, from GSMA-allocated TACs | Modem, protected |
+| **IMEISV** | IMEI + software version | TAC + serial + SVN (2 digits) | | Modem |
+| **ICCID** | The SIM card itself | Up to 19-20 digits starting with `89` | SIM manufacturer, for the operator | Card |
+| **MSISDN** (5G: GPSI) | The phone number | E.164 | Operator | Network (sometimes copied to the SIM). Data-only IoT SIMs may have none |
+| **EID** | An eUICC chip | 32 digits | eUICC manufacturer | eUICC |
+| **C-RNTI** | The UE in one cell, while connected | 16 bits | Base station (section 6) | |
+
+**Permanent identities are protected by temporary ones.** After the first attach, the network gives the UE a GUTI and the UE presents it instead of its IMSI, so that a listener can't follow the IMSI around. The IMSI still goes in clear when the network asks for it (a new network, a lost GUTI): this is what IMSI catchers exploit (section 13). 5G closes that with the **SUCI**: the SUPI is encrypted with the home network's public key (ECIES, profile A on Curve25519 or profile B on P-256). If the operator didn't provision a key in the USIM, the "null scheme" sends the SUPI unencrypted.
+
+**The IMEI names the module, not your product.** A product using a certified module carries the module vendor's TAC. Operators can block IMEIs (stolen devices, uncertified ones) through an equipment identity register, and IoT plans can be locked to one IMEI ("IMEI binding"): a SIM moved to another device stops working.
+
+### The USIM
+
+The SIM card (a UICC) runs one or more applications: the **USIM** for LTE/5G access, often an ISIM for IMS. The USIM holds:
+
+- **The secret key K** (and the operator constant OPc), shared only with the operator's authentication center. They never leave the card: the card computes authentication responses and session keys (Milenage or TUAK algorithms, section 13).
+- **Files** the modem reads and writes:
+
+| File | Content |
+|---|---|
+| EF_IMSI, EF_AD | IMSI; MNC length (2 or 3 digits) |
+| EF_ICCID | Card serial |
+| EF_EHPLMN, EF_HPLMNwAcT | Home and equivalent home PLMNs |
+| EF_OPLMNwAcT, EF_PLMNwAcT | Operator- and user-controlled preferred PLMNs with their access technologies: the roaming preference list (section 11) |
+| EF_FPLMN | Forbidden PLMNs, written by the modem after certain rejects (section 11) |
+| EF_EPSLOCI, EF_5GS3GPPLOCI | Last GUTI, last tracking area, update status |
+| EF_ACC | Access class (section 6) |
+| EF_SPN | Service provider name |
+
+Because the last registration state lives on the card, a SIM moved to another device brings its forbidden PLMN list and its last GUTI with it. The modem reads these files at startup and can be asked for them with `AT+CRSM` (section 17).
+
+**PIN and PUK:** 3 wrong PINs block the card, 10 wrong PUKs make it permanently unusable. Products usually ship with the PIN disabled, or set it and store it in the device: a PIN-protected SIM in an unattended device must be unlocked by software at every boot.
+
+**SIM toolkit (USAT):** the card can run applets that issue commands to the modem: send an SMS, display text, open a channel, refresh files. Operators use it with **SIM OTA** (over-the-air updates via SMS or data) to change roaming lists or profiles. A REFRESH command can make the modem re-read the card and re-register: an unexplained detach and reattach in a log can come from the SIM.
+
+### Form factors and eSIM
+
+| Form factor | Size | Notes |
+|---|---|---|
+| 2FF (mini) | 25 × 15 mm | Older devices, industrial holders |
+| 3FF (micro) | 15 × 12 mm | |
+| 4FF (nano) | 12.3 × 8.8 mm | Phones |
+| MFF2 | 5 × 6 mm, soldered (DFN-8) | Embedded SIM chip: vibration, temperature, tamper resistance. Industrial-grade versions have higher write endurance and data retention |
+| iSIM | Inside the modem SoC | Secure enclave in the chip running the SIM: no separate part |
+
+An **eUICC** ("eSIM") is a SIM whose operator **profiles** are downloaded and switched remotely, so one hardware SKU can be connected anywhere and change operator in the field. Form factor and eUICC are independent: an eUICC can be a plug-in card, an MFF2 or an iSIM.
+
+| GSMA specification | For | How profiles are managed |
+|---|---|---|
+| SGP.02 ("M2M") | IoT, older | Pushed by the operator's platform (SM-DP, SM-SR) over SMS. Profiles from operators tied to that platform |
+| SGP.22 ("consumer") | Phones, tablets, laptops | A local profile assistant (LPA) in the device downloads profiles from an SM-DP+ server, using an activation code (the QR code). Needs a user interface |
+| SGP.32 ("IoT") | Headless IoT devices | Like SGP.22, but driven remotely through an eSIM IoT remote manager (eIM) instead of a user. Newer: check support in modules and operators |
+
+A profile download needs connectivity, usually through a bootstrap profile pre-loaded at manufacturing.
 
 ---
 

@@ -292,13 +292,178 @@ NR also has a coarser **synchronization raster** (GSCN) where the UE looks for t
 
 ## 5. The physical layer: OFDM, numerology, resource grid, MCS and MIMO
 
-Planned: OFDMA and SC-FDMA, NR numerologies, frames, slots and resource blocks, modulation and coding, peak rate formula, MIMO layers and beamforming, TDD patterns.
+### OFDMA down, SC-FDMA up
+
+Like Wi-Fi since 802.11a, LTE and NR split a carrier into many narrow **subcarriers** and send one modulated symbol per subcarrier per OFDM symbol, with a **cyclic prefix** (CP, the guard interval) that absorbs echoes. The difference is who uses them: the base station hands out subcarriers and symbols to different UEs in the same transmission (**OFDMA**), every scheduling interval.
+
+- **Downlink:** OFDMA (CP-OFDM).
+- **LTE uplink:** **SC-FDMA** (DFT-spread OFDM): the same grid, but each UE's symbols are spread over its subcarriers by a DFT first, which gives a lower peak-to-average power ratio. The UE's power amplifier can then run closer to its maximum, which saves battery and extends the uplink range.
+- **NR uplink:** CP-OFDM (better for MIMO and high rates) or DFT-s-OFDM (better at the cell edge), chosen by the network.
+
+### LTE frame structure
+
+| Parameter | LTE value |
+|---|---|
+| Subcarrier spacing | 15 kHz |
+| OFDM symbol (without CP) | 66.7 µs |
+| Cyclic prefix | Normal 4.7 µs (5.2 µs on the first symbol of a slot), extended 16.7 µs |
+| Resource block (RB) | 12 subcarriers = 180 kHz, over one slot |
+| Slot | 0.5 ms, 7 symbols (normal CP) |
+| Subframe, TTI | 1 ms, 2 slots: the scheduling interval |
+| Radio frame | 10 ms, 10 subframes, numbered by the system frame number (SFN, 0-1023) |
+
+| Channel bandwidth (MHz) | 1.4 | 3 | 5 | 10 | 15 | 20 |
+|---|---|---|---|---|---|---|
+| Resource blocks | 6 | 15 | 25 | 50 | 75 | 100 |
+| Occupied (MHz) | 1.08 | 2.7 | 4.5 | 9 | 13.5 | 18 |
+
+The rest of the channel is guard band. The example cell (10 MHz on B20) has 50 RBs, 600 subcarriers.
+
+### NR numerologies
+
+NR keeps the structure but scales it: subcarrier spacing is 15 × 2<sup>µ</sup> kHz, where µ is the **numerology**. A slot is always 14 symbols, so wider spacing means shorter slots, hence lower latency and more tolerance to phase noise at high frequencies, but a shorter CP (less tolerance to delay spread).
+
+| µ | Spacing | Slot | Slots per 1 ms | Normal CP | Used for |
+|---|---|---|---|---|---|
+| 0 | 15 kHz | 1 ms | 1 | 4.7 µs | FR1, LTE-like, NR in narrow carriers and DSS |
+| 1 | 30 kHz | 0.5 ms | 2 | 2.3 µs | FR1 mid-band: the usual n77/n78 choice |
+| 2 | 60 kHz | 0.25 ms | 4 | 1.2 µs (extended CP possible) | FR1 or FR2 |
+| 3 | 120 kHz | 0.125 ms | 8 | 0.59 µs | FR2 data |
+| 4 | 240 kHz | 62.5 µs | 16 | 0.29 µs | FR2 synchronization blocks only |
+| 5, 6 | 480, 960 kHz | | | | FR2-2 (52.6-71 GHz), Rel-17 |
+
+| Maximum carrier | 15 kHz | 30 kHz | 60 kHz | 120 kHz |
+|---|---|---|---|---|
+| FR1 | 50 MHz (270 RBs) | 100 MHz (273 RBs) | 100 MHz (135 RBs) | |
+| FR2 | | | 200 MHz | 400 MHz (264 RBs) |
+
+Other NR differences that show up in logs:
+- An NR resource block is 12 subcarriers in frequency only. Allocations are made per slot, over a number of symbols, and can be as short as 2, 4 or 7 symbols ("mini-slots") for low latency.
+- **Bandwidth parts** (BWP): a UE works in a part of the carrier (up to 4 configured, one active at a time). A small BWP saves power when idle; a RedCap device's 20 MHz BWP lives inside a 100 MHz carrier.
+- No always-on reference signals across the whole carrier (LTE's CRS): NR transmits reference signals only where and when needed ("lean carrier"), which saves network energy and interference.
+
+### Modulation, coding and MCS
+
+| Modulation | Bits per symbol | LTE | NR |
+|---|---|---|---|
+| QPSK | 2 | Yes | Yes (π/2-BPSK too, uplink DFT-s-OFDM) |
+| 16-QAM | 4 | Yes | Yes |
+| 64-QAM | 6 | Yes | Yes |
+| 256-QAM | 8 | Downlink Rel-12, uplink Rel-14 | Rel-15, both directions |
+| 1024-QAM | 10 | Downlink, later releases | Downlink FR1, Rel-17 |
+
+| | LTE | NR |
+|---|---|---|
+| Data channel coding | Turbo code | LDPC |
+| Control channel coding | Tail-biting convolutional code | Polar code |
+
+The **MCS index** sent with each grant selects a modulation and a code rate; with the number of allocated RBs and layers, it gives the **transport block size** (TBS) from tables in TS 36.213 and TS 38.214. The base station picks the MCS from the UE's channel reports and its own error statistics (link adaptation, section 7). The highest code rates are about 0.93 (948/1024 in NR).
+
+### Peak data rate
+
+TS 38.306 gives the approximate NR peak rate per carrier:
+
+```
+rate (Mb/s) = 10^-6 × layers × Qm × f × Rmax × (N_PRB × 12) / Ts × (1 - OH)
+  Qm   = bits per symbol (8 for 256-QAM)       Rmax = 948/1024
+  f    = scaling factor (1, or 0.4-0.8 for weaker UEs)
+  Ts   = average symbol duration = 10^-3 / (14 × 2^µ) s
+  OH   = overhead: 0.14 downlink FR1, 0.18 downlink FR2, 0.08 uplink FR1, 0.10 uplink FR2
+```
+
+| Carrier | Layers | Modulation | Peak |
+|---|---|---|---|
+| NR 100 MHz, 30 kHz (273 RBs), downlink | 4 | 256-QAM | 2337 Mb/s |
+| Same, 2 layers (a typical IoT router) | 2 | 256-QAM | 1169 Mb/s |
+| Same, uplink | 1 | 256-QAM | 625 Mb/s, times the TDD uplink share |
+| NR 20 MHz, 15 kHz (106 RBs), RedCap-class | 2 | 64-QAM | 170 Mb/s |
+
+For LTE, a 20 MHz carrier carries 100 RBs × 12 subcarriers × 14 symbols per ms = 16.8 million symbols per second. With 64-QAM and 2 layers that's 201.6 Mb/s of raw capacity; control channels and reference signals take about a quarter, which leaves the 150 Mb/s of Cat 4. As with Wi-Fi, these are peak rates for one UE with perfect signal and the whole cell to itself (section 8 for realistic values).
+
+### MIMO and beamforming
+
+- **Layers** (rank): independent data streams sent on the same resources from several antennas. The UE reports the rank it can receive (**RI**) and a precoder choice (**PMI**); the base station decides. 2 layers is the norm for 2-antenna devices, 4 for phones on mid-band.
+- **LTE transmission modes** (TM1 to TM10) select diversity, open-loop or closed-loop spatial multiplexing, beamforming. They're configured by RRC and appear in modem logs.
+- **Massive MIMO:** mid-band NR base stations commonly have 32 or 64 transmit/receive chains, forming narrow beams per UE (gains at the cell edge) and serving several UEs on the same resources (MU-MIMO).
+- **Beam management:** NR transmits its synchronization blocks in a sweep of beams (section 6); the UE reports the best one, and in FR2 both sides steer beams with antenna arrays. Blocking a mmWave beam with a hand or a wall forces a beam switch or a fallback to FR1/LTE.
+
+### TDD patterns and timing advance
+
+- **TDD pattern:** a sequence of downlink (D), uplink (U) and special/flexible (S) slots, repeated. The special slot has a **guard period** that covers the round trip to the farthest UE, which bounds the cell radius. LTE TDD has 7 fixed configurations (configuration 2 is `DSUDD DSUDD`); NR configures patterns freely: `DDDSU` (2.5 ms at 30 kHz) is common on n78 in Europe, with operator-dependent variants.
+- **Timing advance (TA):** a UE far from the base station receives late and would transmit late. The base station measures the delay and tells the UE to transmit earlier by the round trip, so all uplink transmissions arrive aligned. One LTE TA step is 0.52 µs, about 78 m of distance; the maximum (0.67 ms) allows cells of about 100 km. The current TA is a rough distance to the base station, which positioning uses (section 16).
 
 ---
 
 ## 6. Physical channels, cell search and system information
 
-Planned: synchronization signals, PCI, MIB and SIBs, reference signals, control and shared channels, random access, NR SSB beams and BWPs.
+### Channels and signals
+
+Physical channels carry bits from higher layers; physical signals exist for the physical layer itself (synchronization, channel estimation, measurements).
+
+| Direction | LTE | NR | Carries |
+|---|---|---|---|
+| Downlink | PSS, SSS | PSS, SSS (in the SSB) | Synchronization and physical cell identity |
+| Downlink | PBCH | PBCH (in the SSB) | MIB: the minimum to read the rest of the cell |
+| Downlink | PDCCH (+ PCFICH, PHICH) | PDCCH in CORESETs | DCI: downlink assignments, uplink grants, power control, slot formats |
+| Downlink | PDSCH | PDSCH | User data, system information (SIBs), paging, RRC messages |
+| Downlink | CRS (always on), CSI-RS, DMRS, PRS | CSI-RS, DMRS, PT-RS, PRS, TRS | Channel estimation, measurements, positioning |
+| Uplink | PRACH | PRACH | Random access preambles |
+| Uplink | PUCCH | PUCCH | HARQ acknowledgments, scheduling requests, channel state reports |
+| Uplink | PUSCH | PUSCH | User data, RRC and NAS messages, reports when scheduled |
+| Uplink | SRS, DMRS | SRS, DMRS, PT-RS | Uplink channel sounding, demodulation |
+
+UEs are told apart by an **RNTI** (radio network temporary identifier) that scrambles the PDCCH: the **C-RNTI** identifies one UE in one cell while it is connected; fixed values mark broadcast content (SI-RNTI for system information, P-RNTI for paging, RA-RNTI for random access responses). A UE decodes every PDCCH candidate in its search space and keeps those whose check matches one of its RNTIs ("blind decoding").
+
+### Cell search
+
+A UE that powers up, or loses coverage, looks for cells on the bands it supports, starting with the frequencies it last used (stored in the modem or the SIM), then scanning.
+
+**LTE:**
+1. **PSS** (primary synchronization signal), every 5 ms in the central 6 RBs: gives slot timing and N<sub>ID</sub><sup>(2)</sup> (0-2).
+2. **SSS** (secondary synchronization signal): gives frame timing and N<sub>ID</sub><sup>(1)</sup> (0-167). The **physical cell identity** is PCI = 3 × N<sub>ID</sub><sup>(1)</sup> + N<sub>ID</sub><sup>(2)</sup>: 504 values (0-503).
+3. **CRS** at known positions derived from the PCI: the UE can now measure the cell (RSRP, RSRQ, section 8).
+4. **MIB** on the PBCH, every 40 ms: channel bandwidth, PHICH configuration, SFN.
+5. **SIB1** on the PDSCH, every 80 ms: PLMN identities, tracking area code, cell identity, cell barring, minimum signal level to camp (q-RxLevMin), scheduling of the other SIBs.
+
+**NR:** the PSS, SSS and PBCH travel together in a **synchronization signal block** (SSB, 4 symbols × 20 RBs), placed on the synchronization raster (GSCN) rather than at the carrier center. PCI = 3 × N<sub>ID</sub><sup>(1)</sup> + N<sub>ID</sub><sup>(2)</sup> with N<sub>ID</sub><sup>(1)</sup> 0-335: 1008 values. The SSB is sent in a **burst** of up to 4 or 8 beams in FR1 and 64 in FR2, typically every 20 ms; the UE picks the strongest beam, and its later random access uses the occasion associated with that beam. In NSA mode, the UE gets the NR cell's configuration from LTE RRC and only needs the SSB for timing and measurements.
+
+**PCI vs cell identity:** the PCI is a short local label reused across the network, like a Wi-Fi channel number. The global identity is in SIB1: the **ECGI** (PLMN + 28-bit E-UTRAN cell identity, made of a 20-bit eNB ID and an 8-bit cell ID) in LTE, the **NCGI** (PLMN + 36-bit NR cell identity) in NR. Two neighbors with the same PCI ("PCI confusion") break measurements and handovers, so operators plan PCIs like Wi-Fi channels.
+
+### System information
+
+| SIB (LTE) | Content |
+|---|---|
+| MIB | Bandwidth, SFN |
+| SIB1 | PLMNs, TAC, cell identity, barring, selection thresholds, SIB schedule |
+| SIB2 | Common radio configuration: random access, paging cycle, uplink power control, access barring, timers (T300...) |
+| SIB3 to SIB8 | Cell reselection: same frequency, other frequencies, other technologies (UTRA, GERAN, CDMA2000, NR in SIB24) |
+| SIB10 to SIB12 | Public warning: ETWS, CMAS (EU-Alert, Wireless Emergency Alerts) |
+| SIB16 | GPS time and UTC |
+| SIB20 and later | MBMS, sidelink, NB-IoT and LTE-M specific blocks |
+
+NR broadcasts the MIB and SIB1 (also called RMSI, remaining minimum system information); the other SIBs are broadcast or sent **on demand** when a UE asks, which saves airtime. LTE-M and NB-IoT have their own reduced versions (`SIB1-BR`, `SIB1-NB`).
+
+**Cell barring and access control:** SIB1 can bar a cell entirely or reserve it for the operator; SIB2 (LTE) and SIB1 (NR, unified access control) can bar classes of access for a while, to protect a congested network. Every SIM carries an **access class** (0-9 at random, 11-15 for special users); IoT devices are often configured for **extended access barring** (EAB), so that the network can hold them back first. A barred device keeps camping and retries later: it looks like "registered, but nothing happens".
+
+### Random access
+
+The only transmission a UE makes without a grant. It is used to connect from idle, to regain uplink timing, to request system information on demand, and for handovers.
+
+```mermaid
+sequenceDiagram
+    participant UE
+    participant BS as eNB or gNB
+    Note over UE: Downlink timing from PSS/SSS, PRACH configuration from SIB2 (LTE) or SIB1 (NR)
+    UE->>BS: Msg1: random access preamble on the PRACH (1 of 64), power ramped up on each retry
+    BS->>UE: Msg2: random access response (timing advance, uplink grant, temporary C-RNTI)
+    UE->>BS: Msg3 on the PUSCH: RRC connection request, with an identity (S-TMSI or a random value)
+    BS->>UE: Msg4: contention resolution (echoes the identity), RRC connection setup
+    Note over UE,BS: The UE that sees its own identity in Msg4 keeps the C-RNTI, the others start over
+```
+
+- **Contention:** two UEs can pick the same preamble in the same occasion; Msg4 resolves it. **Contention-free** random access uses a dedicated preamble assigned by the network (handover, beam recovery).
+- **Power ramping:** each unanswered preamble is resent with more power, up to a maximum number of attempts set in system information. Repeated random access failures in a log mean the base station doesn't hear the UE: uplink coverage (section 8) or a timing problem.
+- **2-step random access** (NR Rel-16): Msg1 and Msg3 are sent together (MsgA), and the network answers with MsgB, which saves a round trip.
 
 ---
 

@@ -469,13 +469,168 @@ sequenceDiagram
 
 ## 7. Scheduling, HARQ and layer 2
 
-Planned: downlink and uplink scheduling, SR and BSR, grants, CQI and link adaptation, HARQ, MAC, RLC modes, PDCP, SDAP, carrier aggregation and dual connectivity, latency budget.
+### The scheduler
+
+Every TTI (1 ms in LTE) or slot (NR), the base station's **scheduler** decides which UEs transmit and receive, on which resource blocks, with which MCS and how many layers. Its inputs: channel reports from each UE, buffer sizes, QoS of each bearer (section 12), retransmissions pending, and fairness. The algorithm is the vendor's (proportional fair variants are common): two networks with the same spectrum can perform very differently.
+
+**Downlink:** the PDCCH carries a downlink assignment (DCI) pointing at the UE's data on the PDSCH, in the same subframe in LTE, or a configured number of slots later in NR.
+
+**Uplink:** the UE can't send data until it's granted resources:
+
+```mermaid
+sequenceDiagram
+    participant UE
+    participant BS as eNB
+    Note over UE: Data arrives in an uplink buffer, no grant
+    UE->>BS: Scheduling request on the PUCCH (1 bit, at the UE's next SR opportunity)
+    BS->>UE: Small uplink grant on the PDCCH
+    UE->>BS: PUSCH, 4 ms later (LTE FDD): buffer status report + first data
+    BS->>UE: Grants sized to the reported buffer
+    UE->>BS: PUSCH: the rest of the data
+    BS->>UE: HARQ ACK or NACK for each transport block
+```
+
+- **SR period** (configured per UE, often 5 to 20 ms in LTE) and the grant delay add up to the uplink access latency: an idle uplink is slower than a busy one.
+- **Semi-persistent scheduling** (LTE) and **configured grants** (NR) give a periodic allocation without asking: used for VoLTE and low-latency traffic.
+- **Uplink power control:** the UE sets its power from the downlink path loss it measures (open loop), corrected by the base station's TPC commands (closed loop). It reports its **power headroom** (PHR): at the cell edge it runs out of power, the base station gives it fewer resource blocks, and the uplink rate drops long before the downlink rate does.
+
+### Channel reports and link adaptation
+
+The UE reports **channel state information** (CSI), periodically on the PUCCH or on request on the PUSCH:
+
+| Report | Meaning |
+|---|---|
+| CQI (0-15) | The highest modulation and code rate the UE expects to decode with at most 10% block error rate. Not a signal level: a summary of SINR and receiver quality |
+| RI | Rank: how many layers the UE can receive |
+| PMI | Preferred precoding matrix (closed-loop MIMO) |
+| CRI, SSBRI, L1-RSRP | NR beam reports: best CSI-RS or SSB beam and its power |
+
+The base station starts from the CQI, then adjusts the MCS with its own HARQ statistics to target about 10% **initial block error rate**: errors are cheap because HARQ fixes them quickly, and a lower error target would waste capacity.
+
+### HARQ
+
+Each transport block is acknowledged at the physical layer, quickly:
+
+- **LTE FDD:** 8 parallel stop-and-wait HARQ processes. ACK/NACK 4 ms after the data, retransmission 8 ms after the original. TDD timings depend on the pattern.
+- **NR:** up to 16 processes, with timing set per transmission (K1: data to acknowledgment), as short as a slot or two. Large blocks are split into code block groups that can be retransmitted separately.
+- **Soft combining:** the receiver keeps the failed transmission and combines it with the retransmission, usually sent with different redundancy bits (incremental redundancy). A retransmission is cheaper than starting over.
+
+A block that fails all its HARQ attempts (typically 4 to 5 transmissions) is left to RLC.
+
+### Layer 2: MAC, RLC, PDCP, SDAP
+
+```
+       IP packet (from the host)
+            │
+ SDAP       │  NR only: maps QoS flows to radio bearers, marks the QFI
+ PDCP       │  sequence numbers, header compression (ROHC), ciphering, integrity,
+            │  reordering and duplicate removal (handover, dual connectivity)
+ RLC        │  segmentation and reassembly; ARQ retransmissions in AM
+ MAC        │  multiplexes logical channels into transport blocks, priorities,
+            │  HARQ, SR, BSR, PHR, timing advance, DRX
+ PHY        ▼  coding, modulation, MIMO, resource mapping
+```
+
+| RLC mode | Behavior | Used for |
+|---|---|---|
+| TM (transparent) | Nothing added | Broadcast, paging, RRC before a connection exists (SRB0) |
+| UM (unacknowledged) | Segmentation and reassembly, no retransmissions | VoLTE voice, delay-sensitive traffic |
+| AM (acknowledged) | Retransmits missing segments from status reports | Signaling (SRB1, SRB2), most data bearers |
+
+**Two levels of retransmission:** HARQ (MAC/PHY) recovers most errors within milliseconds; RLC AM catches what HARQ misses, in tens of ms. TCP above sees an almost lossless but variable-delay link: on cellular, packet loss at the IP layer is rare; delay variation and the time to recover from coverage gaps are what hurt. When RLC reaches its maximum number of retransmissions, the UE declares a **radio link failure** (section 14).
+
+**Radio bearers:** signaling radio bearers carry RRC and NAS (SRB0 before the connection, SRB1 for RRC and NAS, SRB2 for lower-priority NAS, SRB3 for direct NR signaling in EN-DC); data radio bearers (DRB) carry user data, one per EPS bearer in LTE, one or more per PDU session in NR (section 12).
+
+### Carrier aggregation and dual connectivity
+
+- **Carrier aggregation** (CA, Rel-10): one UE uses several **component carriers** of one base station at once. The **PCell** (primary cell) carries the RRC connection and the PUCCH; **SCells** (secondary cells) add capacity and are activated or deactivated by MAC commands within milliseconds, as traffic demands. Downlink CA is common (2 to 5 carriers); uplink CA is rarer.
+- **Dual connectivity:** a UE connected to two base stations, a master node and a secondary node, with a split of traffic at PDCP. **EN-DC** (LTE master, NR secondary) is how non-standalone 5G works (section 9); **NR-DC** pairs two NR nodes (FR1 + FR2).
+
+A UE can only aggregate the band combinations it declares (section 4); the network chooses among them.
+
+### Latency
+
+Rule of thumb, connected UE, good signal, server near the operator's gateway:
+
+| | LTE | NR SA (FR1) |
+|---|---|---|
+| Radio one-way, downlink | 2-5 ms | 1-3 ms |
+| Radio one-way, uplink, no grant (SR, grant, data) | 10-20 ms | 3-8 ms |
+| Ping round trip to a nearby server | 25-50 ms | 10-25 ms |
+| First packet after idle (RRC connection setup, section 14) | + 50-100 ms | + 20-50 ms (or less from RRC inactive) |
+| LTE-M, NB-IoT | | 50 ms to seconds (section 15) |
+
+Real values depend on the network's configuration (SR periods, TDD pattern, core location) and, when roaming with home routing, on the distance to the home network's gateway (section 12).
 
 ---
 
 ## 8. Signal measurements and link budget
 
-Planned: RSRP, RSRQ, RSSI, SINR, SS-RSRP, CQI, how modems and AT commands report them, thresholds, noise floor, uplink vs downlink budget, coupling loss.
+### What the UE measures
+
+| Measurement | Definition | Range | Depends on load? |
+|---|---|---|---|
+| **RSRP** | Average power of one resource element of the cell's reference signal (LTE CRS; NR SSB: **SS-RSRP**) | -140 to -44 dBm | No: it measures the cell, not the traffic |
+| **RSSI** | Total power received over the measurement bandwidth: serving cell, neighbors, noise | | Yes |
+| **RSRQ** | N × RSRP / RSSI, with N the number of resource blocks measured | -19.5 to -3 dB (extended ranges in later releases) | Yes: a busy neighbor degrades it |
+| **SINR** | Reference signal power over interference plus noise. Vendor-measured in LTE; standardized as **SS-SINR** in NR | About -20 to +30 dB | Yes |
+| **CQI** | The UE's own estimate of what it can decode (section 7) | 0-15 | Yes |
+
+RSRP tells you **how strong** the cell is (coverage), SINR or RSRQ **how clean** it is (quality). A strong but noisy cell (high RSRP, low SINR) is an interference problem, typically at the border of two cells; a weak but clean cell (low RSRP, decent SINR) is a coverage problem, typical in basements and rural areas.
+
+### Why RSRP looks so low
+
+RSRP is the power of **one** 15 kHz subcarrier. The whole carrier is much stronger: at full load, RSSI ≈ RSRP + 10 log10(12 × N<sub>RB</sub>), which is +27.8 dB for 50 RBs (10 MHz) and +30.8 dB for 100 RBs (20 MHz). An RSRP of -91 dBm on the example cell corresponds to an RSSI of about -63 dBm when the cell is busy. Never compare an LTE RSRP with a Wi-Fi RSSI or a GSM level.
+
+**Noise floor:** thermal noise in 15 kHz is -174 + 10 log10(15000) = -132.2 dBm; with a receiver noise figure of 5 to 9 dB, about -125 dBm per resource element. An RSRP of -110 dBm would give 15 dB of SNR in an empty network; in practice, LTE and NR reuse every frequency in every cell, so **interference from neighbor cells**, not noise, limits SINR in most places. SINR above 20-25 dB is rare outside the immediate vicinity of a site.
+
+### Thresholds
+
+Rule of thumb for LTE data (NR SS-RSRP is similar on the same band; the edge of usability depends on the device class and the network's settings):
+
+| RSRP | RSRQ | SINR | What to expect |
+|---|---|---|---|
+| > -80 dBm | > -10 dB | > 20 dB | Excellent: top MCS, several layers |
+| -80 to -90 dBm | -10 to -15 dB | 13 to 20 dB | Good |
+| -90 to -100 dBm | -15 to -20 dB | 0 to 13 dB | Fair: lower MCS, uplink starts to suffer |
+| -100 to -110 dBm | < -20 dB | < 0 dB | Poor: low rates, drops likely |
+| < -110 to -120 dBm | | | Cell edge for broadband LTE. LTE-M and NB-IoT keep working down to about -130 dBm and below with repetitions (section 15) |
+
+**Reported values are approximate:** the standard requires an absolute accuracy of several dB, and modems average differently. Compare values from the same modem type in the same place, as with Wi-Fi RSSI.
+
+### How devices report them
+
+| Report | Encoding | Notes |
+|---|---|---|
+| `AT+CSQ` → `<rssi>,<ber>` | rssi 0-31: dBm = -113 + 2n (15 = -83 dBm, 31 = -51 dBm or more), 99 = unknown | Defined for GSM. On LTE, modems map RSRP, RSSI or something else into it: don't use it for LTE decisions |
+| `AT+CESQ` → `rxlev,ber,rscp,ecno,rsrq,rsrp` | rsrq 0-34: dB ≈ -20 + n/2; rsrp 0-97: dBm ≈ n - 141; 255 = not available (other technologies' fields) | TS 27.007. Later releases append `ss_rsrq,ss_rsrp,ss_sinr` for NR |
+| Vendor commands | Text with RSRP, RSRQ, RSSI, SINR, band, EARFCN, PCI | The most complete source on most modules (section 17) |
+| Signal "bars" | Vendor or OS mapping | Not comparable between devices |
+
+### Link budget
+
+The **path loss** between the base station and the UE decides almost everything. Free-space path loss, FSPL (dB) = 20 log10(d in m) + 20 log10(f in MHz) - 27.55, is a lower bound; real paths add clutter, buildings and floors.
+
+| At 2 km | B20 (806 MHz) | B3 (1815 MHz) | n78 (3500 MHz) |
+|---|---|---|---|
+| Free-space path loss | 96.6 dB | 103.6 dB | 109.4 dB |
+
+The 13 dB between B20 and n78 come before walls, which also attenuate more at higher frequencies. That's why a device indoors drops to the low bands, and why operators put coverage on 700-900 MHz.
+
+**Downlink vs uplink:** a macro base station transmits about 46 dBm (40 W) per 20 MHz carrier, so 15.2 dBm per resource element, plus 15-18 dBi of antenna gain. A UE transmits at most 23 dBm through a small antenna (0 dBi, often less for embedded antennas). The base station compensates with better antennas, a lower noise figure, and by giving a UE at the edge **fewer resource blocks** so that its 23 dBm are concentrated where they're needed. The result is the same asymmetry as in Wi-Fi: at the cell edge the uplink fails first. Uplink symptoms (random access failures, low uplink rate, drops while sending) at a "reasonable" RSRP point to uplink coverage.
+
+**Maximum coupling loss** (MCL, the total loss between the antennas' connectors, antenna gains included) is how 3GPP compares coverage:
+
+| Technology | MCL (target, TR 45.820 and TS 36 series studies) |
+|---|---|
+| GPRS (reference) | 144 dB |
+| LTE (Cat 1 and above) | About 140 dB |
+| LTE-M (CE mode B) | 155.7 dB |
+| NB-IoT | 164 dB |
+
+Each +10 dB reaches roughly one more wall or floor deeper indoors (rule of thumb). The extra margin of LTE-M and NB-IoT comes from repetitions: more energy per bit, paid in latency and battery (section 15).
+
+**Example:** the device in a basement, 2 km from the site on B20: 96.6 dB free space, plus about 20-30 dB of urban clutter, 15-20 dB to enter the building and 10-20 dB more for the basement (rule of thumb) gives 140-165 dB. Broadband LTE is marginal there; NB-IoT works.
 
 ---
 

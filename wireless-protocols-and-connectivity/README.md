@@ -14,7 +14,7 @@ Notes on the radio links an embedded device uses to reach a network: how each pr
 
 ### Cellular
 
-- [Cellular](cellular/)
+- [Cellular Protocols: LTE, 5G NR and Cellular IoT](cellular/cellular.md): generations, releases and device categories, bands and channel numbers, the LTE and NR physical layer, cell search and system information, scheduling, HARQ and layer 2, RSRP/RSRQ/SINR and link budgets, EPC and 5GC architecture, NSA vs SA, identities and the SIM (eSIM included), attach and registration with reject causes, APNs, bearers, PDU sessions, QoS and IP configuration, roaming, security and known attacks, RRC states, paging, handover, PSM and eDRX, LTE-M, NB-IoT and RedCap, SMS, VoLTE, positioning, slicing and NTN, observing the protocol with AT commands and modem logs, and troubleshooting by layer.
 
 ### NTN
 

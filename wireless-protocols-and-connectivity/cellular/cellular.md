@@ -1296,22 +1296,254 @@ Rel-17 adapts NR (**NR-NTN**) and NB-IoT/LTE-M (**IoT-NTN**) to satellites: the 
 
 ## 17. Observing the protocol: AT commands, modem logs and captures
 
-Planned: standard AT commands for registration, signal, sessions and power saving, modem diagnostic logs, GSMTAP and Wireshark, test networks.
+The operator's network is a black box: what a device engineer can see is what the modem reports. Three levels of detail are available: standard AT commands, vendor commands, and the modem's diagnostic logs. On Linux, ModemManager (`mmcli`) presents much of the same information; driving it is left to the planned embedded Linux note (meanwhile, see the [gateway note](../../networking/gateway/gateway.md#method-2-cellular-modem-quectel-ec25)).
+
+### Standard AT commands (TS 27.007)
+
+Commands are sent on the modem's AT port; `AT+CMEE=2` first makes errors verbose (`+CME ERROR: SIM not inserted` instead of `ERROR`).
+
+| Command | Shows or does |
+|---|---|
+| `AT+CFUN?`, `AT+CFUN=1`, `AT+CFUN=4`, `AT+CFUN=0` | Functionality: full, radio off ("airplane"), minimum. `=0` and `=4` detach cleanly |
+| `AT+CPIN?` | SIM state: `READY`, `SIM PIN`, `SIM PUK` |
+| `AT+CIMI`, `AT+CGSN` | IMSI, IMEI |
+| `AT+COPS?` | Selection mode, current operator, access technology |
+| `AT+COPS=?` | Scan all networks: slow (up to minutes), interrupts service |
+| `AT+COPS=1,2,"00101",7` | Manual selection of PLMN 001-01 on E-UTRAN; `AT+COPS=0` goes back to automatic |
+| `AT+CEREG=<n>`, `AT+CEREG?` | LTE registration: n=2 adds location (TAC, cell ID, access technology), n=3 the reject cause, n=4 the granted PSM timers, n=5 both. `AT+C5GREG` for 5G, `AT+CGREG` for 2G/3G |
+| `AT+CSQ`, `AT+CESQ` | Signal (section 8) |
+| `AT+CGDCONT?`, `AT+CGDCONT=1,"IPV4V6","internet"` | PDP context definitions: context ID, PDN type, APN |
+| `AT+CGAUTH=1,2,"user","pass"` | PAP (1) or CHAP (2) credentials for context 1 |
+| `AT+CGATT?` | Packet domain attached |
+| `AT+CGACT?`, `AT+CGACT=1,1` | Session state, activate context 1 |
+| `AT+CGPADDR=1` | Addresses of context 1 |
+| `AT+CGCONTRDP=1` | Dynamic parameters: APN, addresses, gateway, DNS, and MTU on recent modems |
+| `AT+CEER` | Extended error report: the last failure, often with the 3GPP cause (format vendor-dependent) |
+| `AT+CSCON=1` | Reports RRC connected (`+CSCON: 1`) and idle (`+CSCON: 0`) as they happen |
+| `AT+CPSMS`, `AT+CEDRXS`, `AT+CEDRXRDP` | Request PSM and eDRX (section 14); read the granted eDRX values |
+| `AT+CRSM` | Read and write SIM files (below) |
+| `AT+CTZR=1`, `AT+CCLK?` | Time zone reports (NITZ), modem clock |
+
+An example session on the example network:
+
+```
+AT+CEREG=5
+OK
+AT+CEREG?
++CEREG: 5,1,"1A2B","01A2F301",7,,,"00100001","00111000"
+OK
+AT+CGCONTRDP=1
++CGCONTRDP: 1,5,"internet.mnc001.mcc001.gprs","100.72.15.9.255.255.255.252","100.72.15.10","192.0.2.53","192.0.2.54"
+OK
+```
+
+Reading it: registered on the home network (stat 1) in tracking area 0x1A2B (6699), cell 0x01A2F301, on E-UTRAN (7), with an active time of 1 minute and a periodic update of 24 hours granted. The session on context 1 uses EPS bearer 5. The netmask and gateway a modem reports for a point-to-point session are often synthetic. Exact fields and formats vary with the modem and its firmware.
+
+| `stat` (registration) | Meaning |
+|---|---|
+| 0 | Not registered, not searching (radio off, or the modem gave up: invalid USIM) |
+| 1 | Registered, home network |
+| 2 | Not registered, searching |
+| 3 | Registration denied: look at the reject cause |
+| 4 | Unknown (out of coverage) |
+| 5 | Registered, roaming |
+
+| `AcT` | Access technology |
+|---|---|
+| 0 | GSM |
+| 7 | E-UTRAN (LTE, LTE-M) |
+| 9 | E-UTRAN NB-S1 (NB-IoT) |
+| 10 | E-UTRA connected to a 5G core |
+| 11 | NR connected to a 5G core (SA) |
+| 13 | E-UTRA-NR dual connectivity (NSA) |
+
+| `+CME ERROR` | Meaning |
+|---|---|
+| 3 | Operation not allowed (often: wrong state, such as radio off) |
+| 4 | Operation not supported |
+| 10 | SIM not inserted |
+| 11, 12 | SIM PIN required, SIM PUK required |
+| 13, 14, 15 | SIM failure, SIM busy, SIM wrong |
+| 16 | Incorrect password |
+| 30 | No network service |
+| 50 | Incorrect parameters |
+
+**SIM files:** `AT+CRSM` sends READ BINARY (176) or UPDATE BINARY (214) to a file by ID. The forbidden PLMN list (EF_FPLMN, 0x6F7B = 28539) holds 3 bytes per PLMN, `FFFFFF` for an empty slot:
+
+```
+AT+CRSM=176,28539,0,0,12
++CRSM: 144,0,"00F110FFFFFFFFFFFFFFFFFF"     # 144,0 = success. 00F110 = PLMN 001-01, in BCD
+AT+CRSM=214,28539,0,0,12,"FFFFFFFFFFFFFFFFFFFFFFFF"
++CRSM: 144,0,""                              # list cleared: power-cycle the modem, or AT+CFUN=0 then 1
+```
+
+Read the file's real size first (it can be larger than 12 bytes), and only clear the list once the cause of the reject is fixed.
+
+**Vendor commands** give what the standard doesn't: band, EARFCN, PCI, RSRP, RSRQ, SINR, CE level, CA state. Examples: `AT+QENG="servingcell"` (Quectel), `AT+UCGED?` (u-blox), `AT!GSTATUS?` (Sierra Wireless), `AT#RFSTS` (Telit). Check the module's AT manual: formats change between firmware versions.
+
+### Modem diagnostic logs
+
+The modem firmware can trace its own internal state, including **every RRC and NAS message, decoded**, SIB contents, measurements, scheduling and errors. It's the only complete view of a registration or session failure.
+
+- **Vendor tools:** Qualcomm-based modules expose a DIAG port read by QXDM/QCAT or a module vendor's capture tool (Quectel's QLog, for example); MediaTek, Samsung, Sierra and others have their own. Access often requires an agreement with the module vendor.
+- **Open source:** SCAT (Qualcomm and Samsung) and QCSuper (Qualcomm) read the diagnostic port and convert the messages to **GSMTAP**, which Wireshark decodes as LTE RRC, NAS-EPS, NR RRC and NAS-5GS.
+- What to look for: the SIB1 of the serving cell (PLMN, TAC, barring), RRC Reconfiguration (measurement events, DRX, CA, timers), NAS messages with their causes, the Security Mode Command (algorithm), the Attach/Registration Accept (granted timers, TAI list) and PDN session accept (APN, address, PCO).
+
+### Captures over the air and test networks
+
+- **Downlink broadcast** (MIB, SIBs) can be decoded with an SDR and open-source LTE tools: useful to map cells. User data is ciphered, and capturing other people's communications is illegal in most countries; transmitting on licensed spectrum requires a license.
+- **Test networks:** srsRAN, OpenAirInterface, Open5GS or commercial software, with programmable test SIMs on PLMN 001-01, in a shielded enclosure or cabled through attenuators, under a test license. They show both sides of every procedure and can reproduce rejects at will.
+- **Network emulators** (from test-equipment vendors) are what certification labs use to run conformance and carrier test plans.
 
 ---
 
 ## 18. Troubleshooting by layer
 
-Planned: a method from SIM to IP, symptoms, reject causes and what they mean, a useful bug report.
+### Method
+
+Work up from the SIM, and don't move on until a step passes:
+
+```mermaid
+flowchart TD
+    A{"SIM ready?<br/>AT+CPIN?"} -->|no| SIM["Card, holder, PIN,<br/>eUICC profile"]
+    A -->|yes| B{"Radio on,<br/>bands and RATs allowed?"}
+    B -->|no| RF["CFUN, allowed modes,<br/>band configuration"]
+    B -->|yes| C{"Cell found,<br/>plausible RSRP?"}
+    C -->|no| COV["Coverage, antenna, regional variant,<br/>technology not deployed"]
+    C -->|yes| D{"Registered?<br/>CEREG stat 1 or 5"}
+    D -->|"denied"| REJ["Reject cause: SIM, subscription,<br/>roaming, forbidden lists"]
+    D -->|"searching"| SEL["PLMN selection, barring,<br/>retry timers"]
+    D -->|yes| E{"Session up,<br/>IP address?"}
+    E -->|no| SESS["APN, PDN type,<br/>credentials, ESM cause"]
+    E -->|yes| F{"Host configured,<br/>traffic flows?"}
+    F -->|no| HOST["Fundamentals note:<br/>address, routes, DNS, MTU"]
+    F -->|yes| G{"Stable, fast,<br/>battery as expected?"}
+    G -->|no| PERF["SINR, load, CE level, RLF,<br/>AMBR, PSM not granted"]
+```
+
+| Fault domain | Evidence | Where |
+|---|---|---|
+| SIM | `+CME ERROR: 10/13`, `SIM PIN` | Section 10 |
+| Radio, coverage | No cell, RSRP near the edge, CE level 2, random access failures | Sections 6, 8 |
+| Network selection | `stat 2` forever, forbidden PLMNs, manual mode, barring | Sections 6, 11 |
+| Registration | `stat 3`, EMM/5GMM cause | Section 11 |
+| Data session | Session rejected, ESM/5GSM cause, wrong APN | Section 12 |
+| Host and IP | Session up, but no traffic from the host | [Fundamentals note](../../networking/fundamentals/fundamentals.md#22-troubleshooting) |
+| Performance | Low SINR, cell load, uplink power limit, AMBR, no CA | Sections 7, 8 |
+| Mobility | Drops while moving, RLF, SCG failures | Section 14 |
+| Power | PSM or eDRX not granted, keepalives, high CE level | Sections 14, 15 |
+
+**Compare before concluding:** the same device with another SIM, or another device with the same SIM, at the same place and time. Most "the module is broken" reports are a subscription, coverage or roaming problem, and a second device settles it in minutes.
+
+### Symptoms
+
+| Symptom | Where to look first |
+|---|---|
+| SIM not detected | Card seating, holder, SIM detect configuration, a 1.8 V-only SIM in a 3 V-only slot or the reverse, an eUICC with no enabled profile |
+| Searching forever (`stat 2`) | No supported band here (wrong regional variant), antenna, LTE-M/NB-IoT not deployed or not enabled for the SIM, forbidden PLMN list, manual selection on an absent network, barred cells |
+| Registration denied (`stat 3`) | The reject cause (`AT+CEREG=3`, `AT+CEER`, modem logs) and section 11's table |
+| Works only after a reboot | A persistent reject (#3, #6, #7, #8: invalid USIM until power cycle), a PLMN in EF_FPLMN |
+| Takes about 12 minutes to recover after failures | T3402 after 5 failed attempts (section 11), or a network back-off timer (T3346) |
+| Registered, session rejected | APN, PDN type, credentials: the ESM cause (section 12) |
+| Session up, nothing reachable | A private APN instead of the internet APN, DNS from the PCO not applied, MTU, an exhausted data plan (some operators keep the session and block traffic), host configuration |
+| Works in one country, not in another | Bands, roaming agreements (especially LTE-M/NB-IoT), steering of roaming (a series of rejects before success), permanent roaming restrictions |
+| Good RSRP, poor throughput | SINR (interference between cells), cell load (compare at night), uplink power limit, the plan's AMBR, missing CA combinations |
+| "5G" but LTE speeds | NSA without the NR leg added (B1 threshold not met), SCG failures, NR not in the subscription |
+| First packet slow, later ones fast | Idle to connected transition (section 14) |
+| Commands to the device arrive late or never | eDRX/PSM (by design), NAT mapping expired (section 14), SMS not in the plan |
+| Battery drains faster than planned | PSM or eDRX not granted (check the granted values, `AT+CEREG=4`), frequent keepalives, high CE level, repeated searching in poor coverage |
+| Drops while moving | Radio link failures and handover failures in the modem logs; NB-IoT has no connected-mode handover |
+| Rejected with #6 (illegal ME) | IMEI blocked or not accepted: uncertified device, IMEI-bound plan with another device |
+| No voice | IMS registration (IMS APN, carrier configuration, operator approval) and no 2G/3G fallback left |
+
+### Messages and what they mean
+
+| Message | Meaning |
+|---|---|
+| `+CEREG: 2,3,...` with reject cause 15 | No suitable cells in this tracking area: often a technology (NB-IoT or LTE-M) not allowed for the subscription |
+| `Attach Reject`, EMM cause #19, ESM cause #27 | Attach failed because the APN is unknown or not subscribed |
+| `Authentication Failure` with cause #20 (MAC failure) | The network failed to prove it knows K: wrong network, fake cell, or a SIM profile problem |
+| `Authentication Failure` with cause #21 (synch failure) | Sequence number resynchronization: occasional ones are normal |
+| `Security Mode Command` with EEA0 | The network chose not to cipher |
+| `RRC Connection Reject` with a wait time | Base station overloaded or access barred: the UE waits |
+| `T3346` started | Network congestion back-off: no NAS attempt until it expires |
+| `Radio link failure`, `RRC re-establishment request` (cause handoverFailure or otherFailure) | Coverage loss or a failed handover |
+| `SCG failure` | NSA: the NR leg was lost, LTE continues |
+| `Deactivate EPS Bearer Context Request` with cause #39 | The network asks for a new session: expect a new address |
+
+### A useful bug report
+
+The module model and firmware version, the SIM's operator (MCC-MNC) and plan type, place and time, the serving cell (RAT, band, EARFCN or NR-ARFCN, PCI, TAC, cell ID) with RSRP, RSRQ and SINR, the registration state with its reject cause, `AT+CEER`, a timestamped AT log, the modem's diagnostic log covering the failure, and the result of the same test with another SIM or device. Leave the full IMSI and IMEI out of public reports.
 
 ---
 
 ## 19. Not covered here
 
-Planned: topics for separate notes.
+Topics for separate notes:
+
+- **Cellular modems on embedded Linux:** drivers (`qmi_wwan`, `cdc_mbim`, MHI, WWAN), ModemManager, libqmi and libmbim, AT, QMI and MBIM in practice, USB compositions, power sequencing and board integration, firmware and carrier configurations, certification. The [fundamentals note](../../networking/fundamentals/fundamentals.md#20-modem-based-devices-the-ap-and-the-modem) covers the data path and connection sharing meanwhile.
+- **Running a network:** RAN and core software (srsRAN, OpenAirInterface, Open5GS), radio planning, O-RAN.
+- **The PHY in depth:** channel coding, channel estimation, MIMO processing ([hardware/baseband/](../../hardware/baseband/), [hardware/sdr/](../../hardware/sdr/)).
+- **RF design:** antennas, coexistence, over-the-air performance tests ([hardware/rf/](../../hardware/rf/)).
+- **IMS in depth:** SIP, VoLTE call flows, RCS.
+- **2G and 3G protocols**, sidelink and V2X (PC5), broadcast (MBMS), mmWave beam management, 6G.
+- **Satellite access** in depth ([ntn/](../ntn/)) and **Bluetooth** ([bluetooth/](../bluetooth/)).
 
 ---
 
 ## References
 
-Planned: 3GPP specifications, GSMA documents, regulation, books.
+3GPP specifications (free at <https://www.3gpp.org/ftp/Specs/archive/>, by series; ETSI republishes them as TS 1xx xxx):
+
+| Topic | LTE | NR / 5G |
+|---|---|---|
+| Vocabulary | TS 21.905 | TS 21.905 |
+| Numbering: IMSI, IMEI, GUTI, APN | TS 23.003 | TS 23.003 |
+| Architecture and procedures | TS 23.401 | TS 23.501, TS 23.502 |
+| QoS classes | TS 23.203 | TS 23.501 |
+| PLMN selection | TS 23.122 | TS 23.122 |
+| NAS protocol and causes | TS 24.301 (timer coding in TS 24.008) | TS 24.501 |
+| Security | TS 33.401 | TS 33.501 |
+| USIM | TS 31.102 | TS 31.102 |
+| AT commands | TS 27.007, TS 27.005 (SMS) | TS 27.007 |
+| Radio overview | TS 36.300 | TS 38.300 |
+| UE radio: bands, EARFCN | TS 36.101 | TS 38.101-1, TS 38.101-2; NR-ARFCN in TS 38.104 |
+| Physical layer | TS 36.211 to TS 36.213 | TS 38.211 to TS 38.214 |
+| Measurements (RSRP, RSRQ) | TS 36.214 | TS 38.215 |
+| Idle mode | TS 36.304 | TS 38.304 |
+| UE categories and capabilities | TS 36.306 | TS 38.306 (peak rate formula) |
+| MAC, RLC, PDCP, SDAP | TS 36.321, TS 36.322, TS 36.323 | TS 38.321, TS 38.322, TS 38.323, TS 37.324 |
+| RRC | TS 36.331 | TS 38.331 |
+| IoT studies | TR 36.888 (LTE-M), TR 45.820 (NB-IoT) | |
+
+GSMA documents (<https://www.gsma.com>):
+
+- TS.34, *IoT Device Connection Efficiency Guidelines*
+- SGP.02 (M2M), SGP.22 (consumer) and SGP.32 (IoT) remote SIM provisioning
+
+IETF:
+
+| Topic | Document |
+|---|---|
+| IPv6 in 3GPP networks, /64 sharing | [RFC 6459](https://www.rfc-editor.org/rfc/rfc6459), [RFC 7278](https://www.rfc-editor.org/rfc/rfc7278) |
+| CGNAT address space, 464XLAT | [RFC 6598](https://www.rfc-editor.org/rfc/rfc6598), [RFC 6877](https://www.rfc-editor.org/rfc/rfc6877) |
+| DTLS connection IDs | [RFC 9146](https://www.rfc-editor.org/rfc/rfc9146) |
+| Documentation addresses | [RFC 5737](https://www.rfc-editor.org/rfc/rfc5737), [RFC 3849](https://www.rfc-editor.org/rfc/rfc3849) |
+
+Regulation (check for amendments before relying on them):
+
+- EU: Radio Equipment Directive 2014/53/EU; harmonized standards ETSI EN 301 908-1, -13 (LTE UE), -25 (NR UE)
+- US: 47 CFR Parts 22, 24, 27, 90 and 96
+
+Tools:
+
+- SCAT: <https://github.com/fgsect/scat>
+- QCSuper: <https://github.com/P1sec/QCSuper>
+- Open5GS: <https://open5gs.org>
+- Wireshark's LTE and NR dissectors read GSMTAP captures from the tools above
+
+Books:
+
+- Martin Sauter, *From GSM to LTE-Advanced Pro and 5G: An Introduction to Mobile Networks and Mobile Broadband*: the whole system, clearly explained, with practical observations.
+- Erik Dahlman, Stefan Parkvall and Johan Sköld, *5G NR: The Next Generation Wireless Access Technology* and *4G, LTE-Advanced Pro and The Road to 5G*: the radio interface, by authors involved in the standard.
+- Stefania Sesia, Issam Toufik and Matthew Baker (eds.), *LTE – The UMTS Long Term Evolution: From Theory to Practice*: the LTE radio in depth.

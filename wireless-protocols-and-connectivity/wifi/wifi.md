@@ -2162,7 +2162,7 @@ Topics for separate notes:
 - **Enterprise deployments:** FreeRADIUS, certificate provisioning for fleets, dynamic VLANs, Passpoint operator setup.
 - **Mesh in depth:** 802.11s path selection, batman-adv, EasyMesh controllers.
 - **Wi-Fi 8 (802.11bn)** once the standard settles.
-- **Bluetooth** and **cellular** ([wireless-protocols-and-connectivity/](../)).
+- **Bluetooth** ([bluetooth/](../bluetooth/)) and **cellular** ([Cellular Protocols](../cellular/cellular.md)).
 
 ---
 

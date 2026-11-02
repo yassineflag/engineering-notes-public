@@ -1586,7 +1586,7 @@ IPv6 has no NAT to hide mismatches. Each upstream provides its own prefix, the c
 
 In a cellular product, two processors run separate software. The **application processor** (AP) runs Linux and the product's applications. The **modem** (baseband processor) runs vendor firmware, often an RTOS, sometimes its own Linux, that handles the radio, the cellular protocol stack and the data sessions with the carrier. To Linux, the modem is a peripheral that offers two kinds of interfaces: one to **control** it, one to carry **data**.
 
-This section covers the networking architecture and packet paths, not the radio. Hands-on modem commands for one module (a Quectel EC25 over QMI) are in the [gateway note](../gateway/gateway.md#method-2-cellular-modem-quectel-ec25); deeper modem integration (USB compositions, QMI/MBIM details, firmware) belongs in a dedicated note.
+This section covers the networking architecture and packet paths, not the radio. Hands-on modem commands for one module (a Quectel EC25 over QMI) are in the [gateway note](../gateway/gateway.md#method-2-cellular-modem-quectel-ec25); deeper modem integration (USB compositions, QMI/MBIM details, firmware) belongs in a dedicated note. The cellular protocols themselves (registration, sessions, reject causes, power saving) are in [Cellular Protocols](../../wireless-protocols-and-connectivity/cellular/cellular.md).
 
 ### Who does what
 

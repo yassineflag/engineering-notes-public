@@ -902,46 +902,50 @@ Each +10 dB reaches roughly one more wall or floor deeper indoors (rule of thumb
 
 ### The identifiers
 
-| Identifier | What it identifies | Format | Assigned by | Stored in |
+| Identifier | Identifies | Format | Assigned by | Where it appears |
 |---|---|---|---|---|
-| **IMSI** (5G: SUPI) | The subscription | MCC (3 digits) + MNC (2 or 3) + MSIN, up to 15 digits: `001 01 0000012345` | Operator | USIM |
-| **SUCI** (5G) | The SUPI, encrypted for the home network | Scheme ID, home network key ID, ciphertext | Computed by the USIM or the modem at each registration | |
-| **GUTI** (5G-GUTI) | The UE at its current MME/AMF: temporary | MCC + MNC + MME group/code (AMF region/set/pointer) + 32-bit M-TMSI (5G-TMSI) | MME / AMF, changed regularly | Modem and USIM (EF_EPSLOCI) |
-| **S-TMSI** (5G-S-TMSI) | A short form of the GUTI for paging and RRC | MME code + M-TMSI | Derived | |
-| **IMEI** (5G: PEI) | The device hardware (the modem) | TAC (8 digits) + serial (6) + check digit: `49015420 323751 8` | Device manufacturer, from GSMA-allocated TACs | Modem, protected |
-| **IMEISV** | IMEI + software version | TAC + serial + SVN (2 digits) | | Modem |
-| **ICCID** | The SIM card itself | Up to 19-20 digits starting with `89` | SIM manufacturer, for the operator | Card |
-| **MSISDN** (5G: GPSI) | The phone number | E.164 | Operator | Network (sometimes copied to the SIM). Data-only IoT SIMs may have none |
-| **EID** | An eUICC chip | 32 digits | eUICC manufacturer | eUICC |
-| **C-RNTI** | The UE in one cell, while connected | 16 bits | Base station (section 6) | |
+| **IMSI** (5G: a SUPI of type IMSI) | The subscription | MCC (3 digits) + MNC (2 or 3) + MSIN, up to 15 digits: `001 01 0000012345` | Operator | USIM. Sent in NAS only when the network asks or no temporary identity is usable |
+| **SUCI** (5G) | The SUPI, concealed for the home network | Home network identifiers, routing indicator, protection scheme, key ID, ciphertext | Computed by the USIM or the modem for each use | 5G Registration Request, Identity Response |
+| **GUTI** (LTE) | The UE at its MME: temporary | GUMMEI (MCC, MNC, MME group ID, MME code) + 32-bit M-TMSI | MME, reallocated regularly | Attach and TAU messages, USIM (EF_EPSLOCI) |
+| **5G-GUTI** | The UE at its AMF: temporary | GUAMI (MCC, MNC, AMF region ID, AMF set ID, AMF pointer) + 32-bit 5G-TMSI | AMF | Registration, USIM (EF_5GS3GPPLOCI) |
+| **S-TMSI**, **5G-S-TMSI** | A short GUTI for paging and RRC | MME code + M-TMSI; AMF set ID + AMF pointer + 5G-TMSI | Derived | Paging, RRC connection request |
+| **IMEI** (5G: PEI) | The device hardware (the modem) | TAC (8 digits) + serial (6) + check digit: `49015420 323751 8` | Device manufacturer, from GSMA-allocated TACs | Requested by the network in Identity Request or in the Security Mode procedure (as IMEISV) |
+| **IMEISV** | IMEI + software version | TAC + serial + SVN (2 digits) | | Same |
+| **ICCID** | The SIM card itself | Up to 19-20 digits starting with `89` | SIM manufacturer, for the operator | Card only: never sent over the air |
+| **MSISDN** (5G: one kind of GPSI) | The phone number | E.164 | Operator | Network. Data-only IoT SIMs may have none |
+| **EID** | An eUICC chip | 32 digits | eUICC manufacturer | Remote provisioning only |
+| **C-RNTI**, **I-RNTI** | The UE in one cell (connected), the UE's context in the RAN (inactive) | 16 bits; 24 or 40 bits | Base station | MAC and RRC (sections 7 and 14) |
 
-**Permanent identities are protected by temporary ones.** After the first attach, the network gives the UE a GUTI and the UE presents it instead of its IMSI, so that a listener can't follow the IMSI around. The IMSI still goes in clear when the network asks for it (a new network, a lost GUTI): this is what IMSI catchers exploit (section 13). 5G closes that with the **SUCI**: the SUPI is encrypted with the home network's public key (ECIES, profile A on Curve25519 or profile B on P-256). If the operator didn't provision a key in the USIM, the "null scheme" sends the SUPI unencrypted.
+**Permanent identities are protected by temporary ones.** After the first attach or registration, the network gives the UE a GUTI and the UE presents it instead of its IMSI, so a listener can't follow the IMSI around. The network reallocates GUTIs (at TAUs, at registrations, by explicit commands) and pages with the short S-TMSI. In LTE, the IMSI still goes in clear when the network asks for it before security is active, which IMSI catchers exploit (section 13). 5G closes that gap with the **SUCI**: the SUPI's MSIN is encrypted with the home network's public key (ECIES, profile A on Curve25519 or profile B on P-256) and only the home network's UDM can decrypt it. If the operator didn't provision a key in the USIM, the "null scheme" sends the SUPI unencrypted.
 
-**The IMEI names the module, not your product.** A product using a certified module carries the module vendor's TAC. Operators can block IMEIs (stolen devices, uncertified ones) through an equipment identity register, and IoT plans can be locked to one IMEI ("IMEI binding"): a SIM moved to another device stops working.
+**The IMEI names the module, not the product.** A product using a certified module carries the module vendor's TAC. Operators can block IMEIs (stolen or non-compliant devices) through an equipment identity register, and IoT plans can be locked to one IMEI ("IMEI binding"): a SIM moved to another device stops working, typically with reject cause #6 (section 11).
 
 ### The USIM
 
-The SIM card (a UICC) runs one or more applications: the **USIM** for LTE/5G access, often an ISIM for IMS. The USIM holds:
+The SIM card (a UICC) runs one or more applications: the **USIM** for LTE/5G access, often an **ISIM** for IMS. The USIM holds:
 
 - **The secret key K** (and the operator constant OPc), shared only with the operator's authentication center. They never leave the card: the card computes authentication responses and session keys (Milenage or TUAK algorithms, section 13).
-- **Files** the modem reads and writes:
+- **Files** the modem reads and updates:
 
 | File | Content |
 |---|---|
 | EF_IMSI, EF_AD | IMSI; MNC length (2 or 3 digits) |
 | EF_ICCID | Card serial |
 | EF_EHPLMN, EF_HPLMNwAcT | Home and equivalent home PLMNs |
-| EF_OPLMNwAcT, EF_PLMNwAcT | Operator- and user-controlled preferred PLMNs with their access technologies: the roaming preference list (section 11) |
+| EF_OPLMNwAcT, EF_PLMNwAcT | Operator- and user-controlled preferred PLMNs with their access technologies: the roaming preference lists (section 11) |
+| EF_HPPLMN | Interval for searching higher-priority PLMNs while roaming |
 | EF_FPLMN | Forbidden PLMNs, written by the modem after certain rejects (section 11) |
-| EF_EPSLOCI, EF_5GS3GPPLOCI | Last GUTI, last tracking area, update status |
-| EF_ACC | Access class (section 6) |
+| EF_EPSLOCI, EF_5GS3GPPLOCI | Last GUTI, last registered tracking area, update status |
+| EF_EPSNSC, EF_5GS3GPPNSC | Stored NAS security context, so a later attach can skip authentication |
+| EF_ACC | Access class (section 7) |
 | EF_SPN | Service provider name |
+| EF_UST | USIM service table: which optional services and files the card supports |
 
-Because the last registration state lives on the card, a SIM moved to another device brings its forbidden PLMN list and its last GUTI with it. The modem reads these files at startup and can be asked for them with `AT+CRSM` (section 17).
+Because registration state lives on the card, a SIM moved to another device brings its forbidden PLMN list, its last GUTI and its stored security context with it.
 
 **PIN and PUK:** 3 wrong PINs block the card, 10 wrong PUKs make it permanently unusable. Products usually ship with the PIN disabled, or set it and store it in the device: a PIN-protected SIM in an unattended device must be unlocked by software at every boot.
 
-**SIM toolkit (USAT):** the card can run applets that issue commands to the modem: send an SMS, display text, open a channel, refresh files. Operators use it with **SIM OTA** (over-the-air updates via SMS or data) to change roaming lists or profiles. A REFRESH command can make the modem re-read the card and re-register: an unexplained detach and reattach in a log can come from the SIM.
+**SIM toolkit (USAT):** the card can run applets that issue proactive commands to the modem: send an SMS, open a data channel, refresh files, provide local information. Operators use it with **OTA** updates (over SMS or data) to change roaming lists or profiles. A `REFRESH` command can make the modem re-read the card and register again: an unexplained detach and reattach in a log can come from the SIM.
 
 ### Form factors and eSIM
 
@@ -950,51 +954,61 @@ Because the last registration state lives on the card, a SIM moved to another de
 | 2FF (mini) | 25 × 15 mm | Older devices, industrial holders |
 | 3FF (micro) | 15 × 12 mm | |
 | 4FF (nano) | 12.3 × 8.8 mm | Phones |
-| MFF2 | 5 × 6 mm, soldered (DFN-8) | Embedded SIM chip: vibration, temperature, tamper resistance. Industrial-grade versions have higher write endurance and data retention |
-| iSIM | Inside the modem SoC | Secure enclave in the chip running the SIM: no separate part |
+| MFF2 | 5 × 6 mm, soldered (DFN-8) | Embedded SIM chip: vibration, temperature, tamper resistance. Industrial grades have higher write endurance and data retention |
+| iSIM | Inside the modem SoC | A secure enclave in the chip runs the SIM: no separate part |
 
-An **eUICC** ("eSIM") is a SIM whose operator **profiles** are downloaded and switched remotely, so one hardware SKU can be connected anywhere and change operator in the field. Form factor and eUICC are independent: an eUICC can be a plug-in card, an MFF2 or an iSIM.
+An **eUICC** ("eSIM") is a UICC whose operator **profiles** are downloaded and switched remotely, so one hardware SKU can be connected anywhere and change operator in the field. Form factor and eUICC are independent: an eUICC can be a plug-in card, an MFF2 or an iSIM.
 
 | GSMA specification | For | How profiles are managed |
 |---|---|---|
-| SGP.02 ("M2M") | IoT, older | Pushed by the operator's platform (SM-DP, SM-SR) over SMS. Profiles from operators tied to that platform |
-| SGP.22 ("consumer") | Phones, tablets, laptops | A local profile assistant (LPA) in the device downloads profiles from an SM-DP+ server, using an activation code (the QR code). Needs a user interface |
-| SGP.32 ("IoT") | Headless IoT devices | Like SGP.22, but driven remotely through an eSIM IoT remote manager (eIM) instead of a user. Newer: check support in modules and operators |
+| SGP.02 ("M2M") | IoT, older | Pushed by the operator's platform (SM-DP and SM-SR) over SMS or data. Profiles from operators connected to that SM-SR |
+| SGP.22 ("consumer") | Phones, tablets, laptops | A local profile assistant (LPA) in the device downloads profiles from an SM-DP+ server with an activation code (the QR code). Needs a user |
+| SGP.32 ("IoT") | Headless IoT devices | Like SGP.22, driven remotely through an eSIM IoT remote manager (eIM) instead of a user. Recent: check support in modules, eUICCs and operators |
 
-A profile download needs connectivity, usually through a bootstrap profile pre-loaded at manufacturing.
+A profile download needs connectivity, usually through a bootstrap profile loaded at manufacturing.
 
 ---
 
-## 11. Getting service: PLMN selection, RRC connection, attach and registration
+## 11. Getting service: network selection, RRC connection, attach and registration
 
 ### PLMN selection
 
 In automatic mode (the default), the modem chooses a network in this order (TS 23.122):
 
-1. The last registered PLMN, or the **home PLMN** (from the IMSI) and its **equivalent home PLMNs** (EF_EHPLMN).
+1. The last registered PLMN (RPLMN), or the **home PLMN** and its **equivalent home PLMNs** (EF_EHPLMN), depending on configuration.
 2. PLMNs in the **user-controlled** list (EF_PLMNwAcT), then in the **operator-controlled** list (EF_OPLMNwAcT), in order, with the access technologies they name.
-3. Other PLMNs with a strong enough signal, in random order; then the rest, strongest first.
+3. Other PLMNs with "high quality" signal (RSRP ≥ -110 dBm for E-UTRA), in random order; then the others, strongest first.
 
-PLMNs in the **forbidden list** (EF_FPLMN) are skipped. While roaming, the modem periodically looks for a higher-priority PLMN (period from EF_HPPLMN, in steps of 6 minutes; 60 minutes is common). In **manual mode** (`AT+COPS=1,2,"00101"`), it registers only on the chosen PLMN.
+PLMNs in the **forbidden list** are skipped. While roaming, the modem periodically looks for a higher-priority PLMN (the EF_HPPLMN interval; 60 minutes by default). In **manual mode** (`AT+COPS=1,...`), it registers only on the chosen PLMN. Equivalent PLMNs received in the Attach or Registration Accept are treated as the registered PLMN for cell selection and mobility.
 
-**Cell selection:** on the chosen PLMN, the UE camps on a cell that passes the **S criterion**: measured RSRP above the cell's minimum (q-RxLevMin from SIB1, often around -120 to -128 dBm) plus offsets, and in LTE a minimum RSRQ. Then **cell reselection** keeps it on the best cell while idle, following frequency priorities and thresholds broadcast in SIB3 to SIB8 (section 14).
+**Cell selection:** on the chosen PLMN, the UE camps on a cell that is not barred and passes the **S criterion** (TS 36.304, TS 38.304): Srxlev = measured RSRP - (`q-RxLevMin` + offsets) - power compensation > 0, plus a minimum RSRQ (Squal) in LTE. `q-RxLevMin` is broadcast in SIB1, often around -120 to -128 dBm. Once camped, **cell reselection** keeps the UE on the best cell while idle (section 14). A cell can be **suitable** (right PLMN, not barred, not in a forbidden tracking area) or only **acceptable** (any PLMN): on an acceptable cell the UE can only make emergency calls ("limited service").
 
 ### RRC connection
 
-To send anything to the core, the UE first needs an RRC connection: random access (section 6), then:
+To send anything to the core, the UE first needs an RRC connection: random access (section 7), then:
 
-| Message (LTE) | Direction | Content |
-|---|---|---|
-| RRC Connection Request (Msg3) | UE → eNB | UE identity (S-TMSI or random), **establishment cause**: emergency, high priority, mt-Access (answering paging), mo-Signalling, mo-Data, delayTolerantAccess (IoT) |
-| RRC Connection Setup (Msg4) | eNB → UE | Configuration of SRB1, MAC and PHY parameters |
-| RRC Connection Setup Complete | UE → eNB | Selected PLMN, and the first NAS message (attach request, service request...) |
-| RRC Connection Reject | eNB → UE | Overload or barring, with a wait time |
+| LTE message | NR message | Direction | Content |
+|---|---|---|---|
+| RRCConnectionRequest (Msg3) | RRCSetupRequest | UE → BS | UE identity (S-TMSI or a random value), **establishment cause**: emergency, highPriorityAccess, mt-Access (answering paging), mo-Signalling, mo-Data, mo-VoiceCall, delayTolerantAccess (IoT) |
+| RRCConnectionSetup (Msg4) | RRCSetup | BS → UE | Configuration of SRB1, MAC and PHY |
+| RRCConnectionSetupComplete | RRCSetupComplete | UE → BS | Selected PLMN, registered MME/AMF hint, and the first NAS message (attach or registration request, service request, TAU) |
+| RRCConnectionReject | RRCReject | BS → UE | Overload or barring, with a wait time |
 
-The base station can use the establishment cause to reject low-priority access under load. NR uses the same steps with RRC Setup Request / RRC Setup / RRC Setup Complete.
+The base station forwards the NAS message to the right MME or AMF in an S1AP/NGAP **Initial UE Message**; from then on the core and the UE exchange NAS messages through the base station (downlink and uplink NAS transport). The core then sets up the UE's context in the base station (**Initial Context Setup**): security keys, the bearers or PDU session resources, and the UE's radio capabilities.
+
+### UE capabilities
+
+The radio capabilities (bands, band combinations, layers, features per combination) are large, sometimes tens of kilobytes for a 5G phone. The UE sends them once, on request:
+
+1. If the MME/AMF has no stored capabilities for the UE, the base station sends **UECapabilityEnquiry** (filtered by RAT and bands of interest) and the UE answers with **UECapabilityInformation**.
+2. The base station uploads them to the core, which stores them for the UE's next connections, so they aren't requested every time.
+3. Rel-16 adds **UE radio capability IDs**: a short identifier for a known capability set, so a network only fetches the full set once per device model.
+
+A UE whose capabilities changed (a firmware update enabling bands, SA turned on or off) signals it in its next attach, TAU or registration, so the network discards the stored copy. Missing capabilities in a log ("why doesn't the network configure CA or EN-DC?") is one of the most common explanations for lower-than-expected performance.
 
 ### LTE attach
 
-Attaching makes the UE known to the MME and, in LTE, always creates a first data session (the default bearer): an attached LTE device has an IP address.
+Attaching makes the UE known to the MME and, in LTE, always creates a first PDN connection with its default bearer: an attached LTE device has an IP session.
 
 ```mermaid
 sequenceDiagram
@@ -1004,66 +1018,95 @@ sequenceDiagram
     participant HSS
     participant GW as S-GW and P-GW
     UE->>ENB: RRC connection setup (random access, Msg3, Msg4)
-    UE->>MME: Attach Request + PDN Connectivity Request (GUTI or IMSI, capabilities, PDN type, APN optional)
+    UE->>MME: Attach Request + PDN Connectivity Request (GUTI or IMSI, capabilities, PDN type)
     MME->>HSS: Authentication Information Request
     HSS->>MME: Authentication vectors (RAND, AUTN, XRES, KASME)
     MME->>UE: Authentication Request (RAND, AUTN)
     UE->>MME: Authentication Response (RES)
-    MME->>UE: NAS Security Mode Command (algorithms)
-    UE->>MME: NAS Security Mode Complete (encrypted from here on)
+    MME->>UE: Security Mode Command (algorithms, IMEISV request)
+    UE->>MME: Security Mode Complete (IMEISV). NAS ciphered from here on
+    MME->>UE: ESM Information Request, if the UE deferred its APN and PCO
+    UE->>MME: ESM Information Response (APN, PCO)
     MME->>HSS: Update Location (subscription: APNs, AMBR, roaming rights)
-    MME->>GW: Create Session (APN, PDN type)
+    MME->>GW: Create Session (APN, PDN type, QoS)
     GW->>MME: Create Session Response (IP address, DNS, P-GW tunnel)
-    MME->>ENB: Initial Context Setup (bearer, security keys) with Attach Accept
-    ENB->>UE: AS Security Mode Command, then RRC Connection Reconfiguration (DRB)
-    Note over UE: Attach Accept: GUTI, tracking area list, timers. Activate Default EPS Bearer: IP, APN, PCO
+    MME->>ENB: Initial Context Setup (bearer, KeNB) carrying Attach Accept
+    ENB->>UE: UE Capability Enquiry, if the MME had none
+    ENB->>UE: AS Security Mode Command, then RRCConnectionReconfiguration (DRB, Attach Accept)
     UE->>MME: Attach Complete + Activate Default EPS Bearer Context Accept
-    Note over UE,GW: IP packets flow. After the inactivity timer, RRC release: idle, still attached, IP kept
+    MME->>GW: Modify Bearer (eNB tunnel endpoint): downlink data can now flow
+    Note over UE,GW: After the inactivity timer, RRC release: idle, still attached, IP session kept
 ```
 
-- With a valid GUTI, the MME may skip authentication or fetch the context from the previous MME; the IMSI is only sent when no GUTI is usable (Identity Request).
-- If the attach request carries no APN, the network uses the subscription's **default APN** from the HSS. If the UE flags that it will send the APN only after security is on, the MME asks for it (ESM Information Request).
-- **Combined attach** (EPS and non-EPS) also registers the UE in the circuit-switched domain for SMS over SGs and CS fallback; "EPS only" in the answer, with cause #18 (CS domain not available), is normal on LTE-only networks.
-- **Detach:** the UE sends a Detach Request when switching off (`AT+CFUN=0` does it cleanly; cutting power doesn't). The network can detach a UE too, with a cause, sometimes asking it to reattach.
+- **Attach Accept** carries the GUTI, the TAI list, timers (T3412 and, if negotiated, PSM and eDRX values, section 15), equivalent PLMNs and network feature support (IMS voice over PS, emergency bearers, CIoT optimizations). The **Activate Default EPS Bearer Context Request** inside it carries the APN, the PDN address, the QoS and the PCO (DNS, MTU).
+- With a valid GUTI and a stored security context, the MME may skip authentication or fetch the context from the previous MME. The IMSI is sent only when no GUTI is usable (Identity Request).
+- If the attach carries no APN, the network uses the subscription's **default APN** from the HSS.
+- **Combined attach** (EPS and non-EPS) also registers the UE in the circuit-switched domain for SMS over SGs and CS fallback. An "EPS only" result with cause #18 (CS domain not available) is normal on LTE-only networks.
+- **Voice-centric vs data-centric UEs** (TS 24.301 annex): a UE configured as voice-centric that gets neither IMS voice nor CS fallback on LTE is required to disable E-UTRA and look for another technology. A data-only IoT device must be data-centric, or it can leave LTE on networks without VoLTE.
+- **Detach:** the UE sends a Detach Request when switching off (`AT+CFUN=0` does it cleanly; cutting power doesn't). The network can detach a UE too, with a cause, and ask it to reattach.
 
-### 5G registration and sessions
+### 5G registration
 
-5G separates the two: **registration** makes the UE known to the AMF, and a **PDU session** is a separate procedure, requested when needed.
+5G separates the two steps: **registration** makes the UE known to the AMF, and a **PDU session** (section 12) is a separate procedure, requested when needed. A registered UE may have no session at all.
 
-| Step | Messages | Notes |
-|---|---|---|
-| Registration | Registration Request (SUCI or 5G-GUTI, requested NSSAI, capabilities) → authentication (5G-AKA or EAP-AKA') → NAS Security Mode → Registration Accept (5G-GUTI, TAI list, allowed NSSAI, timers) → Registration Complete | Registration types: initial, mobility update, periodic, emergency |
-| PDU session | PDU Session Establishment Request (DNN, S-NSSAI, session type) → Accept (IP address, QoS rules, DNS in ePCO) | Section 12 |
+```mermaid
+sequenceDiagram
+    participant UE
+    participant GNB as gNB
+    participant AMF
+    participant AUSF as AUSF and UDM
+    UE->>GNB: RRC setup
+    UE->>AMF: Registration Request (SUCI or 5G-GUTI, requested NSSAI, capabilities, type initial)
+    AMF->>AUSF: Authenticate (SUCI): the UDM decrypts the SUCI to the SUPI
+    AUSF->>AMF: 5G-AKA or EAP-AKA' challenge
+    AMF->>UE: Authentication Request
+    UE->>AMF: Authentication Response
+    AMF->>AUSF: Response, confirmed by the home network
+    AMF->>UE: Security Mode Command (algorithms)
+    UE->>AMF: Security Mode Complete (full Registration Request, PEI if requested)
+    AMF->>AUSF: Registration with the UDM, subscription data
+    AMF->>GNB: Initial Context Setup (keys, capabilities) carrying Registration Accept
+    GNB->>UE: AS Security Mode Command, RRC Reconfiguration (Registration Accept)
+    Note over UE: Registration Accept: 5G-GUTI, TAI list, allowed and rejected NSSAI, timers, network features
+    UE->>AMF: Registration Complete
+```
+
+- **Registration types:** initial, mobility registration update (a new tracking area outside the list, or changed capabilities), periodic registration update (T3512), emergency.
+- Before security is active, the UE sends only a minimal set of "cleartext" information elements; the full Registration Request is sent again inside the Security Mode Complete, protected.
+- The Registration Accept says which **slices** (S-NSSAIs) are allowed and which are rejected, and why (section 17).
+- **Service Request** (both systems) is the procedure that restores the signaling connection and user plane for a UE that is registered but idle (section 14).
 
 ### Tracking areas and periodic updates
 
-Cells are grouped in **tracking areas** (TAC in SIB1). The network gives the UE a **TAI list**: it can move freely among those tracking areas while idle; entering a tracking area outside the list triggers a **tracking area update** (TAU) in LTE, or a mobility registration update in 5G. The TAI list is the area where the network pages the UE (section 14).
+Cells are grouped in **tracking areas** (TAC in SIB1). The network gives the UE a **TAI list**: it moves freely among those tracking areas while idle; entering one outside the list triggers a **tracking area update** (TAU) in LTE or a mobility registration update in 5G. The TAI list is where the network pages the UE (section 14). A large list means fewer updates but more paging load.
 
-The UE also updates **periodically** (T3412 in LTE, T3512 in 5G; 54 minutes by default, longer values with PSM, section 14). A UE that misses its periodic update for long enough (the mobile reachable timer, then the implicit detach timer) is detached by the network without being told. On its next attempt it gets a reject (#10 "implicitly detached" or #9 "UE identity cannot be derived") and must attach again.
+The UE also updates **periodically** (T3412 in LTE, T3512 in 5G; 54 minutes by default, much longer with PSM, section 15). If the network hears nothing for longer than its mobile reachable timer (by default 4 minutes more than the periodic timer) and then its implicit detach timer, it deregisters the UE without telling it. The UE finds out at its next attempt, through a reject (#9 "UE identity cannot be derived by the network" or #10 "implicitly detached"), and attaches again.
 
 ### Reject causes
 
-NAS rejects carry a cause (EMM causes in TS 24.301, 5GMM causes in TS 24.501, mostly the same numbers). The cause decides what the UE does next, which matters more than the message itself for an unattended device:
+NAS rejects carry a cause (EMM causes in TS 24.301 annex A, 5GMM causes in TS 24.501 annex A, mostly the same numbers). The cause decides what the UE does next, which matters more than the rejection itself for an unattended device:
 
 | Cause | Meaning | What the UE does (simplified) | Usual reason |
 |---|---|---|---|
-| #3 Illegal UE, #6 Illegal ME | Authentication or identity check failed | Considers the USIM **invalid** until power off or SIM removal | Wrong SIM credentials, blocked IMEI |
-| #7 EPS services not allowed (5G: 5GS services not allowed) | Subscription has no LTE (5G) data | USIM invalid for that service until power off | Subscription or provisioning error, 2G/3G-only plan |
+| #3 Illegal UE, #6 Illegal ME | Authentication failed, or the IMEI isn't accepted | Considers the USIM **invalid** for all services until power off or SIM removal | Wrong credentials, blocked or unbound IMEI |
+| #7 EPS services not allowed (5G: 5GS services not allowed) | No LTE (5G) data in the subscription | USIM invalid for that system until power off | Provisioning error, plan without LTE or 5G |
 | #8 EPS and non-EPS services not allowed | No service at all | USIM invalid until power off | Suspended or deactivated SIM |
 | #9, #10 | UE identity can't be derived / implicitly detached | Attaches again with a new identity | Network lost the context, missed periodic updates |
-| #11 PLMN not allowed | No rights on this network | Adds the PLMN to the **forbidden list on the SIM** and searches another | Roaming not allowed with this operator |
-| #12 Tracking area not allowed | Regional restriction | Forbids the tracking area (until power off or a timeout) | Regional subscription |
-| #13 Roaming not allowed in this tracking area | | Forbids the tracking area for roaming, looks for another PLMN | Roaming steering, regional roaming |
-| #14 EPS services not allowed in this PLMN | | Forbids the PLMN for data | No data roaming agreement on LTE |
-| #15 No suitable cells in tracking area | | Searches another tracking area in the same PLMN | E.g. a technology not allowed for this subscription (LTE-M vs NB-IoT) |
-| #17 Network failure | Core-side failure | Retries with back-off | Core problem, or deliberate roaming steering |
-| #19 ESM failure | Attach failed because the default bearer failed | Retries; look at the ESM cause (section 12) | Wrong or missing APN |
-| #22 Congestion | Overload | Waits for the back-off timer the network gives (T3346) | Network overload, often after an outage |
-| 5GMM #62 No network slices available | Requested slices not allowed | Waits, retries with other NSSAI | Slice not provisioned |
+| #11 PLMN not allowed | No rights on this network | Adds the PLMN to the **forbidden list on the USIM**, selects another | Roaming not allowed with this operator |
+| #12 Tracking area not allowed | Regional restriction | Forbids the tracking area until power off or a timeout (12-24 h) | Regional subscription |
+| #13 Roaming not allowed in this tracking area | | Forbids the tracking area for roaming, selects another PLMN | Regional roaming limits, steering of roaming |
+| #14 EPS services not allowed in this PLMN | | Adds the PLMN to a forbidden list for data (kept in the modem) | No LTE data roaming agreement |
+| #15 No suitable cells in tracking area | | Forbids the tracking area for roaming, searches another tracking area of the same PLMN | E.g. a technology not allowed for this subscription (LTE-M or NB-IoT) |
+| #17 Network failure | Core-side failure | Retries with back-off | Core problem, or deliberate steering of roaming |
+| #19 ESM failure | The attach failed because the default bearer failed | Retries; the real cause is the ESM cause (section 12) | Wrong or missing APN |
+| #22 Congestion | Overload | Waits for the back-off timer given by the network (T3346) | Network overload, often after an outage |
+| #31 Redirection to 5GCN required | | Registers on 5G instead | Operator policy |
+| 5GMM #27 N1 mode not allowed | 5G not allowed | Disables 5G NAS for this PLMN, uses LTE | Subscription without 5G SA |
+| 5GMM #62 No network slices available | Requested slices not allowed | Waits, retries with other slices | Slice not in the subscription or not in this area |
 
-- **Some rejects persist:** #3, #6, #7 and #8 make the modem stop trying until it's power-cycled or the SIM is reinserted, and #11 writes to the SIM's forbidden list, which survives reboots and moves with the card. An unattended device needs a recovery plan: power-cycle the modem after a long outage, clear the forbidden list (rewrite EF_FPLMN, section 17) once the cause is fixed.
-- **Retry timers:** after a failed attach the UE waits T3411 (10 s) and retries; after 5 failures it waits **T3402** (12 minutes by default, or what the network says) before starting over. 5G uses T3511 and T3502 the same way. "The device takes 12 minutes to come back" is this timer.
-- **Don't fight the network:** a fleet of devices that reset their modem and reattach in a loop after an outage creates a signaling storm. GSMA TS.34 (IoT device connection efficiency) asks devices to back off with random delays, avoid synchronized reconnections, and not reset the modem as a first resort.
+- **Some rejects persist:** #3, #6, #7 and #8 make the modem stop trying until it's power-cycled or the SIM is reinserted, and #11 writes to the USIM's forbidden list, which survives reboots and moves with the card. An unattended device needs a recovery plan: power-cycle the modem after a long outage, clear the forbidden list (section 18) once the cause is fixed. Unauthenticated rejects from a fake base station have the same effect (section 13), which is why recent releases let the UE treat rejects received before security more cautiously.
+- **Retry timers:** after a failed attach or registration the UE waits T3411 (10 s) and retries; after 5 failures it waits **T3402** (12 minutes by default, or a value sent by the network) before starting over. 5G uses T3511 and T3502 the same way. "The device takes 12 minutes to come back" is this timer.
+- **Don't fight the network:** a fleet of devices that reset their modems and reattach in a loop after an outage creates a signaling storm. GSMA TS.34 (IoT device connection efficiency) asks devices to back off with randomized delays, avoid synchronized reconnections, and not reset the modem as a first resort.
 
 ---
 
@@ -1071,84 +1114,123 @@ NAS rejects carry a cause (EMM causes in TS 24.301, 5GMM causes in TS 24.501, mo
 
 ### APN and DNN
 
-The **APN** (LTE) or **DNN** (5G) names the packet data network a session connects to: `internet`, an operator's IMS network (`ims`), a private network (`mgmt.example`). The network completes it with an operator identifier (`mgmt.example.mnc001.mcc001.gprs`), resolves that name in its own DNS to find the gateway, and checks it against the subscription.
+The **APN** (LTE) or **DNN** (5G) names the packet data network a session connects to: `internet`, an operator's IMS network (`ims`), a private network (`mgmt.example`). The network completes it with an operator identifier (`mgmt.example.mnc001.mcc001.gprs`), resolves that name in its own DNS to select the gateway (P-GW or SMF/UPF), and checks it against the subscription.
 
 | APN problem | What you see |
 |---|---|
-| Unknown APN, or not in the subscription | Attach or session rejected with ESM #27 "missing or unknown APN" (attach fails with EMM #19) |
-| Valid APN, wrong network (a private APN instead of the internet one) | Session up, IP address assigned, but nothing reachable |
-| Private APN expecting credentials | Rejected with #29 "user authentication failed" until PAP or CHAP credentials are set (sent in PCO, checked by RADIUS behind the gateway) |
+| Unknown APN, or not in the subscription | Session rejected with ESM #27 / 5GSM #27 "missing or unknown APN/DNN"; in LTE the whole attach fails with EMM #19 |
+| Valid APN, wrong network (a private APN instead of the internet one) | Session up, IP address assigned, nothing reachable |
+| Private APN expecting credentials | Rejected with #29 "user authentication failed" until PAP or CHAP credentials are set (sent in the PCO, checked by a RADIUS server behind the gateway) |
 | Attach APN differs from the data APN | Works on some networks, rejected on others: the attach (initial bearer) APN is a separate setting in most modems |
 
-Many networks accept any APN or an empty one for the internet, but a product shouldn't rely on it: configure the APN the operator documents.
+Many networks accept an empty APN for the internet, but a product shouldn't rely on it: configure the APN the operator documents.
 
 ### PDN and PDU session types
 
 | Type | Gives | Notes |
 |---|---|---|
-| IPv4 | One IPv4 address | Usually behind CGNAT (`100.64.0.0/10`, or private ranges) |
+| IPv4 | One IPv4 address | Usually behind CGNAT (`100.64.0.0/10` or private ranges) |
 | IPv6 | A /64 prefix | Common on modern mobile APNs, with NAT64/DNS64 for IPv4 destinations |
-| IPv4v6 | Both in one session | The best request: the network gives what the subscription allows. If it allows only one, it says so (ESM #50 "IPv4 only allowed", #51 "IPv6 only allowed") |
-| Non-IP | Opaque data units | CIoT (section 15): delivered through the SCEF/NEF or a tunnel to an application server |
-| Ethernet, unstructured | Ethernet frames, opaque data | 5G only: industrial LANs, 5G LAN services |
+| IPv4v6 | Both in one session | The best request: the network gives what the subscription allows, and says so when it allows only one (#50 "IPv4 only allowed", #51 "IPv6 only allowed") |
+| Non-IP / Unstructured | Opaque data units | CIoT (section 16): delivered through the SCEF/NEF or a tunnel to an application server |
+| Ethernet | Ethernet frames | 5G only: industrial LANs, 5G LAN services |
 
-### Bearers and QoS in LTE
+### QoS in LTE: bearers
 
-A **PDN connection** has one **default bearer**, created with it and kept as long as the connection exists, plus optional **dedicated bearers** created by the network for traffic that needs different QoS (VoLTE voice). Each EPS bearer maps to one radio bearer and one GTP tunnel.
+A **PDN connection** has one **default bearer**, created with it and kept as long as the connection exists, plus optional **dedicated bearers** created by the network for traffic that needs different QoS (VoLTE voice). Each EPS bearer maps one-to-one to a DRB on the radio and a GTP tunnel in the core, and is identified by an EPS bearer ID (5 to 15: at most 11 bearers per UE).
 
-- **Traffic flow templates** (TFT): packet filters (addresses, ports, protocol) that decide which bearer a packet uses. The network installs them on both ends; packets that match no filter use the default bearer.
-- **QCI** (QoS class identifier, TS 23.203) gives each bearer a priority, delay budget and loss target:
+- **Traffic flow templates** (TFT): packet filters (addresses, ports, protocol, DSCP) that decide which bearer a packet uses. The network installs them in the UE (uplink) and the gateway (downlink); packets that match no filter use the default bearer.
+- **Dedicated bearers are network-initiated** in practice: the IMS (or another application function) asks the PCRF for resources, the PCRF installs rules in the P-GW, and the P-GW triggers bearer creation towards the UE (Activate Dedicated EPS Bearer Context Request).
+
+Each bearer has:
+
+| Parameter | Meaning |
+|---|---|
+| **QCI** (QoS class identifier, TS 23.203) | Priority, packet delay budget and loss target, which the scheduler uses |
+| **ARP** (allocation and retention priority) | Who wins when resources are short: priority level, whether the bearer can pre-empt others and be pre-empted. Admission control, not scheduling |
+| **GBR / MBR** | Guaranteed and maximum bit rates, for GBR bearers only |
+| **APN-AMBR, UE-AMBR** | Aggregate maximum bit rate of all non-GBR bearers, per APN and per UE: the "speed limit" of a data plan, enforced by the gateway and the base station |
 
 | QCI | Type | Delay budget | Loss | Example |
 |---|---|---|---|---|
 | 1 | GBR | 100 ms | 10<sup>-2</sup> | VoLTE voice |
 | 2 | GBR | 150 ms | 10<sup>-3</sup> | Video calls |
 | 5 | Non-GBR | 100 ms | 10<sup>-6</sup> | IMS signaling (default bearer of the IMS APN) |
-| 6, 8, 9 | Non-GBR | 300 ms | 10<sup>-6</sup> | TCP traffic; **9 is the usual default bearer** for internet APNs |
+| 6, 8, 9 | Non-GBR | 300 ms | 10<sup>-6</sup> | TCP traffic; **9 is the usual default bearer** of internet APNs |
 | 7 | Non-GBR | 100 ms | 10<sup>-3</sup> | Interactive video, gaming |
+| 65, 66, 69, 70 | Mixed | | | Mission-critical push-to-talk and data |
 
-- **GBR** (guaranteed bit rate) bearers reserve capacity; non-GBR bearers share what's left.
-- **AMBR** (aggregate maximum bit rate): the subscription's cap on all non-GBR traffic, per APN and per UE. The "speed limit" of an IoT data plan is usually an AMBR enforced by the gateway, not a radio limitation.
+### QoS in 5G: PDU sessions and QoS flows
 
-### PDU sessions and QoS flows in 5G
+A **PDU session** (identified by a PDU session ID, up to 15 per UE) connects to one DNN in one slice (S-NSSAI). QoS is finer-grained than bearers: within the session, packets are classified into **QoS flows**, each identified by a **QFI** and described by a **5QI**, an ARP and, for GBR flows, GFBR/MFBR.
 
-A 5G **PDU session** (identified by a PDU session ID, up to 15 per UE) connects to a DNN in a slice (S-NSSAI, section 16). QoS is finer than bearers: packets are classified into **QoS flows** (marked with a QFI), with **5QI** values that reuse the QCI numbering for standard classes (5QI 9 for default internet traffic, 5QI 1 for voice). The gNB's SDAP layer maps QoS flows onto radio bearers as it sees fit.
+| Element | Role |
+|---|---|
+| **QoS rules** (in the UE) | Packet filters mapping uplink packets to a QFI, sent by the SMF; one is the default rule |
+| **PDRs** (in the UPF) | The same for downlink packets, installed by the SMF over N4 |
+| **5QI** | Standardized values reuse the QCI numbers (1 for voice, 5 for IMS signaling, 9 for default traffic) and add **delay-critical GBR** classes (82-90) with a maximum data burst volume, for URLLC |
+| **Session-AMBR, UE-AMBR** | Aggregate limits, as in LTE |
+| **Reflective QoS** | The UE derives uplink rules from the QFI marked on downlink packets, so the network doesn't have to send explicit rules for each flow |
 
-The **SSC mode** (session and service continuity) says what happens when the UE moves far from its gateway: mode 1 keeps the same anchor and IP address (the usual mode, and LTE's behavior), mode 2 releases the session and creates a new one (new address), mode 3 creates the new session before releasing the old one.
+The gNB's SDAP layer maps QoS flows onto DRBs **as it chooses**: several flows can share a DRB, which decouples the core's QoS model from radio bearer management. That's the main structural difference from LTE, where bearer = DRB = tunnel.
+
+```mermaid
+sequenceDiagram
+    participant UE
+    participant GNB as gNB
+    participant AMF
+    participant SMF
+    participant UPF
+    UE->>AMF: UL NAS Transport: PDU Session Establishment Request (PDU session ID, DNN, S-NSSAI, type, SSC mode)
+    AMF->>SMF: Create SM context
+    Note over SMF: Subscription check (UDM), policy (PCF), UPF selection, IP allocation
+    SMF->>UPF: PFCP Session Establishment (packet detection, forwarding, QoS rules)
+    SMF->>AMF: N1 message (Accept for the UE) + N2 resources (QoS flows for the gNB)
+    AMF->>GNB: PDU Session Resource Setup Request (N2 info, NAS Accept)
+    GNB->>UE: RRC Reconfiguration: DRBs, SDAP mapping, PDU Session Establishment Accept
+    Note over UE: Accept: IP address or prefix, QoS rules, session-AMBR, DNS and MTU in ePCO
+    GNB->>AMF: Resource Setup Response (gNB tunnel endpoint)
+    AMF->>SMF: Update SM context
+    SMF->>UPF: PFCP Session Modification: downlink tunnel to the gNB
+```
+
+The **SSC mode** (session and service continuity) says what happens when the UE moves far from its anchor UPF: mode 1 keeps the same anchor and IP address (the usual mode, and LTE's behavior), mode 2 releases the session and creates a new one (new address), mode 3 creates the new session before releasing the old one.
 
 ### IP configuration
 
 | Item | How it reaches the UE |
 |---|---|
-| IPv4 address | In the NAS session accept (PDN address). DHCPv4 after the session is set up exists but is rare |
-| IPv6 | The network gives a 64-bit **interface identifier** in NAS, for the link-local address only. The UE sends a Router Solicitation over the session, and the gateway answers with a Router Advertisement carrying a **/64 prefix dedicated to this session**. The UE forms its global addresses with any interface identifier it likes (privacy addresses work) |
-| DNS servers | In the **PCO** (protocol configuration options, ePCO in 5G and NB-IoT): a container in the NAS messages, requested by the UE |
-| MTU | IPv4 link MTU in the PCO (since Rel-10, if the UE asks); IPv6 MTU in the Router Advertisement |
-| P-CSCF addresses | In the PCO, for IMS (section 16) |
+| IPv4 address | In the NAS session accept (PDN address / PDU address). Deferred allocation over DHCPv4 after the session exists is specified but rare |
+| IPv6 | The network gives a 64-bit **interface identifier** in NAS, for the link-local address only. The UE sends a Router Solicitation over the session, and the gateway answers with a Router Advertisement carrying a **/64 prefix dedicated to this session** (RFC 6459). The UE forms its global addresses with any interface identifier (privacy addresses work) |
+| DNS servers | In the **PCO** (protocol configuration options, ePCO in 5G and NB-IoT): a container in the NAS messages, filled when the UE requests the items |
+| MTU | IPv4 link MTU in the PCO (since Rel-10, if the UE asks); IPv6 MTU in the Router Advertisement; non-IP MTU in the PCO |
+| P-CSCF addresses | In the PCO, for IMS (section 17) |
 
-- The whole /64 belongs to the UE: the gateway routes it over the point-to-point session, and the device can share it with devices behind it ([fundamentals note, section 21](../../networking/fundamentals/fundamentals.md#f-ipv6-for-the-pc), RFC 7278). Prefix delegation of shorter prefixes exists (Rel-10) but few mobile networks offer it.
-- **MTU:** operators commonly advertise 1500 or something between about 1400 and 1460 (operator-dependent): the GTP encapsulation (section 9) and transport tunnels have to fit somewhere. A host that ignores the advertised MTU sees the classic symptoms of path MTU black holes (see the [fundamentals note](../../networking/fundamentals/fundamentals.md#11-icmp-mtu-and-fragmentation)).
-- **IPv6-only APNs** reach IPv4 servers through NAT64 and DNS64 in the network, and IPv4-only applications through a CLAT on the device (464XLAT).
-- The modem knows all these values; the host must apply them. That split, and how Linux handles it, is in the [fundamentals note](../../networking/fundamentals/fundamentals.md#control-plane-and-data-plane).
+- The whole /64 belongs to the UE: the gateway routes it over the point-to-point session, and the device can share it with hosts behind it ([fundamentals note, section 21](../../networking/fundamentals/fundamentals.md#f-ipv6-for-the-pc), RFC 7278). Prefix delegation of shorter prefixes exists (Rel-10) but few mobile networks offer it.
+- **MTU:** operators commonly advertise 1500 or something between about 1400 and 1460 (operator-dependent), to leave room for GTP and transport tunnels (section 4). A host that ignores the advertised MTU sees the classic path MTU black holes (see the [fundamentals note](../../networking/fundamentals/fundamentals.md#11-icmp-mtu-and-fragmentation)).
+- **IPv6-only APNs** reach IPv4 servers through NAT64/DNS64 in the network, and IPv4-only applications need a CLAT on the device (464XLAT, RFC 6877).
+- The modem learns all these values from NAS; the host must apply them. That split is in the [fundamentals note](../../networking/fundamentals/fundamentals.md#control-plane-and-data-plane).
 
 ### Session lifetime
 
-- **The session survives idle mode.** Going from RRC connected to idle releases the radio resources, not the PDN connection or the IP address. The next packet triggers a **service request** that restores the radio bearers in tens of ms (section 14).
-- The network can deactivate a session or a bearer with a cause: #36 "regular deactivation", #39 "reactivation requested" (reconnect: a new address follows), #8 "operator determined barring". Some operators also release sessions that stay idle for many hours (operator-dependent).
-- A gateway failure or maintenance drops sessions; the UE learns it at its next use, or from a network-initiated detach.
+- **The session survives idle mode.** Releasing the RRC connection releases radio resources and the base station's tunnels, not the PDN connection or the IP address. The next packet triggers a **service request**, which restores the DRBs and tunnels in tens of ms (section 14).
+- The network can modify a session (new QoS, new TFT) or deactivate it with a cause: #36 "regular deactivation", #39 "reactivation requested" (reconnect; a new address may follow), #8 "operator determined barring". Some operators also release sessions idle for many hours (operator-dependent).
+- A gateway failure drops sessions; the UE learns it when it next uses the session or from a network-initiated detach or release.
 
 ### ESM and 5GSM causes
 
 | Cause | Meaning | Usual reason |
 |---|---|---|
-| #26 Insufficient resources | Network can't create the session now | Overload; retry with back-off |
-| #27 Missing or unknown APN | | Wrong APN, or not in the subscription |
-| #28 Unknown PDN type | | Requested a type the network doesn't support |
+| #26 Insufficient resources | | Overload; retry with back-off |
+| #27 Missing or unknown APN / DNN | | Wrong APN, or not in the subscription |
+| #28 Unknown PDN / PDU session type | | Type not supported by the network |
 | #29 User authentication failed | | Private APN credentials wrong or missing |
-| #30, #31 Request rejected by the gateway / unspecified | | Gateway policy, subscription, IP pool exhausted |
+| #30, #31 Request rejected by the gateway / unspecified | | Gateway policy, subscription, address pool exhausted |
 | #32, #33 Service option not supported / not subscribed | | Feature or APN not in the plan |
 | #50, #51 PDN type IPv4 only / IPv6 only allowed | Not an error: the session came up with one family | IPv4v6 requested, subscription allows one |
 | #55 Multiple PDN connections for a given APN not allowed | | A second session on the same APN |
+| 5GSM #54 PDU session does not exist | | Stale session state after a network event |
+| 5GSM #69 Insufficient resources for specific slice | | Slice overload |
 
 ### Roaming
 
@@ -1160,7 +1242,7 @@ The **SSC mode** (session and service continuity) says what happens when the UE 
 | Used for | Almost all data roaming, most IoT SIMs | IMS voice, some IoT and enterprise offers |
 
 - Global IoT SIMs are often **permanently roaming**: an IMSI from one country used everywhere, home-routed. Some countries and operators restrict permanent roaming, and LTE-M and NB-IoT roaming agreements are less complete than LTE ones: check each target market.
-- **Steering of roaming:** the home network prefers some partners and can reject attaches on others (often with #17 or #13) until the device tries a preferred one. In a log it looks like a string of rejects in a new country before a successful attach. 5G standardizes steering through the UDM instead.
+- **Steering of roaming:** the home network prefers some partners and can reject attaches on others (often with #17 or #13) until the device tries a preferred one. In a log it looks like a series of rejects in a new country before a successful attach. 5G standardizes steering through the UDM (a list of preferred PLMNs delivered at registration) instead.
 
 ---
 

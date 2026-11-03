@@ -1252,18 +1252,24 @@ The **SSC mode** (session and service continuity) says what happens when the UE 
 
 Both sides share the USIM's secret key K; nothing secret crosses the air:
 
-1. The home network (HSS/AuC, or UDM in 5G) picks a random **RAND** and computes, from K and a sequence number **SQN**: the expected response **XRES**, an authentication token **AUTN** (SQN masked, plus a MAC), and session keys.
-2. The network sends RAND and AUTN. The USIM checks the MAC (the network knows K: this is **mutual authentication**, which 2G lacked) and that SQN is fresh (no replay), then computes **RES**.
-3. The network compares RES with XRES. Both sides now share a key nobody else can compute: K<sub>ASME</sub> in LTE, K<sub>AUSF</sub> then K<sub>AMF</sub> in 5G.
+1. The home network (HSS/AuC in LTE, UDM/ARPF in 5G) picks a random **RAND** and computes, from K and a sequence number **SQN**: the expected response **XRES**, an authentication token **AUTN** (SQN masked by an anonymity key, a management field and a MAC), and the keys CK and IK.
+2. The serving network sends RAND and AUTN. The USIM checks the MAC (the network knows K: this is **mutual authentication**, which 2G lacked) and that SQN is in the accepted range (no replay), then computes **RES**.
+3. The network compares RES with XRES. Both sides now derive a key nobody else can compute: K<sub>ASME</sub> in LTE; K<sub>AUSF</sub>, then K<sub>SEAF</sub> and K<sub>AMF</sub> in 5G.
 
 | Variant | Where | Notes |
 |---|---|---|
-| EPS-AKA | LTE | The serving network (MME) checks RES |
-| 5G-AKA | 5G | The **home** network confirms the result too, so a visited network can't claim an authentication that didn't happen |
-| EAP-AKA' | 5G | The same exchange carried in EAP; also used for Wi-Fi access to the core |
+| EPS-AKA | LTE | The serving network (MME) checks RES against XRES from the HSS |
+| 5G-AKA | 5G | The **home** network (AUSF) also confirms the result, so a visited network can't claim an authentication that didn't happen |
+| EAP-AKA' | 5G | The same exchange carried in EAP; also used for non-3GPP access to the core |
 | EAP-TLS and other EAP methods | 5G private networks | Certificate-based access without a USIM key |
 
-**Authentication failures** reported by the UE: **MAC failure** (#20: the network doesn't know the right K, a fake or misconfigured network, or the wrong SIM profile), **synch failure** (#21: the sequence numbers drifted, the UE sends resynchronization data and the network retries; occasional ones are normal), **non-EPS authentication unacceptable** (#26).
+**Authentication failures** reported by the UE in an Authentication Failure message: **MAC failure** (#20: the network failed to prove it knows K: a fake or misconfigured network, or the wrong SIM profile), **synch failure** (#21: the sequence numbers drifted; the UE sends resynchronization data and the network retries, which is normal now and then), **non-EPS authentication unacceptable** (#26: the vector wasn't generated for LTE).
+
+### NAS and AS security contexts
+
+- A successful authentication creates a **NAS security context**, identified by a key set identifier (eKSI in LTE, ngKSI in 5G). It is reused across connections, and stored in the USIM or the modem when the UE switches off, so a later attach or registration can skip authentication.
+- **NAS security** is activated by the MME/AMF with a **Security Mode Command** (chosen algorithms, the UE's own security capabilities echoed back to detect bidding-down attacks). **AS security** is activated separately by the base station with its own Security Mode Command, once per RRC connection.
+- Every protected message carries a sequence number; PDCP and NAS **COUNT** values feed ciphering and integrity, and protect against replay.
 
 ### Key hierarchy
 
@@ -1280,39 +1286,39 @@ flowchart TB
     kenb --> upint["KUPint: user data integrity (NR, optional)"]
 ```
 
-- NAS security is set up by the MME/AMF (NAS Security Mode Command), AS security by the base station (AS Security Mode Command), both during the attach or registration (section 11).
-- K<sub>eNB</sub> changes at every handover (derived forward, so a compromised base station doesn't expose the previous or next cells' keys) and at every new connection.
+**Keys at handover:** the base station key changes at every handover. A **horizontal** derivation (from the current K<sub>eNB</sub>/K<sub>gNB</sub>) gives backward security: the target can't compute the keys used before. A **vertical** derivation from the **next hop** parameter (NH), which the core provides for later handovers, gives forward security: after two hops, the old base station can no longer compute the new keys. The NH chaining counter (NCC) in the handover command tells the UE which derivation to use.
 
 ### Algorithms
 
-| LTE | NR | Algorithm | Use |
+| LTE | NR | Algorithm | Notes |
 |---|---|---|---|
-| EEA0, EIA0 | NEA0, NIA0 | Null | No ciphering. Null integrity is only allowed for emergency calls without a valid SIM |
-| EEA1, EIA1 | NEA1, NIA1 | SNOW 3G | |
+| EEA0, EIA0 | NEA0, NIA0 | Null | No ciphering is allowed by the standard. Null integrity only for emergency calls without authentication |
+| EEA1, EIA1 | NEA1, NIA1 | SNOW 3G | 128-bit |
 | EEA2, EIA2 | NEA2, NIA2 | AES-128 (CTR, CMAC) | The usual choice |
 | EEA3, EIA3 | NEA3, NIA3 | ZUC | Mainly China |
+| | NEA4-6, NIA4-6 | SNOW 5G, AES-256, ZUC-256 | 256-bit algorithms, Rel-19; adoption will take years |
 
-All use 128-bit keys; 256-bit algorithms are being added in recent releases. The network chooses among the algorithms the UE declares. **Ciphering with EEA0 is allowed by the standard** and some networks have used it; a modem's log shows the algorithm selected in the Security Mode Command.
+The network chooses among the algorithms the UE declares. Some networks have used **no ciphering** (EEA0); a modem log shows the selected algorithms in the Security Mode Command.
 
 ### What is protected, and where
 
 | | Protected | Not protected |
 |---|---|---|
-| Broadcast: MIB, SIBs, paging | | Anyone can transmit them: they're not authenticated |
-| Before security activation: RRC connection request, attach or registration request, identity request, some rejects | | Visible and forgeable |
+| Broadcast: MIB, SIBs, paging | | Anyone can transmit them: not authenticated |
+| Before security activation: RRC connection setup, Attach/Registration Request (in 5G, only cleartext IEs), Identity Request, Authentication messages, rejects | | Visible, and forgeable by a fake base station |
 | NAS after Security Mode | Ciphered and integrity-protected | |
 | RRC after AS Security Mode | Ciphered and integrity-protected | |
-| User data on the radio | Ciphered | **LTE: no integrity protection.** NR: integrity possible but optional, rarely enabled |
+| User data on the radio | Ciphered (PDCP) | **LTE: no integrity protection.** NR: integrity protection specified per DRB but optional and rarely enabled; Rel-15 devices may only support it at low rates |
 | User data beyond the base station | | Cellular security **ends at the eNB/gNB**. Backhaul may be IPsec (operator choice); inside the core, packets are plaintext in GTP tunnels |
 
 ### Known attacks
 
-- **Fake base stations ("IMSI catchers"):** a transmitter that broadcasts a stronger cell of the target's PLMN. Before security, it can ask for the IMSI (LTE sends it in clear when asked), page, or send **unauthenticated rejects**. A reject with #7 or #8 makes many UEs consider their USIM invalid until reboot (section 11): an easy denial of service against unattended devices.
-- **2G downgrade:** GSM authenticates only the device, not the network, and its A5/1 cipher is broken (A5/0 is none). A fake GSM cell plus jamming of LTE makes a device fall back and talk to the attacker. Disabling 2G (and 3G) in the modem's allowed modes, where the product doesn't need them, closes it.
-- **No user-plane integrity in LTE:** ciphertext can be modified in transit without detection. Research attacks (aLTEr, 2019) used this to redirect DNS answers. NR's optional integrity protection addresses it when enabled.
-- **Unauthenticated broadcasts:** public warning messages (SIB12) and system information can be spoofed. Rel-15+ work on protecting system information is limited in deployment.
-- **5G improvements:** SUCI hides the permanent identity, home-network confirmation of authentication, optional user-plane integrity, better key separation. Messages before security are still unprotected, so fake base stations remain a problem.
-- **Baseband vulnerabilities:** modem firmware parses complex messages from anyone in range before authentication. Exploitable bugs have been published for every major vendor's basebands: keep modem firmware updated, and treat the modem as an untrusted peripheral.
+- **Fake base stations ("IMSI catchers"):** a transmitter that broadcasts a stronger cell of the target's PLMN. Before security, it can ask for the IMSI (LTE sends it in clear when asked), page, or send **unauthenticated rejects**. A reject with #7 or #8 makes many UEs consider their USIM invalid until reboot (section 11): an easy denial of service against unattended devices. Recent releases make UEs handle unprotected rejects more cautiously (counters and timers before acting), but deployed behavior varies.
+- **2G downgrade:** GSM authenticates only the device and its A5/1 cipher is broken (A5/0 is none). A fake GSM cell plus jamming of LTE makes a device fall back and talk to the attacker. Disabling 2G (and 3G) in the modem's allowed technologies where the product doesn't need them closes it.
+- **No user-plane integrity in LTE:** ciphertext can be modified in transit without detection; the aLTEr research attack (2019) used it to redirect DNS answers. NR's optional integrity protection addresses it when enabled.
+- **Unauthenticated broadcasts:** public warning messages and system information can be spoofed.
+- **5G improvements:** SUCI hides the permanent identity, the home network confirms authentication, user-plane integrity is possible, key separation is better. Messages before security are still unprotected, so fake base stations remain a problem.
+- **Baseband vulnerabilities:** modem firmware parses complex messages from anyone in range before any authentication. Exploitable bugs have been published for every major vendor's basebands: keep modem firmware updated and treat the modem as an untrusted peripheral.
 
 ### What it means for a device
 
@@ -1323,72 +1329,159 @@ All use 128-bit keys; 256-bit algorithms are being added in recent releases. The
 
 ---
 
-## 14. Mobility and power saving: RRC states, paging, handover, DRX, PSM
+## 14. RRC states and mobility: paging, reselection, handover, 4G-5G interworking
 
-### States
+### RRC states
 
-The UE has a NAS state (registered with the core or not) and an RRC state (connection to the base station or not):
-
-| State | Where the network knows the UE | Who decides mobility | Data | Battery |
+| State | Where the network knows the UE | Who decides mobility | To send data | UE context |
 |---|---|---|---|---|
-| **RRC connected** | Cell | Network (handover) | Immediately (with a grant) | Highest |
-| **RRC inactive** (NR, and LTE-M/NB-IoT suspend) | RAN notification area | UE (reselection) | After a quick resume: context kept in the UE and the RAN | Low |
-| **RRC idle** | Tracking area list (core) | UE (reselection) | After paging or a service request: new RRC connection, context restored from the core | Low |
-| **PSM** | Registered, but unreachable | | Only when the UE wakes up | Close to off |
-| **Deregistered** | Not at all | | Attach first | Off |
+| **RRC_CONNECTED** | Cell (and beam, in NR) | Network: handover | Immediately, with a grant | In the RAN and the core |
+| **RRC_INACTIVE** (NR; LTE connected to a 5GC) | RAN notification area (RNA): one or more cells or tracking areas | UE: reselection | After a resume: one round trip | Stored in the last serving gNB (anchor) and the UE; the core still sees CM-CONNECTED |
+| **RRC_IDLE** | Tracking area list (core) | UE: reselection | After paging or a service request: new RRC connection, context restored from the core | Core only |
 
 ```mermaid
 flowchart LR
-    dereg["Deregistered"] -->|"attach / registration"| conn["RRC connected"]
-    conn -->|"inactivity timer: RRC release"| idle["RRC idle"]
-    idle -->|"uplink data, or paging: service request"| conn
-    conn -->|"release with suspend (NR, CIoT)"| inact["RRC inactive"]
-    inact -->|"resume"| conn
-    inact -->|"resume fails, or core decides"| idle
-    idle -->|"active timer T3324 expires"| psm["PSM"]
-    psm -->|"uplink data, or periodic update T3412"| conn
-    conn -->|"detach"| dereg
+    idle["RRC_IDLE"] -->|"RRCSetupRequest / RRCConnectionRequest<br/>+ service request or registration"| conn["RRC_CONNECTED"]
+    conn -->|"RRCRelease / RRCConnectionRelease<br/>(inactivity timer)"| idle
+    conn -->|"RRCRelease with suspendConfig"| inact["RRC_INACTIVE"]
+    inact -->|"RRCResumeRequest, RRCResume"| conn
+    inact -->|"resume rejected or context lost:<br/>RRCSetup or release"| idle
+    conn -->|"radio link failure,<br/>re-establishment fails"| idle
 ```
 
-- **Inactivity timer:** after the last packet, the base station keeps the UE connected for a while (operator-dependent, often 5 to 20 s), then releases it to idle. Every transmission after a quiet period therefore costs a connection setup (latency, section 7) and a "tail" of connected time (energy). Many small transmissions spread out cost far more than the same bytes in one burst.
-- The **IP session stays up in idle and inactive** (section 12): only the radio connection comes and goes.
+- **Inactivity timer:** after the last packet, the base station keeps the UE connected for a while (operator-dependent, often 5 to 20 s), then releases it. Every transmission after a quiet period therefore costs a connection setup (latency, section 8) and a "tail" of connected time (energy, section 15). Many small transmissions spread out cost far more than the same bytes in one burst.
+- **RRC_INACTIVE** keeps the AS context (security, bearer configuration) in the UE and its anchor gNB. The release message gives the UE an **I-RNTI** and an RNA. To transmit, or when paged, the UE sends `RRCResumeRequest` with its I-RNTI, possibly to a different gNB, which fetches the context from the anchor over Xn. Leaving the RNA triggers an **RNA update** (a resume with cause `rna-Update`, usually answered by a new release). Rel-17 **small data transmission** (SDT) sends small uplink packets during the resume procedure without entering RRC_CONNECTED.
+- LTE has an older relative for IoT: **RRC suspend/resume** (user plane CIoT optimization, Rel-13, section 16).
+- **The IP session stays up in idle and inactive** (section 12): only radio resources come and go.
 
-### Paging and DRX
+### Paging and service request
 
-**Downlink to an idle UE:** the gateway buffers the packet, the MME (AMF) asks every base station of the UE's tracking area list to **page** it, and the UE answers with a service request. A UE in idle only listens for paging at its **paging occasions**: one subframe per **DRX cycle**, at a position derived from its identity.
+Downlink data for an idle UE waits at the gateway, which tells the core; the core pages the UE in every cell of its TAI list, and the UE reconnects:
 
-| Mode | Cycle | Effect |
-|---|---|---|
-| Idle DRX (LTE, NR) | 0.32, 0.64, 1.28 or 2.56 s (1.28 s is common) | Downlink latency to an idle device: up to one cycle, plus connection setup |
-| Connected DRX (C-DRX) | Tens to hundreds of ms, with on-durations and an inactivity timer | Saves energy while connected, adds latency to downlink data |
-| eDRX in idle | LTE-M: up to 2621.44 s (43.7 min); NB-IoT: up to 10485.76 s (2.9 h); NR (RedCap, Rel-17): up to 10485.76 s | Paging only during a **paging time window** once per cycle: unreachable in between |
+```mermaid
+sequenceDiagram
+    participant UE
+    participant ENB as eNB
+    participant MME
+    participant SGW as S-GW
+    SGW->>SGW: Downlink packet for an idle UE: buffered
+    SGW->>MME: Downlink Data Notification
+    MME->>ENB: S1AP Paging (S-TMSI, TAI list) to every eNB of the tracking areas
+    ENB->>UE: Paging record (S-TMSI) at the UE's paging occasion (P-RNTI)
+    UE->>ENB: Random access, RRCConnectionRequest (S-TMSI, cause mt-Access)
+    UE->>MME: Service Request (in RRCConnectionSetupComplete)
+    MME->>ENB: Initial Context Setup (bearers, KeNB)
+    ENB->>UE: AS Security Mode Command, RRCConnectionReconfiguration (DRBs)
+    MME->>SGW: Modify Bearer (eNB tunnel): buffered data delivered
+```
+
+- **Paging occasions:** an idle UE listens only at its **paging frame** and **paging occasion** within each **DRX cycle** T (32, 64, 128 or 256 frames: 0.32 to 2.56 s): SFN mod T = (T div N) × (UE_ID mod N), with UE_ID = IMSI mod 1024 in LTE and 5G-S-TMSI mod 1024 in NR. The cell broadcasts a default cycle; the UE can request a shorter UE-specific one at attach or registration. The downlink latency to an idle UE is up to one cycle plus the connection setup.
+- **NR paging** is beam-swept like the SSB, and in RRC_INACTIVE the gNB pages within the RNA (**RAN paging**, with the I-RNTI); the core is not involved.
+- The paging message can also carry system information change and public warning notifications, so idle UEs read it even when nothing is addressed to them.
+- An uplink transmission from idle is the same procedure without the paging steps (cause `mo-Data` or `mo-Signalling`). In 5G, the Service Request lists the PDU sessions to reactivate.
 
 ### Idle mobility: cell reselection
 
-The UE moves between cells on its own, following rules from system information (SIB3 to SIB8 in LTE): an **absolute priority** per frequency and technology, thresholds to move to a higher-priority layer when it's good enough or to a lower one when the serving cell gets bad, and ranking with hysteresis among cells of equal priority, held for a reselection time (around 1 s). The UE only measures other frequencies when the serving cell drops below a threshold, which saves energy. The network moves idle devices to the layer it wants (for example from 3.5 GHz down to 800 MHz) through these priorities.
+In idle and inactive, the UE moves between cells on its own, following rules broadcast in system information (TS 36.304, TS 38.304):
 
-### Connected mobility: handover
+- **Absolute priorities** per frequency and technology (`cellReselectionPriority`): the UE always measures higher-priority layers, and moves to one when its cell is above `threshX-High`. It moves to a lower-priority layer only when its serving cell drops below `threshServingLow` and the target is above `threshX-Low`.
+- **Ranking** among cells of equal priority (usually the same frequency): the best cell by RSRP with a hysteresis (`q-Hyst`) and per-neighbor offsets, held for `t-Reselection` (around 1 s).
+- **Measurement rules save energy:** the UE measures other cells of its frequency only when the serving cell drops below `s-IntraSearch`, and lower-priority frequencies only below `s-NonIntraSearch`. Rel-16 adds relaxed measurements for stationary or cell-center devices.
+- The network moves idle devices to the layer it wants (from 3.5 GHz to 800 MHz, from LTE to NR SA) through these priorities, and can push dedicated priorities in the release message (`idleModeMobilityControlInfo`, `cellReselectionPriorities`).
 
-1. The network configures **measurement events** for the UE:
+### Connected mobility: measurements and handover
+
+**Measurement configuration** is sent in RRC reconfiguration and links three lists: **measurement objects** (the frequencies to measure, with neighbor lists or blacklists), **report configurations** (the event and its parameters) and **measurement IDs** pairing them. Filtering of the results (layer 3 filter coefficient) and the measured quantities are also configured. Measuring another frequency needs **measurement gaps** if the UE has only one receiver chain for it: typically 6 ms every 40 or 80 ms in LTE, configurable patterns in NR, during which the UE can't be scheduled.
 
 | Event | Triggers when |
 |---|---|
-| A1 / A2 | Serving cell better / worse than a threshold (start or stop measuring other frequencies) |
+| A1 / A2 | Serving cell better / worse than a threshold (start or stop measuring other frequencies, release a gap) |
 | A3 | A neighbor becomes better than the serving cell by an offset: the classic intra-frequency handover trigger |
 | A4 / A5 | A neighbor better than a threshold / serving worse than one threshold and neighbor better than another |
-| B1 / B2 | Same as A4 / A5 for another technology (LTE to NR: B1 adds the NR leg in EN-DC) |
+| A6 | A neighbor better than an SCell by an offset (carrier aggregation) |
+| B1 / B2 | Same as A4 / A5 for another technology. B1 on NR adds the NR leg in EN-DC |
 
-2. The UE sends a **Measurement Report** when an event holds for its time-to-trigger.
-3. The source base station prepares the target over X2/Xn (or through the core) and sends the UE an **RRC Reconfiguration** with the target cell (mobilityControlInfo in LTE, reconfigurationWithSync in NR).
-4. The UE performs contention-free random access on the target and continues. Data is forwarded from the source; the interruption is typically some tens of ms in LTE (rule of thumb). Rel-16 adds conditional handover (prepared in advance, executed by the UE) and DAPS (no interruption).
+Each event has a hysteresis and a **time-to-trigger**; the UE then sends a **MeasurementReport**, periodically repeated while the condition holds if configured.
 
-The IP address doesn't change: the gateway is the anchor (section 9). Unlike Wi-Fi roaming, there is no new authentication or DHCP.
+```mermaid
+sequenceDiagram
+    participant UE
+    participant S as Source eNB / gNB
+    participant T as Target eNB / gNB
+    participant CN as MME / AMF and gateway
+    UE->>S: MeasurementReport (A3: target PCI better by the offset)
+    S->>T: Handover Request over X2 / Xn (UE context, security key, bearers)
+    T->>S: Handover Request Acknowledge (target configuration, dedicated preamble)
+    S->>UE: RRCConnectionReconfiguration with mobilityControlInfo / RRCReconfiguration with reconfigurationWithSync
+    Note over UE: Detaches from the source, synchronizes to the target
+    S->>T: SN Status Transfer, then forwarding of buffered downlink data
+    UE->>T: Contention-free random access, then Reconfiguration Complete
+    T->>CN: Path Switch Request: move the downlink tunnel to the target
+    CN->>T: Path Switch Request Acknowledge (next hop key)
+    T->>S: UE Context Release
+```
 
-**Radio link failure (RLF):** the UE declares it when the downlink becomes undecodable for a while (N310 out-of-sync indications, then timer T310 expires), when random access fails repeatedly, when RLC reaches its maximum retransmissions, or when a handover fails. It then tries an **RRC re-establishment** on the best cell; if that cell wasn't prepared, it goes to idle and connects again (a data gap of seconds). In NSA, losing the NR leg is an **SCG failure**: the LTE connection continues without NR.
+- The data interruption is typically some tens of ms in LTE (rule of thumb). The IP address doesn't change: the gateway is the anchor (section 4). Unlike Wi-Fi roaming, there is no new authentication or DHCP.
+- Without X2/Xn between the two base stations, the handover goes through the core (S1/N2 handover), and between MMEs or AMFs the UE context moves with it.
+- **Improvements:** conditional handover (Rel-16: the target is prepared in advance and the UE executes when a condition is met, avoiding a late command), DAPS handover (Rel-16: the UE keeps receiving from the source until the target works), L1/L2-triggered mobility (Rel-18: cell changes driven by lower-layer measurements, faster than RRC).
 
-### PSM and eDRX
+### Radio link failure and re-establishment
 
-For devices that send a little data now and then (meters, trackers), the 3GPP power saving features let the modem sleep most of the time while staying registered, so it doesn't pay for an attach every time:
+The UE declares a **radio link failure** (RLF) when:
+- the downlink becomes undecodable for too long: N310 consecutive out-of-sync indications from the physical layer start timer **T310**, which expires without N311 in-sync indications;
+- random access fails (`preambleTransMax` reached);
+- RLC reaches its maximum number of retransmissions;
+- a handover fails (timer T304 expires before the target accepts it).
+
+It then sends `RRCConnectionReestablishmentRequest` / `RRCReestablishmentRequest` on the best cell, with a cause (`handoverFailure`, `reconfigurationFailure`, `otherFailure`). If that cell has (or can fetch) the UE's context, the connection continues after a short gap; if not, the UE goes to idle and connects again, which costs seconds. In EN-DC, radio problems on the NR leg are an **SCG failure**: the UE reports it to the LTE master node and the connection continues without NR.
+
+### NSA mobility
+
+In EN-DC, the LTE master node owns mobility. The NR leg is added after a B1 measurement report (**SN addition**: the eNB asks the gNB for resources, then reconfigures the UE), changed or released as the UE moves (**SN change**, **SN release**), and dropped at every LTE handover unless the target also sets it up. In idle, the UE camps on LTE only. Frequent SN additions and releases show up as throughput that jumps between LTE and NR rates.
+
+### 4G-5G interworking
+
+| Situation | With N26 (MME-AMF interface) | Without N26 |
+|---|---|---|
+| Idle, LTE to 5G SA | Registration (mobility update) with a GUTI mapped from the LTE GUTI; the AMF fetches the context from the MME | Registration; sessions transferred if the gateway is combined (IP preserved), otherwise re-established |
+| Idle, 5G SA to LTE | TAU with a mapped GUTI | Attach with the "handover" request type, if the UE and network support it |
+| Connected | Inter-system handover, sessions and IP kept, bearers mapped to QoS flows | Release and redirection to the other system, then the idle procedure |
+
+**EPS fallback:** an SA network that doesn't run voice over NR moves a UE to LTE when an IMS voice call starts (handover or redirection), and the call continues as VoLTE (section 17). It adds call setup delay but lets operators launch SA before VoNR.
+
+**Legacy technologies:** from LTE, the network can redirect or hand over to 2G/3G where they still exist (CS fallback, SRVCC for an ongoing VoLTE call). These disappear with the sunsets.
+
+---
+
+## 15. Power saving: DRX, eDRX and PSM
+
+Where a cellular device's energy goes, from most to least per second: transmitting, receiving data, staying connected with nothing to send (the inactivity tail), monitoring paging in idle, and sleeping. Power saving features attack each of these, and **the network grants them**: a device requests values, and the values that count are those in the network's response.
+
+### DRX in connected mode
+
+**C-DRX** (connected-mode discontinuous reception, configured by RRC) lets a connected UE monitor the PDCCH only during an **on-duration** at the start of each DRX cycle. Any grant restarts a **DRX inactivity timer** that keeps it awake; when traffic stops, it moves from short cycles (tens of ms) to long cycles (up to hundreds of ms or more) until the RRC inactivity timer releases the connection. C-DRX saves a large share of the connected-mode energy at the cost of added downlink latency.
+
+### DRX in idle and inactive
+
+Idle and inactive UEs wake only for their paging occasions (section 14), once per DRX cycle of 0.32 to 2.56 s, and do their cell measurements around them.
+
+### eDRX
+
+**Extended DRX** stretches the paging cycle for devices that can wait for downlink data:
+
+| System | eDRX cycle in idle | Notes |
+|---|---|---|
+| LTE (WB-S1, including LTE-M) | 5.12 s to 2621.44 s (43.7 min) | |
+| NB-IoT (NB-S1) | 20.48 s to 10485.76 s (2.9 h) | |
+| NR (Rel-17, mainly RedCap) | 2.56 s to 10485.76 s in idle; up to 10.24 s in RRC_INACTIVE | Longer inactive cycles were left to later releases |
+
+- Cycles longer than one SFN cycle (10.24 s) are counted with **hyper-frames** (H-SFN), broadcast in system information.
+- The UE listens during a **paging time window** (PTW) once per eDRX cycle, with normal DRX inside the window, and is unreachable in between.
+- The UE requests eDRX in the attach, TAU or registration (Extended DRX parameters IE, TS 24.008 section 10.5.5.32: a 4-bit cycle code and a PTW), and the network accepts, changes or ignores it.
+
+### PSM
+
+The **power saving mode** lets the modem stop listening entirely between its own transmissions while staying registered, so it doesn't pay for an attach each time:
 
 ```
  ──[data]──[inactivity]──┬── idle: paging every DRX/eDRX cycle ──┬── PSM: deep sleep, unreachable ──────────┬──[TAU or data]──
@@ -1396,20 +1489,33 @@ For devices that send a little data now and then (meters, trackers), the 3GPP po
                          RRC release                                                                       wake up
 ```
 
-| Feature | What the UE requests (attach or TAU request) | Effect |
-|---|---|---|
-| **PSM** | Active time **T3324** and an extended periodic update timer **T3412** | After T3324 in idle, the modem stops listening entirely, still registered. It wakes for its own uplink data or when T3412 expires. Reachable only during the active time |
-| **eDRX** | An eDRX cycle and paging time window | In idle, listens for paging only once per long cycle |
+- The UE requests an **active time** (T3324) and an extended **periodic update timer** (T3412 extended in LTE, T3512 in 5G) in the attach, TAU or registration request. After the release, it stays reachable in idle for T3324, then enters PSM: no paging monitoring, no measurements, current close to the modem's off state.
+- It wakes for its own uplink data or when the periodic timer expires (to run a TAU), whichever comes first. The maximum T3412 extended value is several hundred days.
+- **Downlink data for a sleeping device** waits until it wakes: the network may buffer it for a while (extended buffering, operator-dependent) or drop it. Applications must be designed for it: the device reports in and fetches pending commands.
 
-- **The network decides.** It grants values in the Attach/TAU Accept, possibly different from the request, or refuses the feature. The granted values are the ones that count: `AT+CEREG=4` reports them (section 17).
-- **Downlink to a sleeping device** waits until it wakes; the network may buffer it for a while (high latency communication, operator-dependent) or drop it. Applications must be designed for it: the device reports in and fetches pending commands.
-- **AT command encoding** (TS 27.007, values coded as in TS 24.008): `AT+CPSMS=1,,,"00111000","00100001"` requests T3412 = 24 h (unit `001` = 1 hour, value `11000` = 24) and T3324 = 1 min (unit `001` = 1 minute, value `00001`). `AT+CEDRXS=1,4,"0101"` requests an 81.92 s eDRX cycle on LTE-M (access technology 4 = E-UTRAN WB-S1, 5 = NB-S1).
+The timers travel in NAS as GPRS Timer IEs (TS 24.008): T3324 as **GPRS Timer 2**, T3412 extended as **GPRS Timer 3**, each one byte with a 3-bit unit and a 5-bit value:
 
-| T3412 extended unit (bits 8-6) | T3324 unit (bits 8-6) |
+| GPRS Timer 3 unit (T3412 ext) | GPRS Timer 2 unit (T3324) |
 |---|---|
 | `000` 10 min, `001` 1 h, `010` 10 h, `011` 2 s, `100` 30 s, `101` 1 min, `110` 320 h, `111` deactivated | `000` 2 s, `001` 1 min, `010` 6 min, `111` deactivated |
 
-**Energy, rule of thumb** (orders of magnitude; module datasheets give the real values):
+Example: `00111000` = 24 × 1 h = 24 hours; `00100001` = 1 × 1 min = 1 minute. A modem log or an AT report (section 18) shows these bytes for both the requested and the granted values.
+
+### NR power saving features
+
+| Feature | Release | Effect |
+|---|---|---|
+| Bandwidth part switching | Rel-15 | A narrow BWP when traffic is low reduces RF and processing power |
+| Wake-up signal (DCI format 2_6) | Rel-16 | Tells a C-DRX UE before each on-duration whether to wake up at all |
+| SCell dormancy, cross-slot scheduling | Rel-16 | Keeps secondary carriers in a low-power state; lets the UE sleep between the PDCCH and the data |
+| Relaxed RRM measurements | Rel-16 | Fewer neighbor measurements for stationary or cell-center UEs |
+| Paging early indication (DCI 2_7) | Rel-17 | Tells an idle UE whether its paging occasion contains anything, so it can skip decoding it |
+
+LTE-M and NB-IoT have their own wake-up signals and early release mechanisms (section 16).
+
+### Energy budget
+
+Orders of magnitude (rule of thumb; module datasheets give real values):
 
 | State | Average current |
 |---|---|
@@ -1419,18 +1525,17 @@ For devices that send a little data now and then (meters, trackers), the 3GPP po
 | Idle with long eDRX | Tens of µA |
 | PSM | A few µA |
 
-A device that wakes once a day for 10 s at 100 mA spends 0.28 mAh per day on it, and 5 µA of PSM floor costs 0.12 mAh per day: a few years on a pair of lithium AA cells. The same device waking every minute for a keepalive would last weeks.
+A device that wakes once a day for 10 s at 100 mA spends 0.28 mAh per day on it, and 5 µA of PSM floor costs 0.12 mAh per day: a few years on a pair of lithium AA cells. The same device waking every minute for a keepalive lasts weeks. Coverage matters as much as configuration: at high coverage enhancement levels, the same transmission takes many times longer (section 16).
 
 ### Keepalives behind CGNAT
 
-A device behind the operator's CGNAT stays reachable from its server only while the NAT mapping lives. Mappings time out after an idle period (operator-dependent: often tens of seconds to a few minutes for UDP, longer for TCP), and every keepalive that refreshes it wakes the radio, pays a connection setup and the inactivity tail. On a battery device, keepalives decide battery life.
+A device behind the operator's CGNAT stays reachable from its server only while its NAT mapping lives. Mappings time out after an idle period (operator-dependent: often tens of seconds to a few minutes for UDP, longer for TCP), and every keepalive that refreshes one wakes the radio, pays a connection setup and the inactivity tail. On a battery device, keepalives decide battery life.
 
-Options, from the protocol side:
-- **Lengthen the interval** to just under the measured NAT timeout, not to a guess.
-- **Avoid NAT:** a private APN with routable addresses, or IPv6 where the operator doesn't firewall inbound traffic; the server can then reach the device whenever it's not in PSM.
+- **Lengthen the interval** to just under the measured NAT timeout, not a guess.
+- **Avoid NAT:** a private APN with routable addresses, or IPv6 where the operator doesn't firewall inbound traffic; the server can then reach the device whenever it isn't in PSM.
 - **Let the device call in:** PSM or eDRX with periodic reports, and commands fetched at each report.
-- **Survive address changes cheaply:** UDP protocols with session resumption (CoAP/LwM2M over DTLS with connection IDs, RFC 9146) don't need a full handshake when the NAT mapping changed.
-- **Wake by SMS** (section 16) where the plan includes it: SMS reaches an idle device without any IP mapping.
+- **Survive address changes cheaply:** UDP protocols with session resumption (CoAP/LwM2M over DTLS with connection IDs, RFC 9146) don't need a new handshake when the NAT mapping changed.
+- **Wake by SMS** (section 17) where the plan includes it: SMS reaches an idle device without any IP mapping (not one in PSM, until it wakes).
 
 TCP keepalives and NAT behavior are covered in the [fundamentals note](../../networking/fundamentals/fundamentals.md#10-tcp-and-udp).
 

@@ -610,76 +610,107 @@ For an FDD carrier, the formula gives the rate per direction; for TDD it must be
 
 ---
 
-## 7. Physical channels, cell search and system information
+## 7. Physical channels, cell search, system information and random access
 
 ### Channels and signals
 
-Physical channels carry bits from higher layers; physical signals exist for the physical layer itself (synchronization, channel estimation, measurements).
+Physical channels carry transport channels from MAC (section 4); physical signals exist for the physical layer itself (synchronization, channel estimation, measurements).
 
 | Direction | LTE | NR | Carries |
 |---|---|---|---|
 | Downlink | PSS, SSS | PSS, SSS (in the SSB) | Synchronization and physical cell identity |
-| Downlink | PBCH | PBCH (in the SSB) | MIB: the minimum to read the rest of the cell |
-| Downlink | PDCCH (+ PCFICH, PHICH) | PDCCH in CORESETs | DCI: downlink assignments, uplink grants, power control, slot formats |
-| Downlink | PDSCH | PDSCH | User data, system information (SIBs), paging, RRC messages |
-| Downlink | CRS (always on), CSI-RS, DMRS, PRS | CSI-RS, DMRS, PT-RS, PRS, TRS | Channel estimation, measurements, positioning |
+| Downlink | PBCH | PBCH (in the SSB) | MIB: the minimum needed to read the rest of the cell |
+| Downlink | PDCCH (+ PCFICH, PHICH) | PDCCH in CORESETs | DCI: downlink assignments, uplink grants, power control, slot formats, power saving signals |
+| Downlink | PDSCH | PDSCH | User data, RRC messages, system information (SIBs), paging, random access responses |
+| Downlink | CRS (always on), CSI-RS, DMRS, PRS | CSI-RS, DMRS, PT-RS, TRS, PRS | Channel estimation, measurements, phase and time tracking, positioning |
 | Uplink | PRACH | PRACH | Random access preambles |
-| Uplink | PUCCH | PUCCH | HARQ acknowledgments, scheduling requests, channel state reports |
-| Uplink | PUSCH | PUSCH | User data, RRC and NAS messages, reports when scheduled |
-| Uplink | SRS, DMRS | SRS, DMRS, PT-RS | Uplink channel sounding, demodulation |
+| Uplink | PUCCH | PUCCH | Uplink control information (UCI): HARQ acknowledgments, scheduling requests, channel state reports |
+| Uplink | PUSCH | PUSCH | User data, RRC and NAS messages, UCI when multiplexed with data |
+| Uplink | SRS, DMRS | SRS, DMRS, PT-RS | Uplink sounding, demodulation |
 
-UEs are told apart by an **RNTI** (radio network temporary identifier) that scrambles the PDCCH: the **C-RNTI** identifies one UE in one cell while it is connected; fixed values mark broadcast content (SI-RNTI for system information, P-RNTI for paging, RA-RNTI for random access responses). A UE decodes every PDCCH candidate in its search space and keeps those whose check matches one of its RNTIs ("blind decoding").
+**PDCCH and DCI.** The PDCCH carries **downlink control information** (DCI) in formats sized for each purpose:
 
-### Cell search
+| Purpose | LTE DCI formats | NR DCI formats |
+|---|---|---|
+| Uplink grant | 0, 4 (MIMO) | 0_0 (fallback), 0_1, 0_2 (compact, URLLC) |
+| Downlink assignment | 1, 1A, 1B, 1C, 1D, 2, 2A-2D | 1_0 (fallback), 1_1, 1_2 |
+| Group commands | 3, 3A (power control) | 2_0 (slot format), 2_1 (pre-emption), 2_2/2_3 (power control), 2_6 (wake-up for power saving), 2_7 (paging early indication) |
 
-A UE that powers up, or loses coverage, looks for cells on the bands it supports, starting with the frequencies it last used (stored in the modem or the SIM), then scanning.
+In LTE the PDCCH occupies the first 1-3 symbols of every subframe across the whole carrier. In NR it lives in **CORESETs** (control resource sets: a configured block of RBs and 1-3 symbols), monitored according to **search spaces** (which CORESET, how often, which DCI formats). **CORESET 0**, defined by the MIB, is where every UE finds the scheduling of SIB1, paging and random access responses; UE-specific search spaces are configured by RRC after connection.
+
+**RNTIs.** UEs are told apart by the RNTI (radio network temporary identifier) that scrambles the DCI's CRC. A UE blindly decodes every PDCCH candidate in its search spaces and keeps those whose CRC matches one of its RNTIs:
+
+| RNTI | Identifies |
+|---|---|
+| C-RNTI | One connected UE in one cell (16 bits), assigned during random access |
+| SI-RNTI, P-RNTI | System information, paging (fixed values) |
+| RA-RNTI, TC-RNTI | Random access response, temporary identity during contention resolution |
+| CS-RNTI (NR), SPS C-RNTI (LTE) | Configured grants and semi-persistent scheduling |
+| I-RNTI (NR) | A UE in RRC_INACTIVE, for resume (not used on the PDCCH) |
+
+**PUCCH formats** carry UCI of different sizes: LTE formats 1/1a/1b (SR, 1-2 HARQ bits), 2 (CSI) and 3-5 (many HARQ bits with carrier aggregation); NR formats 0 and 1 (up to 2 bits), 2 to 4 (more bits), short (1-2 symbols) or long (4-14 symbols, for coverage).
+
+### Cell search and initial acquisition
+
+A UE that powers up or loses coverage searches the bands it supports, starting with the frequencies stored from previous sessions (in the modem or in USIM files), then scanning.
 
 **LTE:**
-1. **PSS** (primary synchronization signal), every 5 ms in the central 6 RBs: gives slot timing and N<sub>ID</sub><sup>(2)</sup> (0-2).
-2. **SSS** (secondary synchronization signal): gives frame timing and N<sub>ID</sub><sup>(1)</sup> (0-167). The **physical cell identity** is PCI = 3 × N<sub>ID</sub><sup>(1)</sup> + N<sub>ID</sub><sup>(2)</sup>: 504 values (0-503).
-3. **CRS** at known positions derived from the PCI: the UE can now measure the cell (RSRP, RSRQ, section 8).
-4. **MIB** on the PBCH, every 40 ms: channel bandwidth, PHICH configuration, SFN.
-5. **SIB1** on the PDSCH, every 80 ms: PLMN identities, tracking area code, cell identity, cell barring, minimum signal level to camp (q-RxLevMin), scheduling of the other SIBs.
+1. **PSS** (primary synchronization signal), every 5 ms on the central 62 subcarriers: slot timing and N<sub>ID</sub><sup>(2)</sup> (0-2).
+2. **SSS** (secondary synchronization signal): frame timing, FDD or TDD, and N<sub>ID</sub><sup>(1)</sup> (0-167). The **physical cell identity** is PCI = 3 × N<sub>ID</sub><sup>(1)</sup> + N<sub>ID</sub><sup>(2)</sup>: 504 values (0-503).
+3. **CRS** at positions derived from the PCI: the UE can now measure the cell (RSRP, RSRQ, section 9).
+4. **MIB** on the PBCH (40 ms period, repeated every 10 ms): downlink bandwidth, PHICH configuration, SFN.
+5. **SIB1** on the PDSCH (80 ms period, repeated every 20 ms): PLMN identities, tracking area code, cell identity, cell barring, minimum receive level (`q-RxLevMin`), and the schedule of the other SIBs.
 
-**NR:** the PSS, SSS and PBCH travel together in a **synchronization signal block** (SSB, 4 symbols × 20 RBs), placed on the synchronization raster (GSCN) rather than at the carrier center. PCI = 3 × N<sub>ID</sub><sup>(1)</sup> + N<sub>ID</sub><sup>(2)</sup> with N<sub>ID</sub><sup>(1)</sup> 0-335: 1008 values. The SSB is sent in a **burst** of up to 4 or 8 beams in FR1 and 64 in FR2, typically every 20 ms; the UE picks the strongest beam, and its later random access uses the occasion associated with that beam. In NSA mode, the UE gets the NR cell's configuration from LTE RRC and only needs the SSB for timing and measurements.
+**NR:**
+1. The PSS, SSS and PBCH travel together in a **synchronization signal block** (SSB, 4 symbols × 240 subcarriers), placed on the synchronization raster (section 5). PCI = 3 × N<sub>ID</sub><sup>(1)</sup> + N<sub>ID</sub><sup>(2)</sup> with N<sub>ID</sub><sup>(1)</sup> 0-335: 1008 values.
+2. The SSB is sent in a **burst** of up to L<sub>max</sub> beams: 4 below 3 GHz, 8 between 3 and 6 GHz, 64 in FR2. The UE assumes a 20 ms burst period during initial search, picks the strongest beam, and later uses the random access occasions associated with that beam.
+3. The **MIB** gives the SFN, the subcarrier spacing of the initial access channels, the location of **CORESET 0** and its search space, and cell barring.
+4. **SIB1** (scheduled through CORESET 0): PLMNs, TAC, cell identity, access control, the initial BWP and random access configuration, and the schedule of other SIBs.
 
-**PCI vs cell identity:** the PCI is a short local label reused across the network, like a Wi-Fi channel number. The global identity is in SIB1: the **ECGI** (PLMN + 28-bit E-UTRAN cell identity, made of a 20-bit eNB ID and an 8-bit cell ID) in LTE, the **NCGI** (PLMN + 36-bit NR cell identity) in NR. Two neighbors with the same PCI ("PCI confusion") break measurements and handovers, so operators plan PCIs like Wi-Fi channels.
+In NSA, the UE never performs initial access on the NR cell: LTE RRC hands it the NR cell's configuration, and the UE only needs the SSB for timing and measurements.
+
+**PCI vs cell identity:** the PCI is a short local label reused across the network, like a Wi-Fi channel number. The global identity is in SIB1: the **ECGI** (PLMN + 28-bit E-UTRAN cell identity: a 20-bit eNB ID and an 8-bit cell ID) in LTE, the **NCGI** (PLMN + 36-bit NR cell identity, with a 22 to 32-bit gNB ID) in NR. Two neighbors with the same PCI on the same frequency ("PCI confusion") break measurements and handovers, so operators plan PCIs. The network learns its neighbor relations by asking UEs to read and report the global identity of unknown PCIs (automatic neighbor relations).
 
 ### System information
 
-| SIB (LTE) | Content |
-|---|---|
-| MIB | Bandwidth, SFN |
-| SIB1 | PLMNs, TAC, cell identity, barring, selection thresholds, SIB schedule |
-| SIB2 | Common radio configuration: random access, paging cycle, uplink power control, access barring, timers (T300...) |
-| SIB3 to SIB8 | Cell reselection: same frequency, other frequencies, other technologies (UTRA, GERAN, CDMA2000, NR in SIB24) |
-| SIB10 to SIB12 | Public warning: ETWS, CMAS (EU-Alert, Wireless Emergency Alerts) |
-| SIB16 | GPS time and UTC |
-| SIB20 and later | MBMS, sidelink, NB-IoT and LTE-M specific blocks |
+| LTE SIB | Content | NR equivalent |
+|---|---|---|
+| MIB | Bandwidth, SFN | MIB (+ CORESET 0, SCS) |
+| SIB1 | PLMNs, TAC, cell identity, barring, selection thresholds, SIB schedule | SIB1, which also carries the common radio configuration and access control |
+| SIB2 | Common radio configuration: random access, paging cycle, uplink power control, access barring, timers (T300...), `upperLayerIndication` for NSA | Merged into SIB1 |
+| SIB3 | Cell reselection common parameters, intra-frequency | SIB2 |
+| SIB4, SIB5 | Intra-frequency neighbors, inter-frequency carriers | SIB3, SIB4 |
+| SIB6 to SIB8 | UTRA, GERAN, CDMA2000 reselection | SIB5 (LTE neighbors) |
+| SIB24 | NR carriers for reselection from LTE | |
+| SIB10 to SIB12 | Public warning: ETWS, CMAS (EU-Alert, Wireless Emergency Alerts) | SIB6 to SIB8 |
+| SIB16 | GPS time and UTC | SIB9 |
+| SIB20 and later | Multicast, sidelink, positioning assistance, IoT-specific blocks | SIB10 and later |
 
-NR broadcasts the MIB and SIB1 (also called RMSI, remaining minimum system information); the other SIBs are broadcast or sent **on demand** when a UE asks, which saves airtime. LTE-M and NB-IoT have their own reduced versions (`SIB1-BR`, `SIB1-NB`).
+- **Changes:** system information changes only at **modification period** boundaries. The network announces a coming change in paging (`systemInfoModification` in LTE, a short message on the PDCCH in NR), and idle UEs re-read it; a value tag lets a UE skip reading unchanged SIBs.
+- **On-demand SI (NR):** other SIBs can be broadcast only when a UE asks, through a dedicated random access preamble or an RRC request, which saves airtime.
+- LTE-M and NB-IoT have their own reduced versions (`SIB1-BR`, `SIB1-NB`, section 16).
 
-**Cell barring and access control:** SIB1 can bar a cell entirely or reserve it for the operator; SIB2 (LTE) and SIB1 (NR, unified access control) can bar classes of access for a while, to protect a congested network. Every SIM carries an **access class** (0-9 at random, 11-15 for special users); IoT devices are often configured for **extended access barring** (EAB), so that the network can hold them back first. A barred device keeps camping and retries later: it looks like "registered, but nothing happens".
+**Cell barring and access control:** SIB1 can bar a cell (`cellBarred`) or reserve it for operator use; the network can also bar classes of access attempts for a while to protect itself from overload. LTE uses **access class barring** (ACB, in SIB2): every USIM carries an access class (0-9 at random, 11-15 for special users), and the network bars a probability of attempts per class; IoT devices can be subject to **extended access barring** (EAB). NR uses **unified access control** (UAC, in SIB1): each attempt gets an access identity (from the USIM) and an access category (from the type of attempt: emergency, signaling, data, delay-tolerant), with barring factors per category. A barred device keeps camping and retries later: in a log it looks like "registered, but nothing happens".
 
 ### Random access
 
-The only transmission a UE makes without a grant. It is used to connect from idle, to regain uplink timing, to request system information on demand, and for handovers.
+The only transmission a UE makes without a dedicated grant. It is used for initial access from idle, RRC re-establishment, handover to a new cell, uplink data when out of uplink synchronization or without PUCCH resources for scheduling requests, on-demand system information, and beam failure recovery.
 
 ```mermaid
 sequenceDiagram
     participant UE
     participant BS as eNB or gNB
-    Note over UE: Downlink timing from PSS/SSS, PRACH configuration from SIB2 (LTE) or SIB1 (NR)
-    UE->>BS: Msg1: random access preamble on the PRACH (1 of 64), power ramped up on each retry
-    BS->>UE: Msg2: random access response (timing advance, uplink grant, temporary C-RNTI)
-    UE->>BS: Msg3 on the PUSCH: RRC connection request, with an identity (S-TMSI or a random value)
-    BS->>UE: Msg4: contention resolution (echoes the identity), RRC connection setup
-    Note over UE,BS: The UE that sees its own identity in Msg4 keeps the C-RNTI, the others start over
+    Note over UE: Downlink sync and PRACH configuration from SIB2 (LTE) or SIB1 (NR). NR: occasion tied to the best SSB beam
+    UE->>BS: Msg1: random access preamble on the PRACH (1 of 64)
+    BS->>UE: Msg2: random access response on the PDSCH (RA-RNTI): timing advance, uplink grant, temporary C-RNTI, backoff
+    UE->>BS: Msg3 on the PUSCH: RRCConnectionRequest / RRCSetupRequest with S-TMSI or a random value, and a cause
+    BS->>UE: Msg4: contention resolution (echoes the Msg3 identity) + RRCConnectionSetup / RRCSetup
+    Note over UE,BS: The UE that finds its own identity in Msg4 keeps the C-RNTI, the others start over after a backoff
 ```
 
-- **Contention:** two UEs can pick the same preamble in the same occasion; Msg4 resolves it. **Contention-free** random access uses a dedicated preamble assigned by the network (handover, beam recovery).
-- **Power ramping:** each unanswered preamble is resent with more power, up to a maximum number of attempts set in system information. Repeated random access failures in a log mean the base station doesn't hear the UE: uplink coverage (section 8) or a timing problem.
-- **2-step random access** (NR Rel-16): Msg1 and Msg3 are sent together (MsgA), and the network answers with MsgB, which saves a round trip.
+- **Contention:** two UEs can pick the same preamble in the same occasion; Msg4 resolves it. **Contention-free** random access uses a dedicated preamble assigned by the network (handover, beam failure recovery, PDCCH order) and stops after Msg2.
+- **Power ramping:** each unanswered preamble is resent with more power (`powerRampingStep`), up to `preambleTransMax` attempts, after which the MAC reports a random access problem to RRC. Repeated random access failures in a log mean the base station doesn't hear the UE: uplink coverage (section 9), wrong timing, or overload (a backoff indicator in Msg2).
+- **2-step random access** (NR Rel-16): MsgA carries the preamble and the Msg3 payload together, and MsgB answers both, which saves a round trip. Rel-15 LTE added **early data transmission** with user data in Msg3 for IoT devices (section 16), and Rel-17 NR **small data transmission** in RRC_INACTIVE does the same (section 14).
 
 ---
 
@@ -687,96 +718,122 @@ sequenceDiagram
 
 ### The scheduler
 
-Every TTI (1 ms in LTE) or slot (NR), the base station's **scheduler** decides which UEs transmit and receive, on which resource blocks, with which MCS and how many layers. Its inputs: channel reports from each UE, buffer sizes, QoS of each bearer (section 12), retransmissions pending, and fairness. The algorithm is the vendor's (proportional fair variants are common): two networks with the same spectrum can perform very differently.
+Every TTI (LTE) or slot (NR), the base station's **MAC scheduler** decides which UEs transmit and receive, on which RBs, with which MCS, how many layers and with how much power. Its inputs: channel reports from each UE, buffer sizes, the QoS of each bearer or flow (section 12), pending retransmissions and fairness. The algorithm is the vendor's (proportional-fair variants are common): two networks with the same spectrum can perform very differently.
 
-**Downlink:** the PDCCH carries a downlink assignment (DCI) pointing at the UE's data on the PDSCH, in the same subframe in LTE, or a configured number of slots later in NR.
+**Downlink:** a DCI on the PDCCH points at the UE's data on the PDSCH: in the same subframe in LTE; in NR, K0 slots later (K0 is often 0).
 
 **Uplink:** the UE can't send data until it's granted resources:
 
 ```mermaid
 sequenceDiagram
     participant UE
-    participant BS as eNB
+    participant BS as eNB / gNB
     Note over UE: Data arrives in an uplink buffer, no grant
     UE->>BS: Scheduling request on the PUCCH (1 bit, at the UE's next SR opportunity)
-    BS->>UE: Small uplink grant on the PDCCH
-    UE->>BS: PUSCH, 4 ms later (LTE FDD): buffer status report + first data
+    BS->>UE: Small uplink grant (DCI 0 / 0_x)
+    UE->>BS: PUSCH (4 ms later in LTE FDD, K2 slots in NR): buffer status report + first data
     BS->>UE: Grants sized to the reported buffer
     UE->>BS: PUSCH: the rest of the data
-    BS->>UE: HARQ ACK or NACK for each transport block
+    BS->>UE: HARQ feedback or new grants
 ```
 
-- **SR period** (configured per UE, often 5 to 20 ms in LTE) and the grant delay add up to the uplink access latency: an idle uplink is slower than a busy one.
-- **Semi-persistent scheduling** (LTE) and **configured grants** (NR) give a periodic allocation without asking: used for VoLTE and low-latency traffic.
-- **Uplink power control:** the UE sets its power from the downlink path loss it measures (open loop), corrected by the base station's TPC commands (closed loop). It reports its **power headroom** (PHR): at the cell edge it runs out of power, the base station gives it fewer resource blocks, and the uplink rate drops long before the downlink rate does.
+- **SR period** (configured per UE, often 5 to 20 ms in LTE) and the grant delay make up the uplink access latency: an idle uplink is slower than a busy one. A UE that sends too many SRs without getting a grant (`dsr-TransMax`) releases its PUCCH resources and falls back to random access.
+- **Buffer status reports** (BSR, a MAC control element) give the amount of data per logical channel group; **power headroom reports** (PHR) give how much transmit power is left.
+- **Semi-persistent scheduling** (LTE SPS, used for VoLTE) and **configured grants** (NR: type 1 entirely by RRC, type 2 activated by DCI) give periodic allocations without an SR each time: lower latency and less signaling for periodic traffic.
+- **Discontinuous reception in connected mode** (C-DRX) limits when the UE monitors the PDCCH, trading latency for energy (section 15).
+
+### Uplink power control
+
+The UE sets each PUSCH transmission's power as (simplified, TS 36.213 / TS 38.213):
+
+```
+P = min( P_CMAX,  P0 + 10 log10(M) + α × PL + Δ_TF + f )
+    P_CMAX  maximum allowed: power class, cell's p-Max, minus allowed reductions (MPR/A-MPR) for
+            wide allocations and high modulation
+    P0      target received power per RB, from RRC (cell and UE parts)
+    M       number of allocated RBs
+    α × PL  fraction (α = 0, or 0.4 to 1) of the downlink path loss, measured on reference signals
+    Δ_TF    adjustment for the modulation and coding
+    f       accumulated closed-loop corrections from TPC commands in DCIs
+```
+
+The open-loop part (P0, α, path loss) puts the UE roughly at the right level; the base station's TPC commands correct it. At the cell edge P reaches P_CMAX, the power headroom report goes to zero or negative, and the scheduler must give the UE **fewer RBs** to keep power per RB high enough: the uplink rate drops long before the downlink rate does. PUCCH, SRS and PRACH have their own formulas on the same principle.
 
 ### Channel reports and link adaptation
 
-The UE reports **channel state information** (CSI), periodically on the PUCCH or on request on the PUSCH:
+The UE reports **channel state information** (CSI), periodically on the PUCCH or on request (aperiodic, on the PUSCH):
 
 | Report | Meaning |
 |---|---|
-| CQI (0-15) | The highest modulation and code rate the UE expects to decode with at most 10% block error rate. Not a signal level: a summary of SINR and receiver quality |
+| CQI (0-15) | The highest modulation and code rate the UE expects to decode with at most 10% block error rate (or 0.001% with the URLLC table). A summary of SINR and receiver quality, not a signal level |
 | RI | Rank: how many layers the UE can receive |
-| PMI | Preferred precoding matrix (closed-loop MIMO) |
-| CRI, SSBRI, L1-RSRP | NR beam reports: best CSI-RS or SSB beam and its power |
+| PMI | Preferred precoder from a codebook |
+| CRI, SSBRI, L1-RSRP, L1-SINR | NR beam reports: best CSI-RS or SSB beams and their quality |
 
-The base station starts from the CQI, then adjusts the MCS with its own HARQ statistics to target about 10% **initial block error rate**: errors are cheap because HARQ fixes them quickly, and a lower error target would waste capacity.
+In NR, what the UE measures and reports is fully configured by RRC (CSI resource settings and report settings), so the report content varies between networks. The base station starts from the CQI and adjusts the MCS with its own HARQ statistics (outer loop) to target about 10% **initial block error rate**: errors are cheap because HARQ fixes them within milliseconds, and a lower target would waste capacity.
 
 ### HARQ
 
-Each transport block is acknowledged at the physical layer, quickly:
+Each transport block is acknowledged at the physical layer:
 
-- **LTE FDD:** 8 parallel stop-and-wait HARQ processes. ACK/NACK 4 ms after the data, retransmission 8 ms after the original. TDD timings depend on the pattern.
-- **NR:** up to 16 processes, with timing set per transmission (K1: data to acknowledgment), as short as a slot or two. Large blocks are split into code block groups that can be retransmitted separately.
-- **Soft combining:** the receiver keeps the failed transmission and combines it with the retransmission, usually sent with different redundancy bits (incremental redundancy). A retransmission is cheaper than starting over.
+| | LTE | NR |
+|---|---|---|
+| Processes | 8 (FDD), more in TDD | Up to 16 (32 for NTN) |
+| Downlink | Asynchronous: any process, any time. ACK/NACK 4 ms after the data (FDD) | Asynchronous. ACK/NACK timing per transmission (K1), as short as the UE's processing time allows |
+| Uplink | Synchronous: retransmission 8 ms after the original, at a fixed time (PHICH carries the ACK) | Asynchronous: retransmissions are scheduled explicitly by DCI (no PHICH) |
+| Granularity | Transport block | Transport block, or code block groups (only the failed parts are resent) |
 
-A block that fails all its HARQ attempts (typically 4 to 5 transmissions) is left to RLC.
+The receiver keeps a failed transmission and combines it with the retransmission (**soft combining**), usually sent with different redundancy bits (incremental redundancy): a retransmission is cheaper than starting over. A block that fails its last HARQ attempt is left to RLC.
 
 ### Layer 2: MAC, RLC, PDCP, SDAP
 
 ```
        IP packet (from the host)
             │
- SDAP       │  NR only: maps QoS flows to radio bearers, marks the QFI
+ SDAP       │  NR only: maps QoS flows to DRBs, marks the QFI
  PDCP       │  sequence numbers, header compression (ROHC), ciphering, integrity,
-            │  reordering and duplicate removal (handover, dual connectivity)
+            │  reordering and duplicate removal (handover, dual connectivity), duplication
  RLC        │  segmentation and reassembly; ARQ retransmissions in AM
  MAC        │  multiplexes logical channels into transport blocks, priorities,
-            │  HARQ, SR, BSR, PHR, timing advance, DRX
+            │  HARQ, SR, BSR, PHR, timing advance, DRX, random access
  PHY        ▼  coding, modulation, MIMO, resource mapping
 ```
 
+**MAC** maps logical channels to transport channels, chooses what goes into each uplink transport block according to logical channel priorities and prioritized bit rates (so a VoLTE packet isn't stuck behind a bulk upload), runs HARQ, random access and DRX, and exchanges **MAC control elements**: BSR, PHR, timing advance commands, DRX commands, SCell activation and deactivation, contention resolution identity, TCI state activation (NR).
+
 | RLC mode | Behavior | Used for |
 |---|---|---|
-| TM (transparent) | Nothing added | Broadcast, paging, RRC before a connection exists (SRB0) |
+| TM (transparent) | Nothing added | Broadcast, paging, SRB0 |
 | UM (unacknowledged) | Segmentation and reassembly, no retransmissions | VoLTE voice, delay-sensitive traffic |
-| AM (acknowledged) | Retransmits missing segments from status reports | Signaling (SRB1, SRB2), most data bearers |
+| AM (acknowledged) | Retransmits missing segments from status reports | SRB1, SRB2, most data bearers |
 
-**Two levels of retransmission:** HARQ (MAC/PHY) recovers most errors within milliseconds; RLC AM catches what HARQ misses, in tens of ms. TCP above sees an almost lossless but variable-delay link: on cellular, packet loss at the IP layer is rare; delay variation and the time to recover from coverage gaps are what hurt. When RLC reaches its maximum number of retransmissions, the UE declares a **radio link failure** (section 14).
+**PDCP** numbers every packet (the sequence number plus a hyper frame number form the **COUNT**, an input of ciphering and integrity, section 13), compresses headers with ROHC (essential for VoLTE's 40-byte IP/UDP/RTP headers), ciphers, protects integrity, and reorders and removes duplicates when packets arrive over two paths (handover, dual connectivity). NR moved reordering from RLC to PDCP, and RLC no longer concatenates SDUs, so segments can be prepared before the grant arrives. **SDAP** (NR only) maps each QoS flow of a PDU session to a DRB and adds the QFI.
 
-**Radio bearers:** signaling radio bearers carry RRC and NAS (SRB0 before the connection, SRB1 for RRC and NAS, SRB2 for lower-priority NAS, SRB3 for direct NR signaling in EN-DC); data radio bearers (DRB) carry user data, one per EPS bearer in LTE, one or more per PDU session in NR (section 12).
+**Two levels of retransmission:** HARQ recovers most errors in milliseconds; RLC AM catches what HARQ misses, in tens of ms. TCP above sees an almost lossless link with variable delay: on cellular, IP-level loss is rare; delay variation and the time to recover from coverage gaps are what hurt. When RLC reaches its maximum number of retransmissions, the UE declares a **radio link failure** (section 14).
 
 ### Carrier aggregation and dual connectivity
 
-- **Carrier aggregation** (CA, Rel-10): one UE uses several **component carriers** of one base station at once. The **PCell** (primary cell) carries the RRC connection and the PUCCH; **SCells** (secondary cells) add capacity and are activated or deactivated by MAC commands within milliseconds, as traffic demands. Downlink CA is common (2 to 5 carriers); uplink CA is rarer.
-- **Dual connectivity:** a UE connected to two base stations, a master node and a secondary node, with a split of traffic at PDCP. **EN-DC** (LTE master, NR secondary) is how non-standalone 5G works (section 9); **NR-DC** pairs two NR nodes (FR1 + FR2).
+- **Carrier aggregation** (CA, LTE Rel-10, NR from Rel-15): one UE uses several **component carriers** of the same base station. The **PCell** (primary cell) carries the RRC connection, NAS mobility and the PUCCH; **SCells** (secondary cells) add capacity and are activated or deactivated by MAC control elements within milliseconds as traffic demands. Downlink CA of 2 to 5 carriers is common; uplink CA is rarer because the UE's power is shared. Aggregation is a MAC function: one HARQ entity per carrier, one PDCP and RLC per bearer.
+- **Dual connectivity** (DC): the UE is connected to two base stations, a **master node** (MN, with the master cell group, MCG) and a **secondary node** (SN, with the secondary cell group, SCG), each with its own MAC scheduler. Bearers are MCG bearers, SCG bearers or **split bearers**, whose PDCP sends packets over both legs. In **EN-DC** (NSA), the LTE eNB is the master node and the gNB the secondary node; the uplink of a split bearer goes over the primary path (usually NR) until the buffer exceeds a threshold. The UE shares its total power between the LTE and NR uplinks, which constrains band combinations (section 5).
+- **SCG failure** (radio problems on the secondary leg) is reported to the master node, which releases or reconfigures the secondary node; the connection continues on the master cell group (section 14).
 
-A UE can only aggregate the band combinations it declares (section 4); the network chooses among them.
+### URLLC tools
+
+Rel-15 and Rel-16 add features for low latency and high reliability, used by industrial networks rather than public broadband ones: mini-slot scheduling, configured grants without an SR, short PUCCH, a CQI table targeting 10<sup>-5</sup> block error rate with a low-rate MCS table, **pre-emption** (an urgent transmission punctures an ongoing eMBB one, signaled by DCI 2_1), uplink cancellation, and **PDCP duplication** (the same packet sent over two carriers or two cell groups).
 
 ### Latency
 
 Rule of thumb, connected UE, good signal, server near the operator's gateway:
 
-| | LTE | NR SA (FR1) |
+| | LTE | NR SA (FR1, 30 kHz TDD) |
 |---|---|---|
-| Radio one-way, downlink | 2-5 ms | 1-3 ms |
-| Radio one-way, uplink, no grant (SR, grant, data) | 10-20 ms | 3-8 ms |
+| Radio one-way, downlink | 2-5 ms | 1-3 ms (waiting for a downlink slot in TDD dominates) |
+| Radio one-way, uplink without a grant (SR, grant, data) | 10-20 ms | 3-8 ms |
 | Ping round trip to a nearby server | 25-50 ms | 10-25 ms |
-| First packet after idle (RRC connection setup, section 14) | + 50-100 ms | + 20-50 ms (or less from RRC inactive) |
-| LTE-M, NB-IoT | | 50 ms to seconds (section 15) |
+| First packet from RRC_IDLE (section 14) | + 50-100 ms | + 20-50 ms; less from RRC_INACTIVE |
+| LTE-M, NB-IoT | 50 ms to seconds (section 16) | |
 
-Real values depend on the network's configuration (SR periods, TDD pattern, core location) and, when roaming with home routing, on the distance to the home network's gateway (section 12).
+Real values depend on the configuration (SR periods, TDD pattern, DRX), the core's location and, when roaming with home routing, the distance to the home gateway (section 12).
 
 ---
 
@@ -784,44 +841,35 @@ Real values depend on the network's configuration (SR periods, TDD pattern, core
 
 ### What the UE measures
 
-| Measurement | Definition | Range | Depends on load? |
+| Measurement | Definition | Reported range | Depends on load? |
 |---|---|---|---|
-| **RSRP** | Average power of one resource element of the cell's reference signal (LTE CRS; NR SSB: **SS-RSRP**) | -140 to -44 dBm | No: it measures the cell, not the traffic |
-| **RSSI** | Total power received over the measurement bandwidth: serving cell, neighbors, noise | | Yes |
-| **RSRQ** | N × RSRP / RSSI, with N the number of resource blocks measured | -19.5 to -3 dB (extended ranges in later releases) | Yes: a busy neighbor degrades it |
-| **SINR** | Reference signal power over interference plus noise. Vendor-measured in LTE; standardized as **SS-SINR** in NR | About -20 to +30 dB | Yes |
-| **CQI** | The UE's own estimate of what it can decode (section 7) | 0-15 | Yes |
+| **RSRP** | Average power of one resource element of the cell's reference signal: CRS in LTE; SSB (**SS-RSRP**) or CSI-RS in NR | -140 to -44 dBm (later releases extend the lower end) | No: it measures the cell, not the traffic |
+| **RSSI** | Total power over the measurement bandwidth: serving cell, neighbors, noise | | Yes |
+| **RSRQ** | N × RSRP / RSSI, with N the number of RBs measured | -19.5 to -3 dB (extended range -34 to +2.5 dB) | Yes: neighbors' traffic degrades it |
+| **SINR** | Reference signal power over interference plus noise: RS-SINR in LTE (defined in Rel-13, optional reporting), **SS-SINR** and CSI-SINR in NR | About -20 to +30 dB in practice | Yes |
+| **CQI** | The UE's own estimate of what it can decode (section 8) | 0-15 | Yes |
 
-RSRP tells you **how strong** the cell is (coverage), SINR or RSRQ **how clean** it is (quality). A strong but noisy cell (high RSRP, low SINR) is an interference problem, typically at the border of two cells; a weak but clean cell (low RSRP, decent SINR) is a coverage problem, typical in basements and rural areas.
+RSRP tells **how strong** the cell is (coverage); SINR, and to a lesser extent RSRQ, **how clean** it is (quality). A strong but noisy cell (high RSRP, low SINR) is an interference problem, typical at the border between two cells. A weak but clean cell (low RSRP, decent SINR) is a coverage problem, typical in basements and rural areas. Before Rel-13, LTE SINR values came only from vendor-specific measurements, which modems still report in their own formats.
 
 ### Why RSRP looks so low
 
-RSRP is the power of **one** 15 kHz subcarrier. The whole carrier is much stronger: at full load, RSSI ≈ RSRP + 10 log10(12 × N<sub>RB</sub>), which is +27.8 dB for 50 RBs (10 MHz) and +30.8 dB for 100 RBs (20 MHz). An RSRP of -91 dBm on the example cell corresponds to an RSSI of about -63 dBm when the cell is busy. Never compare an LTE RSRP with a Wi-Fi RSSI or a GSM level.
+RSRP is the power of **one** 15 kHz subcarrier (in NR, of one SSB subcarrier, whatever the numerology). The whole carrier is much stronger: at full load, RSSI ≈ RSRP + 10 log10(12 × N<sub>RB</sub>), which is +27.8 dB for 50 RBs (10 MHz) and +30.8 dB for 100 RBs (20 MHz). An RSRP of -91 dBm on the example cell corresponds to an RSSI of about -63 dBm when the cell is busy. Never compare an LTE RSRP with a Wi-Fi RSSI or a GSM level.
 
-**Noise floor:** thermal noise in 15 kHz is -174 + 10 log10(15000) = -132.2 dBm; with a receiver noise figure of 5 to 9 dB, about -125 dBm per resource element. An RSRP of -110 dBm would give 15 dB of SNR in an empty network; in practice, LTE and NR reuse every frequency in every cell, so **interference from neighbor cells**, not noise, limits SINR in most places. SINR above 20-25 dB is rare outside the immediate vicinity of a site.
+**Noise floor:** thermal noise in 15 kHz is -174 + 10 log10(15000) = -132.2 dBm; with a receiver noise figure of 5 to 9 dB, about -125 dBm per resource element. An RSRP of -110 dBm would give 15 dB of SNR in an empty network. In practice LTE and NR reuse every frequency in every cell, so **interference from neighbor cells**, not noise, limits SINR in most places; SINR above 20-25 dB is rare away from a site. LTE's always-on CRS from neighbor cells interfere even when those cells carry no traffic, which is one reason NR cells show better SINR at low load.
 
 ### Thresholds
 
-Rule of thumb for LTE data (NR SS-RSRP is similar on the same band; the edge of usability depends on the device class and the network's settings):
+Rule of thumb for broadband LTE on the same band; NR SS-RSRP is comparable. Read the four metrics separately, not as rows of one table, and compare with the network's own thresholds (`q-RxLevMin`, measurement events) rather than with fixed numbers:
 
-| RSRP | RSRQ | SINR | What to expect |
-|---|---|---|---|
-| > -80 dBm | > -10 dB | > 20 dB | Excellent: top MCS, several layers |
-| -80 to -90 dBm | -10 to -15 dB | 13 to 20 dB | Good |
-| -90 to -100 dBm | -15 to -20 dB | 0 to 13 dB | Fair: lower MCS, uplink starts to suffer |
-| -100 to -110 dBm | < -20 dB | < 0 dB | Poor: low rates, drops likely |
-| < -110 to -120 dBm | | | Cell edge for broadband LTE. LTE-M and NB-IoT keep working down to about -130 dBm and below with repetitions (section 15) |
+| Quality | RSRP | RSRQ | SINR | What to expect |
+|---|---|---|---|---|
+| Excellent | > -80 dBm | > -10 dB | > 20 dB | Top MCS, several layers |
+| Good | -80 to -90 dBm | -10 to -15 dB | 13 to 20 dB | |
+| Fair | -90 to -100 dBm | -15 to -20 dB | 0 to 13 dB | Lower MCS, uplink starts to suffer |
+| Poor | -100 to -110 dBm | < -20 dB | < 0 dB | Low rates, drops likely |
+| Edge | -110 to -120 dBm and below | | | The edge of broadband LTE. LTE-M and NB-IoT keep working well below, with repetitions (section 16) |
 
-**Reported values are approximate:** the standard requires an absolute accuracy of several dB, and modems average differently. Compare values from the same modem type in the same place, as with Wi-Fi RSSI.
-
-### How devices report them
-
-| Report | Encoding | Notes |
-|---|---|---|
-| `AT+CSQ` → `<rssi>,<ber>` | rssi 0-31: dBm = -113 + 2n (15 = -83 dBm, 31 = -51 dBm or more), 99 = unknown | Defined for GSM. On LTE, modems map RSRP, RSSI or something else into it: don't use it for LTE decisions |
-| `AT+CESQ` → `rxlev,ber,rscp,ecno,rsrq,rsrp` | rsrq 0-34: dB ≈ -20 + n/2; rsrp 0-97: dBm ≈ n - 141; 255 = not available (other technologies' fields) | TS 27.007. Later releases append `ss_rsrq,ss_rsrp,ss_sinr` for NR |
-| Vendor commands | Text with RSRP, RSRQ, RSSI, SINR, band, EARFCN, PCI | The most complete source on most modules (section 17) |
-| Signal "bars" | Vendor or OS mapping | Not comparable between devices |
+**Reported values are approximate:** the standard allows an absolute accuracy of several dB, and modems average and filter differently. Compare values from the same modem type at the same place, as with Wi-Fi RSSI. How modems report these values is in section 18.
 
 ### Link budget
 
@@ -831,11 +879,11 @@ The **path loss** between the base station and the UE decides almost everything.
 |---|---|---|---|
 | Free-space path loss | 96.6 dB | 103.6 dB | 109.4 dB |
 
-The 13 dB between B20 and n78 come before walls, which also attenuate more at higher frequencies. That's why a device indoors drops to the low bands, and why operators put coverage on 700-900 MHz.
+The 13 dB between B20 and n78 come before walls, which also attenuate more at higher frequencies (partly compensated on n78 by beamforming gain). That's why a device indoors drops to the low bands, and why operators put coverage on 700-900 MHz.
 
-**Downlink vs uplink:** a macro base station transmits about 46 dBm (40 W) per 20 MHz carrier, so 15.2 dBm per resource element, plus 15-18 dBi of antenna gain. A UE transmits at most 23 dBm through a small antenna (0 dBi, often less for embedded antennas). The base station compensates with better antennas, a lower noise figure, and by giving a UE at the edge **fewer resource blocks** so that its 23 dBm are concentrated where they're needed. The result is the same asymmetry as in Wi-Fi: at the cell edge the uplink fails first. Uplink symptoms (random access failures, low uplink rate, drops while sending) at a "reasonable" RSRP point to uplink coverage.
+**Downlink vs uplink:** a macro base station transmits about 46 dBm (40 W) per 20 MHz carrier, so 15.2 dBm per resource element, through 15-18 dBi antennas. A UE transmits at most 23 dBm (less after MPR) through a small antenna (0 dBi, often negative for embedded antennas). The base station compensates with better antennas and noise figure and by concentrating the UE's power on fewer RBs (section 8). The result is the same asymmetry as in Wi-Fi: at the cell edge the uplink fails first. Uplink symptoms (random access failures, low uplink rate, drops while sending) at a "reasonable" RSRP point to uplink coverage.
 
-**Maximum coupling loss** (MCL, the total loss between the antennas' connectors, antenna gains included) is how 3GPP compares coverage:
+**Maximum coupling loss** (MCL: the total loss between the antenna connectors at which the service still works, antenna gains included) is how 3GPP compares coverage:
 
 | Technology | MCL (3GPP study targets: TR 36.888 for LTE-M, TR 45.820 for NB-IoT) |
 |---|---|
@@ -844,9 +892,9 @@ The 13 dB between B20 and n78 come before walls, which also attenuate more at hi
 | LTE-M (CE mode B) | 155.7 dB: LTE + 15 dB |
 | NB-IoT | 164 dB: GPRS + 20 dB |
 
-Each +10 dB reaches roughly one more wall or floor deeper indoors (rule of thumb). The extra margin of LTE-M and NB-IoT comes from repetitions: more energy per bit, paid in latency and battery (section 15).
+Each +10 dB reaches roughly one more wall or floor deeper indoors (rule of thumb). The extra margin of LTE-M and NB-IoT comes from repetitions: more energy per bit, paid in latency and battery (section 16).
 
-**Example:** the device in a basement, 2 km from the site on B20: 96.6 dB free space, plus about 20-30 dB of urban clutter, 15-20 dB to enter the building and 10-20 dB more for the basement (rule of thumb) gives 140-165 dB. Broadband LTE is marginal there; NB-IoT works.
+**Example:** the device in a basement, 2 km from the site on B20: 96.6 dB of free space, plus about 20-30 dB of urban clutter, 15-20 dB to enter the building and 10-20 dB more for the basement (rule of thumb), gives 140-165 dB. Broadband LTE is marginal there; NB-IoT works.
 
 ---
 

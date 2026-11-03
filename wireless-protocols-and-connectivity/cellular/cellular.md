@@ -399,17 +399,19 @@ Enterprises run their own LTE or 5G networks on dedicated spectrum (local licens
 |---|---|---|
 | FDD (frequency division duplex) | Uplink and downlink on two separate frequency ranges at the same time, a fixed **duplex spacing** apart | Most bands below 2.7 GHz (B1, B3, B7, B8, B20, B28...) |
 | TDD (time division duplex) | One frequency range, shared in time according to a slot pattern | 2.3, 2.6 and 3.3-4.2 GHz, mmWave (B38, B40, B41, n41, n77, n78, n257-n261) |
-| SDL (supplemental downlink) | Downlink only, aggregated with an FDD carrier | B32 (1.5 GHz, EU), B29 (700 MHz, US) |
+| SDL (supplemental downlink) | Downlink only, aggregated with another carrier | B29 (700 MHz, US), B32 / n75 (1.5 GHz, EU) |
+| SUL (supplemental uplink, NR) | Uplink only, paired with an NR TDD cell to extend its uplink coverage on a lower frequency | n80 to n86 (the uplink parts of B3, B8, B20, B28...) |
+| Half-duplex FDD | FDD bands, but the UE doesn't transmit and receive at the same time | LTE-M and NB-IoT devices, RedCap optionally: saves the duplexer |
 
-All TDD cells of an area use the **same** uplink/downlink pattern, synchronized to GNSS time: a base station transmitting while its neighbor receives would jam it. The pattern fixes the uplink share (a typical n78 pattern gives the uplink about a fifth of the time), which is why TDD uplink rates are lower than downlink rates.
+All TDD cells of an area use the **same** uplink/downlink pattern, synchronized to GNSS time: a base station transmitting while its neighbor receives would jam it. The pattern fixes the uplink share (a common n78 pattern gives the uplink about a fifth of the time, section 6), which is why TDD uplink rates are much lower than downlink rates.
 
-In most FDD bands the uplink is the lower frequency range. **Reverse duplex** bands (B13, B14, B20) put the uplink above the downlink.
+In most FDD bands the uplink is the lower frequency range. **Reverse duplex** bands (B13, B14, B20, B71) put the uplink above the downlink.
 
-### Band numbers
+### Band numbers and frequency ranges
 
-3GPP numbers LTE bands `B<n>` (TS 36.101) and NR bands `n<n>` (TS 38.101-1, -2). An NR band reusing an LTE band's range usually keeps its number (B3 → n3, B28 → n28). NR splits its spectrum in two **frequency ranges**:
+3GPP numbers LTE bands `B<n>` (TS 36.101) and NR bands `n<n>` (TS 38.101-1 for FR1, TS 38.101-2 for FR2). An NR band reusing an LTE band's range usually keeps its number (B3 → n3, B28 → n28). NR splits its spectrum in two **frequency ranges**:
 
-- **FR1:** 410 MHz to 7.125 GHz ("sub-6 GHz", including mid-band 3.3-4.2 GHz).
+- **FR1:** 410 MHz to 7.125 GHz ("sub-6 GHz", including the 3.3-4.2 GHz mid-band and, for NR-U, 5 and 6 GHz unlicensed bands).
 - **FR2:** 24.25 to 71 GHz (mmWave), split since Rel-17 into FR2-1 (to 52.6 GHz) and FR2-2 (52.6 to 71 GHz).
 
 | Band | Uplink (MHz) | Downlink (MHz) | Duplex | Where it's used |
@@ -420,7 +422,7 @@ In most FDD bands the uplink is the lower frequency range. **Reverse duplex** ba
 | B4 | 1710-1755 | 2110-2155 | FDD | Americas (AWS-1) |
 | B5 / n5 | 824-849 | 869-894 | FDD | Americas, Asia ("850") |
 | B7 / n7 | 2500-2570 | 2620-2690 | FDD | EU, Asia ("2600") |
-| B8 / n8 | 880-915 | 925-960 | FDD | EU, Asia ("900"): former GSM, used by LTE-M and NB-IoT |
+| B8 / n8 | 880-915 | 925-960 | FDD | EU, Asia ("900"): former GSM, widely used by LTE-M and NB-IoT |
 | B12 | 699-716 | 729-746 | FDD | US (700 lower A/B/C) |
 | B13 | 777-787 | 746-756 | FDD, reverse | US (700 upper C) |
 | B14 | 788-798 | 758-768 | FDD, reverse | US (FirstNet public safety) |
@@ -437,24 +439,34 @@ In most FDD bands the uplink is the lower frequency range. **Reverse duplex** ba
 | n258 | 24250-27500 | | TDD | EU ("26 GHz"), Asia |
 | n260, n261 | 37000-40000, 27500-28350 | | TDD | US mmWave |
 
-**Low bands carry coverage, high bands carry capacity.** Below 1 GHz (B8, B12, B13, B20, B28, B71) signals travel far and enter buildings; 1.7-2.7 GHz carries most LTE traffic; 3.5 GHz gives wide channels with less range; mmWave gives very wide channels over a few hundred meters with line of sight. An IoT device in a basement lives on the low bands.
+**Low bands carry coverage, high bands carry capacity.** Below 1 GHz (B8, B12, B13, B20, B28, B71) signals travel far and enter buildings; 1.7-2.7 GHz carries most LTE traffic; 3.5 GHz gives 100 MHz carriers with less range; mmWave gives very wide carriers over a few hundred meters with line of sight. An IoT device in a basement lives on the low bands (section 9).
 
-### Regulation
+### Regulation and power classes
 
-Unlike Wi-Fi, a cellular device never chooses its frequencies: it only transmits on a carrier where the operator's cell invited it, at the power the cell allows (up to its **power class**: 23 dBm, class 3, for most devices; 26 dBm, class 2, on some TDD bands; 20 dBm, class 5, for many LTE-M modules). Regulation therefore applies to the device's conformity, not to its configuration:
+Unlike Wi-Fi, a cellular device never chooses its frequencies or power on its own: it only transmits on a carrier where a cell allowed it, at a power set by power control (section 8) and capped by the cell (`p-Max`) and by its **power class**:
+
+| Power class | Maximum output | Typical use |
+|---|---|---|
+| 3 | 23 dBm | Most LTE and NR devices |
+| 2 | 26 dBm | "HPUE", mainly NR and LTE TDD bands (n41, n77, n78, B41) where the uplink duty cycle is low |
+| 1.5, 1 | 29 dBm, 31 dBm | Fixed wireless access and special devices, some bands only |
+| 5 | 20 dBm | Many LTE-M and NB-IoT modules |
+| 6 | 14 dBm | NB-IoT for very small batteries (Rel-14), later LTE-M too |
+
+FR2 has its own power classes by device type (fixed, handheld, vehicle), specified as EIRP because the antenna is an array. Regulation applies to the device's conformity, not to user configuration:
 
 | Region | Rules |
 |---|---|
 | EU | Radio Equipment Directive (RED), with harmonized standards ETSI EN 301 908-1 (common), -13 (LTE UE), -25 (NR UE) |
-| US | FCC Part 22 (850 MHz), Part 24 (PCS), Part 27 (AWS, 600/700 MHz, 2.5 GHz, 3.7 GHz), Part 90 (B14), Part 96 (CBRS, B48/n48) |
+| US | FCC Part 22 (850 MHz), Part 24 (PCS), Part 27 (AWS, 600/700 MHz, 2.5 GHz, 3.7 GHz C-band), Part 30 (mmWave: 24, 28, 37, 39, 47 GHz), Part 90 (B14), Part 96 (CBRS, B48/n48) |
 
-On top of regulation, operators require **industry certification** (GCF in Europe, PTCRB in North America) and often their own acceptance tests before a device may use their network.
+Operators also require **industry certification** (GCF in Europe, PTCRB in North America) and often their own acceptance tests before a device may use their network.
 
 ### Channel numbers: EARFCN and NR-ARFCN
 
 Cells are configured and reported by channel number, not frequency.
 
-**LTE EARFCN** (TS 36.101 section 5.7.3): each band has a downlink offset. F<sub>DL</sub> = F<sub>DL_low</sub> + 0.1 × (N<sub>DL</sub> - N<sub>Offs-DL</sub>) MHz.
+**LTE EARFCN** (TS 36.101 section 5.7.3): each band has a downlink offset. F<sub>DL</sub> = F<sub>DL_low</sub> + 0.1 × (N<sub>DL</sub> - N<sub>Offs-DL</sub>) MHz; the carrier center is on a 100 kHz raster.
 
 | Band | F<sub>DL_low</sub> (MHz) | N<sub>Offs-DL</sub> | Downlink EARFCN range | Example |
 |---|---|---|---|---|
@@ -465,22 +477,23 @@ Cells are configured and reported by channel number, not frequency.
 | B20 | 791 | 6150 | 6150-6449 | 6300 = 806 MHz (the example cell) |
 | B28 | 758 | 9210 | 9210-9659 | 9410 = 778 MHz |
 
-Uplink EARFCNs have their own ranges (B20 uplink: 24150-24449); one EARFCN is enough to identify an FDD carrier, since the duplex spacing is fixed per band.
+Uplink EARFCNs have their own ranges (B20 uplink: 24150-24449). One downlink EARFCN identifies an FDD carrier, since the duplex spacing is fixed per band.
 
 **NR-ARFCN** (TS 38.104 section 5.4.2) is one global raster for all bands:
 
 | Range | Step | Formula | Example |
 |---|---|---|---|
-| 0-3000 MHz | 5 kHz | F = 0.005 × N MHz | 158200 = 791 MHz (n28, n20 region) |
+| 0-3000 MHz | 5 kHz | F = 0.005 × N MHz | 158200 = 791 MHz (n20, n28) |
 | 3000-24250 MHz | 15 kHz | F = 3000 + 0.015 × (N - 600000) MHz | 636666 = 3549.99 MHz (the example n78 cell) |
 | 24250-100000 MHz | 60 kHz | F = 24250.08 + 0.06 × (N - 2016667) MHz | |
 
-NR also has a coarser **synchronization raster** (GSCN) where the UE looks for the SSB during cell search (section 6), so it doesn't have to try every NR-ARFCN.
+Each band allows only a subset of NR-ARFCNs (its channel raster, every 15 or 30 kHz in n78, for instance). NR also has a coarser **synchronization raster** (GSCN numbers) on which the SSB is placed, so the UE doesn't try every NR-ARFCN during cell search (section 7). The SSB doesn't have to be at the carrier center, unlike LTE's synchronization signals.
 
 ### Combinations and regional variants
 
-- **Carrier aggregation** (CA, section 7) and **EN-DC** (LTE + NR dual connectivity, section 9) only work for the band combinations the UE declares and the operator configured: `CA_3A-20A` is a 20 MHz class A carrier on B3 plus one on B20; `DC_20A_n78A` is LTE B20 anchoring NR n78. The list of supported combinations in a module's datasheet matters as much as its band list.
-- **Modules come in regional variants** (an `-E` for Europe, an `-A` for North America...) because RF front ends (filters, duplexers, power amplifiers) cover a limited set of bands, and because certification is per region and per operator. A "global" module covers more bands with more compromises (size, cost, sensitivity). Check every target country's and operator's bands, including low bands for coverage and LTE-M/NB-IoT bands if the device uses them.
+- **Carrier aggregation** and **dual connectivity** (section 8) only work for the band combinations the UE declares and the network configured: `CA_3A-20A` is one carrier on B3 plus one on B20 (class A = one carrier of up to 20 MHz in that band); `CA_7C` is two contiguous carriers in B7; `DC_20A_n78A` is EN-DC with an LTE B20 anchor and an NR n78 secondary. The supported combinations in a module's capability report matter as much as its band list.
+- **Modules come in regional variants** (a European and a North American version of the same module, for instance) because RF front ends (filters, duplexers, power amplifiers) cover a limited set of bands, and because certification is per region and per operator. A "global" module covers more bands with compromises in size, cost and sensitivity. Check every target country's and operator's bands, including low bands for coverage and the LTE-M/NB-IoT bands if the device uses them.
+- **Unlicensed and shared spectrum:** LTE-LAA (B46, 5 GHz, downlink with listen-before-talk) and NR-U (n46 at 5 GHz, n96 at 6 GHz) use unlicensed spectrum alongside Wi-Fi, with listen-before-talk; CBRS (B48/n48, US) is shared spectrum managed by a spectrum access system.
 
 ---
 
@@ -488,70 +501,77 @@ NR also has a coarser **synchronization raster** (GSCN) where the UE looks for t
 
 ### OFDMA down, SC-FDMA up
 
-Like Wi-Fi since 802.11a, LTE and NR split a carrier into many narrow **subcarriers** and send one modulated symbol per subcarrier per OFDM symbol, with a **cyclic prefix** (CP, the guard interval) that absorbs echoes. The difference is who uses them: the base station hands out subcarriers and symbols to different UEs in the same transmission (**OFDMA**), every scheduling interval.
+Like Wi-Fi since 802.11a, LTE and NR split a carrier into many narrow **subcarriers** and send one modulated symbol per subcarrier per OFDM symbol, with a **cyclic prefix** (CP) that absorbs multipath echoes. The difference is who uses them: the base station allocates subcarriers and symbols to different UEs in the same OFDM symbols (**OFDMA**), every scheduling interval, and nobody contends.
 
-- **Downlink:** OFDMA (CP-OFDM).
-- **LTE uplink:** **SC-FDMA** (DFT-spread OFDM): the same grid, but each UE's symbols are spread over its subcarriers by a DFT first, which gives a lower peak-to-average power ratio. The UE's power amplifier can then run closer to its maximum, which saves battery and extends the uplink range.
-- **NR uplink:** CP-OFDM (better for MIMO and high rates) or DFT-s-OFDM (better at the cell edge), chosen by the network.
+- **Downlink:** OFDMA (CP-OFDM) in both systems.
+- **LTE uplink:** **SC-FDMA** (DFT-spread OFDM): each UE's symbols are spread over its contiguous subcarriers by a DFT before the OFDM modulator, which gives a low peak-to-average power ratio. The UE's power amplifier then runs closer to its maximum with less back-off: more uplink range for the same battery.
+- **NR uplink:** CP-OFDM (better for MIMO and high rates, allows non-contiguous allocations) or DFT-s-OFDM (single layer, better at the cell edge), switched by RRC configuration.
 
 ### LTE frame structure
 
 | Parameter | LTE value |
 |---|---|
-| Subcarrier spacing | 15 kHz |
+| Subcarrier spacing | 15 kHz (plus 7.5 and 3.75 kHz for special cases such as MBSFN and NB-IoT uplink) |
 | OFDM symbol (without CP) | 66.7 µs |
-| Cyclic prefix | Normal 4.7 µs (5.2 µs on the first symbol of a slot), extended 16.7 µs |
-| Resource block (RB) | 12 subcarriers = 180 kHz, over one slot |
+| Cyclic prefix | Normal: 5.2 µs on the first symbol of a slot, 4.7 µs on the others. Extended: 16.7 µs |
+| Resource element | One subcarrier during one symbol: the unit of the resource grid |
+| Resource block (RB) | 12 subcarriers = 180 kHz during one slot. The scheduler allocates pairs of RBs over a subframe |
 | Slot | 0.5 ms, 7 symbols (normal CP) |
-| Subframe, TTI | 1 ms, 2 slots: the scheduling interval |
-| Radio frame | 10 ms, 10 subframes, numbered by the system frame number (SFN, 0-1023) |
+| Subframe, TTI | 1 ms, 2 slots, 14 symbols: the scheduling interval |
+| Radio frame | 10 ms, 10 subframes, numbered by the system frame number (SFN, 0-1023: a 10.24 s cycle) |
+| Frame types | Type 1 for FDD; type 2 for TDD (7 uplink-downlink configurations with special subframes) |
 
 | Channel bandwidth (MHz) | 1.4 | 3 | 5 | 10 | 15 | 20 |
 |---|---|---|---|---|---|---|
 | Resource blocks | 6 | 15 | 25 | 50 | 75 | 100 |
 | Occupied (MHz) | 1.08 | 2.7 | 4.5 | 9 | 13.5 | 18 |
 
-The rest of the channel is guard band. The example cell (10 MHz on B20) has 50 RBs, 600 subcarriers.
+The rest of the channel is guard band. The example cell (10 MHz on B20) has 50 RBs, 600 subcarriers. Each downlink subframe starts with a **control region** of 1 to 3 symbols (PDCCH, size signaled by PCFICH) followed by the data region, and LTE's cell-specific reference signals (CRS) are spread over every RB of every subframe, whether or not data is sent.
 
 ### NR numerologies
 
-NR keeps the structure but scales it: subcarrier spacing is 15 × 2<sup>µ</sup> kHz, where µ is the **numerology**. A slot is always 14 symbols, so wider spacing means shorter slots, hence lower latency and more tolerance to phase noise at high frequencies, but a shorter CP (less tolerance to delay spread).
+NR keeps the structure but scales it: subcarrier spacing is 15 × 2<sup>µ</sup> kHz, where µ is the **numerology**. A slot is always 14 symbols (12 with extended CP), so wider spacing means shorter slots: lower latency and more tolerance to phase noise and Doppler at high frequencies, but a shorter CP (less tolerance to delay spread, hence smaller cells).
 
-| µ | Spacing | Slot | Slots per 1 ms | Normal CP | Used for |
+| µ | Spacing | Slot | Slots per 1 ms subframe | Normal CP | Used for |
 |---|---|---|---|---|---|
-| 0 | 15 kHz | 1 ms | 1 | 4.7 µs | FR1, LTE-like, NR in narrow carriers and DSS |
+| 0 | 15 kHz | 1 ms | 1 | 4.7 µs | FR1: narrow carriers, low bands, DSS with LTE |
 | 1 | 30 kHz | 0.5 ms | 2 | 2.3 µs | FR1 mid-band: the usual n77/n78 choice |
-| 2 | 60 kHz | 0.25 ms | 4 | 1.2 µs (extended CP possible) | FR1 or FR2 |
-| 3 | 120 kHz | 0.125 ms | 8 | 0.59 µs | FR2 data |
-| 4 | 240 kHz | 62.5 µs | 16 | 0.29 µs | FR2 synchronization blocks only |
-| 5, 6 | 480, 960 kHz | | | | FR2-2 (52.6-71 GHz), Rel-17 |
+| 2 | 60 kHz | 0.25 ms | 4 | 1.2 µs (extended CP 4.2 µs possible) | FR1 (rare) or FR2 |
+| 3 | 120 kHz | 0.125 ms | 8 | 0.59 µs | FR2 data and SSB |
+| 4 | 240 kHz | 62.5 µs | 16 | 0.29 µs | FR2-1 SSB only |
+| 5, 6 | 480, 960 kHz | 31.25, 15.6 µs | 32, 64 | | FR2-2 (52.6-71 GHz), Rel-17 |
 
 | Maximum carrier | 15 kHz | 30 kHz | 60 kHz | 120 kHz |
 |---|---|---|---|---|
 | FR1 | 50 MHz (270 RBs) | 100 MHz (273 RBs) | 100 MHz (135 RBs) | |
-| FR2 | | | 200 MHz | 400 MHz (264 RBs) |
+| FR2-1 | | | 200 MHz (264 RBs) | 400 MHz (264 RBs) |
 
-Other NR differences that show up in logs:
-- An NR resource block is 12 subcarriers in frequency only. Allocations are made per slot, over a number of symbols, and can be as short as 2, 4 or 7 symbols ("mini-slots") for low latency.
-- **Bandwidth parts** (BWP): a UE works in a part of the carrier (up to 4 configured, one active at a time). A small BWP saves power when idle; a RedCap device's 20 MHz BWP lives inside a 100 MHz carrier.
-- No always-on reference signals across the whole carrier (LTE's CRS): NR transmits reference signals only where and when needed ("lean carrier"), which saves network energy and interference.
+The 10 ms frame and 1 ms subframe are kept in every numerology, so timing across numerologies stays aligned.
+
+**Where NR's structure differs from LTE's:**
+- **Resource blocks** are 12 subcarriers in frequency only. An allocation is a set of RBs over a number of symbols in a slot (from 2 symbols, "mini-slots", up to the full slot), so short transmissions don't wait for a slot boundary.
+- **Slot formats:** in TDD, each symbol is downlink, uplink or flexible, configured semi-statically by RRC (a common pattern for the cell plus per-UE adjustments) and possibly changed dynamically by a slot format indication.
+- **No CRS.** NR transmits reference signals only where and when needed: DMRS with the data, CSI-RS for measurements, the SSB for synchronization. This "lean carrier" saves energy and interference and makes forward compatibility possible, but means the UE has fewer always-present signals to track.
+- **Bandwidth parts** (BWP): a UE works in a contiguous part of the carrier with its own numerology (up to 4 configured per direction, one active). The network switches the active BWP by DCI or a timer: a narrow BWP when idle saves power, a wide one for bursts. Initial access uses the **initial BWP** defined by the cell's CORESET 0 (section 7). A RedCap device's 20 MHz BWP lives inside a 100 MHz carrier.
+- **Point A and carrier offsets:** all grids are positioned relative to a common reference frequency ("point A"), so carriers of different numerologies and UEs with different BWPs share one frame of reference.
 
 ### Modulation, coding and MCS
 
 | Modulation | Bits per symbol | LTE | NR |
 |---|---|---|---|
-| QPSK | 2 | Yes | Yes (π/2-BPSK too, uplink DFT-s-OFDM) |
+| π/2-BPSK | 1 | | Uplink with DFT-s-OFDM (coverage) |
+| QPSK | 2 | Yes | Yes |
 | 16-QAM | 4 | Yes | Yes |
 | 64-QAM | 6 | Yes | Yes |
 | 256-QAM | 8 | Downlink Rel-12, uplink Rel-14 | Rel-15, both directions |
-| 1024-QAM | 10 | Downlink, later releases | Downlink FR1, Rel-17 |
+| 1024-QAM | 10 | Downlink, Rel-15 | Downlink FR1, Rel-17 |
 
 | | LTE | NR |
 |---|---|---|
-| Data channel coding | Turbo code | LDPC |
-| Control channel coding | Tail-biting convolutional code | Polar code |
+| Data channel coding | Turbo code | LDPC (two base graphs: large blocks and high rates, small blocks and low rates) |
+| Control channel coding | Tail-biting convolutional code (PDCCH, PBCH) | Polar code (DCI, PBCH, larger UCI); Reed-Muller and repetition for small UCI |
 
-The **MCS index** sent with each grant selects a modulation and a code rate; with the number of allocated RBs and layers, it gives the **transport block size** (TBS) from tables in TS 36.213 and TS 38.214. The base station picks the MCS from the UE's channel reports and its own error statistics (link adaptation, section 7). The highest code rates are about 0.93 (948/1024 in NR).
+The **MCS index** sent with each grant selects a modulation and a code rate from an MCS table (several are defined: a default table, a 256-QAM table, a low-spectral-efficiency table for URLLC). With the number of allocated RBs and layers, it gives the **transport block size** (TBS): a lookup in TS 36.213 for LTE, a formula plus a table in TS 38.214 for NR. The base station picks the MCS from the UE's channel reports and its own error statistics (link adaptation, section 8). The highest code rate is about 0.93 (948/1024 in NR).
 
 ### Peak data rate
 
@@ -560,7 +580,7 @@ TS 38.306 gives the approximate NR peak rate per carrier:
 ```
 rate (Mb/s) = 10^-6 × layers × Qm × f × Rmax × (N_PRB × 12) / Ts × (1 - OH)
   Qm   = bits per symbol (8 for 256-QAM)       Rmax = 948/1024
-  f    = scaling factor (1, or 0.4-0.8 for weaker UEs)
+  f    = scaling factor (1, or 0.8, 0.75, 0.4 for UEs that declare less)
   Ts   = average symbol duration = 10^-3 / (14 × 2^µ) s
   OH   = overhead: 0.14 downlink FR1, 0.18 downlink FR2, 0.08 uplink FR1, 0.10 uplink FR2
 ```
@@ -569,22 +589,24 @@ rate (Mb/s) = 10^-6 × layers × Qm × f × Rmax × (N_PRB × 12) / Ts × (1 - O
 |---|---|---|---|
 | NR 100 MHz, 30 kHz (273 RBs), downlink | 4 | 256-QAM | 2337 Mb/s |
 | Same, 2 layers (a typical IoT router) | 2 | 256-QAM | 1169 Mb/s |
-| Same, uplink | 1 | 256-QAM | 625 Mb/s, times the TDD uplink share |
-| NR 20 MHz, 15 kHz (106 RBs), RedCap-class | 2 | 64-QAM | 170 Mb/s |
+| Same, uplink | 1 | 256-QAM | 625 Mb/s, before applying the TDD uplink share |
+| NR 20 MHz, 15 kHz (106 RBs), downlink | 2 | 64-QAM | 170 Mb/s |
 
-For LTE, a 20 MHz carrier carries 100 RBs × 12 subcarriers × 14 symbols per ms = 16.8 million symbols per second. With 64-QAM and 2 layers that's 201.6 Mb/s of raw capacity; control channels and reference signals take about a quarter, which leaves the 150 Mb/s of Cat 4. As with Wi-Fi, these are peak rates for one UE with perfect signal and the whole cell to itself (section 8 for realistic values).
+For an FDD carrier, the formula gives the rate per direction; for TDD it must be multiplied by the share of symbols in each direction. For LTE, a 20 MHz carrier carries 100 RBs × 12 subcarriers × 14 symbols per ms = 16.8 million resource elements per second. With 64-QAM and 2 layers that's 201.6 Mb/s raw; the control region and reference signals take about a quarter, which leaves the 150 Mb/s of Cat 4. These are peak rates for one UE with perfect signal and the whole cell to itself.
 
 ### MIMO and beamforming
 
-- **Layers** (rank): independent data streams sent on the same resources from several antennas. The UE reports the rank it can receive (**RI**) and a precoder choice (**PMI**); the base station decides. 2 layers is the norm for 2-antenna devices, 4 for phones on mid-band.
-- **LTE transmission modes** (TM1 to TM10) select diversity, open-loop or closed-loop spatial multiplexing, beamforming. They're configured by RRC and appear in modem logs.
-- **Massive MIMO:** mid-band NR base stations commonly have 32 or 64 transmit/receive chains, forming narrow beams per UE (gains at the cell edge) and serving several UEs on the same resources (MU-MIMO).
-- **Beam management:** NR transmits its synchronization blocks in a sweep of beams (section 6); the UE reports the best one, and in FR2 both sides steer beams with antenna arrays. Blocking a mmWave beam with a hand or a wall forces a beam switch or a fallback to FR1/LTE.
+- **Layers** (rank): independent data streams sent on the same resources from several antennas. The UE reports the rank it can receive (**RI**) and a preferred precoder (**PMI**) from a codebook; the base station decides. 2 layers is the norm for 2-antenna devices, 4 for phones on mid-band. Uplink MIMO (2 or 4 layers) exists but most IoT devices transmit one layer.
+- **LTE transmission modes** (TM1 to TM10) select transmit diversity, open-loop or closed-loop spatial multiplexing, or beamforming with UE-specific reference signals; they are configured by RRC. NR has no transmission modes: everything is DMRS-based, and the precoding is transparent to the UE.
+- **TDD reciprocity:** in TDD, uplink and downlink share a frequency, so the base station can estimate the downlink channel from the UE's uplink **sounding reference signals** (SRS) instead of relying on codebook reports. That's what makes massive MIMO efficient on n78.
+- **Massive MIMO:** mid-band NR base stations commonly have 32 or 64 transmit/receive chains, forming narrow beams per UE (gain at the cell edge) and serving several UEs on the same resources (multi-user MIMO).
+- **Beam management** (NR): the SSB and CSI-RS are sent in a sweep of beams; the UE measures them and reports the best (section 8). In FR2, both sides steer beams with antenna arrays, and the network tells the UE which receive beam to use through **TCI states** (transmission configuration indicators). When the serving beam fades (a hand over a mmWave module), the UE runs **beam failure recovery**: it detects the failure on reference signals and asks for a new beam through random access, without dropping the connection.
 
 ### TDD patterns and timing advance
 
-- **TDD pattern:** a sequence of downlink (D), uplink (U) and special/flexible (S) slots, repeated. The special slot has a **guard period** that covers the round trip to the farthest UE, which bounds the cell radius. LTE TDD has 7 fixed configurations (configuration 2 is `DSUDD DSUDD`); NR configures patterns freely: `DDDSU` (2.5 ms at 30 kHz) is common on n78 in Europe, with operator-dependent variants.
-- **Timing advance (TA):** a UE far from the base station receives late and would transmit late. The base station measures the delay and tells the UE to transmit earlier by the round trip, so all uplink transmissions arrive aligned. One LTE TA step is 0.52 µs, about 78 m of distance; the maximum (0.67 ms) allows cells of about 100 km. The current TA is a rough distance to the base station, which positioning uses (section 16).
+- **TDD pattern:** a sequence of downlink (D), uplink (U) and special or flexible (S) slots, repeated. The special slot contains a **guard period** that covers the round trip to the farthest UE, which bounds the cell radius. LTE TDD has 7 fixed configurations (configuration 2 is `DSUDD DSUDD`); NR configures patterns freely: `DDDSU` (2.5 ms at 30 kHz) is common on n78 in Europe, with operator-dependent variants such as `DDDSUDDSUU`. Neighbor operators in adjacent blocks of the same band must align their patterns to avoid interference.
+- **Timing advance (TA):** a UE far from the base station receives late and would transmit late. The base station measures the delay during random access and tells the UE to transmit earlier by the round trip, then keeps correcting it with TA commands, so all uplink transmissions arrive aligned within the CP. One LTE TA step is 16 T<sub>s</sub> ≈ 0.52 µs, about 78 m of distance; the maximum (0.67 ms) allows cells of about 100 km. NR uses steps scaled by the numerology.
+- **Uplink synchronization is a state:** when the **time alignment timer** expires without TA commands (after a quiet period, set by RRC), the UE considers itself out of uplink sync and must do random access again before sending anything. The TA value is also a rough distance to the base station, used by positioning (section 17).
 
 ---
 

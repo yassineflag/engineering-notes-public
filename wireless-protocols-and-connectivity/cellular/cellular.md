@@ -1,24 +1,27 @@
 # Cellular Protocols: LTE, 5G NR and Cellular IoT
 
-How a cellular network works from the radio up to the IP session: spectrum and the physical layer, how the base station schedules every transmission, how a device finds a cell, registers, authenticates and gets an IP address, how it moves and saves power, and what LTE-M, NB-IoT and RedCap change for IoT devices.
+How a cellular network works from the radio up to the IP session: how the system is split between the device, the radio access network and the core, how the physical layer and the base station's scheduler share the spectrum, how a device finds a cell, registers, authenticates and gets an IP session with a given QoS, how it moves and sleeps, and what LTE-M, NB-IoT and RedCap change for IoT devices.
 
-This note covers the **protocols**, as 3GPP specifies them and as a device engineer meets them in modem logs and AT command answers. Driving a modem from Linux (ModemManager, QMI, MBIM, drivers, board integration) belongs in a separate note. Until it exists, the networking side is in [Networking Fundamentals for Embedded Linux Engineers](../../networking/fundamentals/fundamentals.md#20-modem-based-devices-the-ap-and-the-modem) (the AP-modem split, data path, sharing the connection) and a hands-on modem bring-up is in [Building a Home Gateway on Linux](../../networking/gateway/gateway.md#method-2-cellular-modem-quectel-ec25).
+This note covers the **protocols**, as 3GPP specifies them and as an engineer meets them in modem logs, signaling traces and network behavior. Driving a modem from Linux (drivers, ModemManager, QMI, MBIM, board integration) belongs in a separate note. Until it exists, the device-side networking is in [Networking Fundamentals for Embedded Linux Engineers](../../networking/fundamentals/fundamentals.md#20-modem-based-devices-the-ap-and-the-modem) (the AP-modem split, data path, sharing the connection) and a hands-on modem bring-up is in [Building a Home Gateway on Linux](../../networking/gateway/gateway.md#method-2-cellular-modem-quectel-ec25). The [Wi-Fi note](../wifi/wifi.md) is the reference for the comparisons with 802.11.
 
 **Assumptions:**
-- One example network (section 2) is used throughout: a device with an LTE/5G module, an operator's LTE and 5G cells, and its core network.
-- LTE means 3GPP E-UTRA from Release 8 on; 5G means NR and the 5G core (5GC) from Release 15 on. 2G and 3G appear only where they still matter: fallback, sunsets and security downgrades.
-- Spectrum values are given for the EU and the US. They change, and other regions differ.
+- One example network (section 2) is used throughout: a device with an LTE/5G module, an operator's LTE and NR cells, and its core network.
+- LTE means 3GPP E-UTRA and the EPC from Release 8 on; 5G means NR and the 5G core (5GC) from Release 15 on. 2G and 3G appear only where they still matter: fallback, sunsets and security downgrades.
+- Spectrum and regulation are given for the EU and the US. They change, and other regions differ.
 
 **Conventions:**
-- **Normative** values come from a 3GPP specification (cited by its TS number) or a regulation.
+- **Normative** values come from a 3GPP specification (the TS or TR number is given) or a regulation.
 - **Rule of thumb** marks empirical values that depend on the network, the device and the environment.
-- **Operator-dependent** or **vendor-dependent** marks behavior that 3GPP leaves to the network operator or to the modem vendor.
+- **Operator-dependent** marks what 3GPP leaves to the network's configuration; **vendor-dependent** what it leaves to the modem or base station implementation. A feature can be specified, supported by a modem, supported by the network equipment and still not enabled by a given operator: the four are different questions.
+- LTE and NR names are given side by side when they differ (`RRCConnectionSetup` / `RRCSetup`). Message and information element names follow TS 36.331, TS 38.331, TS 24.301 and TS 24.501.
+
+**Verification status:** procedures, timers, cause values and numerical parameters follow the 3GPP specifications cited in each section. The less common values (AT result code fields, timer encodings, IoT and RedCap capabilities, eDRX limits, the Rel-19 256-bit algorithms) were checked against specification text or vendor references in November 2026. Peak rates of the IoT categories differ slightly between sources and are given as approximations. Nothing was measured on a live network: example outputs are illustrative.
 
 **How to read it:**
-- **To learn:** Parts 1 to 3 in order.
-- **To understand the radio:** Part 2 (sections 5 to 8).
-- **To understand registration, sessions and power saving:** Part 3 (sections 9 to 16).
-- **To debug:** section 18 first, then the section of the step that fails.
+- **To learn:** in order. Part 1 sets up the vocabulary and the architecture that the rest relies on.
+- **To understand the radio:** Part 2 (sections 6 to 9).
+- **To understand registration, sessions, mobility and power saving:** Part 3 (sections 10 to 17).
+- **To read logs or debug:** sections 18 and 19, then the section of the procedure that fails.
 
 ## Table of contents
 
@@ -26,73 +29,77 @@ This note covers the **protocols**, as 3GPP specifies them and as a device engin
 
 - [1. The mental model: what cellular changes compared to Wi-Fi](#1-the-mental-model-what-cellular-changes-compared-to-wi-fi)
 - [2. Example network](#2-example-network)
-- [3. Generations, 3GPP releases and device categories](#3-generations-3gpp-releases-and-device-categories)
-- [4. Spectrum: bands, duplexing and channel numbers](#4-spectrum-bands-duplexing-and-channel-numbers)
+- [3. Generations, 3GPP releases and device capabilities](#3-generations-3gpp-releases-and-device-capabilities)
+- [4. Architecture and protocol stacks: EPS, 5GS, NSA and SA](#4-architecture-and-protocol-stacks-eps-5gs-nsa-and-sa)
+- [5. Spectrum: bands, duplexing and channel numbers](#5-spectrum-bands-duplexing-and-channel-numbers)
 
 **Part 2: The radio interface**
 
-- [5. The physical layer: OFDM, numerology, resource grid, MCS and MIMO](#5-the-physical-layer-ofdm-numerology-resource-grid-mcs-and-mimo)
-- [6. Physical channels, cell search and system information](#6-physical-channels-cell-search-and-system-information)
-- [7. Scheduling, HARQ and layer 2](#7-scheduling-harq-and-layer-2)
-- [8. Signal measurements and link budget](#8-signal-measurements-and-link-budget)
+- [6. The physical layer: OFDM, numerology, resource grid, MCS and MIMO](#6-the-physical-layer-ofdm-numerology-resource-grid-mcs-and-mimo)
+- [7. Physical channels, cell search, system information and random access](#7-physical-channels-cell-search-system-information-and-random-access)
+- [8. Scheduling, HARQ and layer 2](#8-scheduling-harq-and-layer-2)
+- [9. Signal measurements and link budget](#9-signal-measurements-and-link-budget)
 
-**Part 3: The network and its procedures**
+**Part 3: Procedures**
 
-- [9. Network architecture: RAN, EPC, 5GC, NSA and SA](#9-network-architecture-ran-epc-5gc-nsa-and-sa)
 - [10. Identities and the SIM](#10-identities-and-the-sim)
-- [11. Getting service: PLMN selection, RRC connection, attach and registration](#11-getting-service-plmn-selection-rrc-connection-attach-and-registration)
+- [11. Getting service: network selection, RRC connection, attach and registration](#11-getting-service-network-selection-rrc-connection-attach-and-registration)
 - [12. Data sessions: APNs, bearers, PDU sessions, QoS and IP](#12-data-sessions-apns-bearers-pdu-sessions-qos-and-ip)
 - [13. Security: authentication, keys, ciphering and known attacks](#13-security-authentication-keys-ciphering-and-known-attacks)
-- [14. Mobility and power saving: RRC states, paging, handover, DRX, PSM](#14-mobility-and-power-saving-rrc-states-paging-handover-drx-psm)
-- [15. Cellular IoT: LTE-M, NB-IoT and RedCap](#15-cellular-iot-lte-m-nb-iot-and-redcap)
-- [16. Beyond data: SMS, voice, positioning, slicing, NTN](#16-beyond-data-sms-voice-positioning-slicing-ntn)
+- [14. RRC states and mobility: paging, reselection, handover, 4G-5G interworking](#14-rrc-states-and-mobility-paging-reselection-handover-4g-5g-interworking)
+- [15. Power saving: DRX, eDRX and PSM](#15-power-saving-drx-edrx-and-psm)
+- [16. Cellular IoT: LTE-M, NB-IoT and RedCap](#16-cellular-iot-lte-m-nb-iot-and-redcap)
+- [17. Beyond best-effort data: voice, SMS, positioning, slicing, URLLC, NTN](#17-beyond-best-effort-data-voice-sms-positioning-slicing-urllc-ntn)
 
 **Part 4: Observing and debugging**
 
-- [17. Observing the protocol: AT commands, modem logs and captures](#17-observing-the-protocol-at-commands-modem-logs-and-captures)
-- [18. Troubleshooting by layer](#18-troubleshooting-by-layer)
-- [19. Not covered here](#19-not-covered-here)
+- [18. Observing the signaling: modem reports and logs](#18-observing-the-signaling-modem-reports-and-logs)
+- [19. Troubleshooting by layer](#19-troubleshooting-by-layer)
+- [20. Not covered here](#20-not-covered-here)
 - [References](#references)
 
 ---
 
 ## 1. The mental model: what cellular changes compared to Wi-Fi
 
-Wi-Fi and cellular both carry IP over a radio, but they are built on opposite assumptions. Wi-Fi is a LAN that anyone can set up on free spectrum; cellular is a service that an operator runs on spectrum it paid for, and every device is a subscriber the network knows by name.
+Wi-Fi and cellular both carry IP over OFDM radios, but they are built on opposite assumptions. Wi-Fi is a LAN that anyone can set up on shared spectrum; cellular is a service that an operator runs on spectrum it holds a license for, and every device is a subscriber the network authenticates by name before giving it anything.
 
 | | Wi-Fi | Cellular (LTE, 5G NR) |
 |---|---|---|
-| Spectrum | Unlicensed: shared with neighbors and other technologies | Licensed to the operator: no one else transmits there |
-| Who transmits when | Each station contends for the medium (CSMA/CA) | The **base station schedules** every transmission, both directions, every millisecond or less (section 7) |
-| Duplex | Half duplex on one channel | FDD (separate uplink and downlink frequencies) or TDD (scheduled time split), section 4 |
+| Spectrum | Unlicensed: shared with neighbors and other technologies | Licensed to the operator: no uncoordinated transmitter on the carrier |
+| Who transmits when | Each station contends for the medium (CSMA/CA) | The **base station schedules** every transmission in both directions, every 1 ms (LTE) or every slot (NR) (section 8) |
+| Duplex | Half duplex on one channel | FDD (separate uplink and downlink frequencies) or TDD (time split on a synchronized pattern) (section 5) |
 | Range | Tens of meters | Hundreds of meters to tens of kilometers per cell |
-| Identity | A MAC address; the network knows a passphrase | A subscription in a SIM (IMSI), authenticated by the operator's core (sections 10 and 13) |
-| Joining | Scan, authenticate, associate, handshake, DHCP | Cell search, random access, RRC connection, attach or registration, authentication, data session (section 11) |
-| What you get | A port on a LAN: broadcast, ARP, neighbors | A point-to-point **IP session** to the operator's gateway: no LAN, no broadcast, no neighbors (section 12) |
-| Mobility | The client decides when to roam; a new AP may mean a new handshake | The **network** decides handovers; the IP address survives across the whole network (section 14) |
-| Power saving | The client tells the AP it sleeps | The network sets the sleep cycles and timers; the device requests values (section 14) |
-| Who you debug with | Your own AP's logs | The operator's network, which you usually can't see: the device's logs and reject causes are most of your evidence (sections 17 and 18) |
+| Identity | A MAC address; the network knows a passphrase or a RADIUS account | A subscription in a USIM (IMSI/SUPI), authenticated by the operator's core (sections 10 and 13) |
+| Joining | Scan, authenticate, associate, 4-way handshake, DHCP | Cell search, system information, random access, RRC connection, attach or registration with authentication, data session (sections 7 and 11) |
+| What you get | A port on a LAN: broadcast, ARP, neighbors | A point-to-point **IP session** to a gateway in the operator's core: no LAN, no broadcast, no neighbors (section 12) |
+| QoS | Four access categories, decided per frame by the sender | Per-session and per-flow QoS classes enforced by the network, with guaranteed bit rates for voice (section 12) |
+| Mobility | The client decides when to roam; a new AP may mean a new handshake | The **network** commands handovers in connected mode; the IP address survives across the whole network (section 14) |
+| Power saving | The client tells the AP it sleeps | The network configures the sleep cycles and timers; the device requests values (section 15) |
+| Who you debug with | Your own AP's logs | The operator's network, which you usually can't see: the device's signaling logs and cause values are most of your evidence (sections 18 and 19) |
 
-**Vocabulary:**
+**The base station is in charge of the air.** A UE never transmits data on its own initiative: it asks for resources and sends exactly what it is granted, at the time, on the resource blocks and with the modulation the base station chose. The exceptions are the random access preamble (the "knock on the door", section 7) and resources the network configured in advance. Most of what makes cellular feel different from Wi-Fi follows: predictable latency under load, no collisions between users of a cell, and a device that can do nothing about a busy cell except wait for its share.
+
+**The network is in charge of the state.** Whether the device is connected or idle, which cell it uses in connected mode, how often it may sleep and for how long, which QoS each flow gets: all are decided by the network, using parameters it broadcasts or sends in RRC and NAS messages. A device influences them only through requests and capability reports. Reading what the network actually configured (rather than what the device asked for) is the core skill of cellular debugging.
+
+**Your IP session is a tunnel.** The address a device gets belongs to a gateway in the operator's core, often hundreds of kilometers away, or in another country when roaming. Every packet travels from the device to that gateway through GTP tunnels and only there enters an IP network (section 4). The radio is one hop of that path.
+
+**Vocabulary** (more in the sections that introduce each concept):
 
 | Term | Meaning |
 |---|---|
-| UE (user equipment) | The device: in 3GPP terms, the mobile equipment (ME, the modem and its host) plus the USIM |
-| eNB, gNB | The LTE base station (eNodeB) and the 5G NR base station (gNodeB). One base station serves several cells |
-| Cell | One carrier frequency, from one base station, in one direction (sector). Identified on the air by its PCI and globally by its cell identity (section 6) |
-| RAN | Radio access network: the base stations (E-UTRAN for LTE, NG-RAN for 5G) |
-| Core network | The operator's control and gateway functions: EPC for LTE, 5GC for 5G (section 9) |
-| PLMN | Public land mobile network: one operator's network in one country, identified by MCC + MNC (`001-01` in the examples) |
-| Attach, registration | Becoming known to the core network: "attach" in LTE, "registration" in 5G (section 11) |
+| UE (user equipment) | The device: the mobile equipment (ME: the modem and its host) plus the USIM |
+| eNB, gNB | The LTE base station (eNodeB) and the NR base station (gNodeB). One base station serves several cells |
+| Cell | One carrier, from one base station, in one direction (sector). Identified on the air by its PCI and globally by its cell identity (section 7) |
+| RAN | Radio access network: the base stations. E-UTRAN for LTE, NG-RAN for 5G (gNBs and ng-eNBs) |
+| Core network | The operator's control and gateway functions: EPC for LTE, 5GC for 5G (section 4) |
+| PLMN | Public land mobile network: one operator's network in one country, identified by MCC + MNC |
+| AS, NAS | Access stratum: the protocols between the UE and the base station (RRC and the radio layers). Non-access stratum: the protocols between the UE and the core (registration, mobility, sessions), carried transparently through the base station |
+| RRC | Radio resource control: the AS control protocol that sets up, configures and releases the radio connection |
+| Attach, registration | Becoming known to the core: "attach" in LTE, "registration" in 5G (section 11) |
 | APN, DNN | The name of the packet data network a session connects to: access point name (LTE), data network name (5G) (section 12) |
-| Bearer, PDU session | The data session and its QoS: a PDN connection made of EPS bearers in LTE, a PDU session with QoS flows in 5G (section 12) |
-| NAS, AS | Non-access stratum: messages between the UE and the core (registration, sessions, security). Access stratum: everything between the UE and the base station (RRC, the radio layers) |
-| RRC | Radio resource control: the protocol between the UE and the base station that sets up, configures and releases the radio connection (sections 6, 11 and 14) |
-| Modem | The processor and firmware that implement all of the above in the device. The host (an application processor running Linux, for instance) only asks it for a session and gets IP packets |
-
-**The base station is in charge.** A UE never transmits data on its own initiative: it asks for resources and sends exactly what it is granted, on the frequencies, at the times and with the modulation the base station chose. The only exception is the random access preamble, the "knock on the door" (section 6). Most of what makes cellular feel different from Wi-Fi follows from that: predictable latency under load, no collisions between users of the same cell, and a device that can do nothing about a busy cell except wait for its share.
-
-**Your IP session is a tunnel.** The address a device gets belongs to a gateway in the operator's core, often hundreds of kilometers away (in another country when roaming). Every packet travels from the device to that gateway through tunnels, and only there enters an IP network (section 9). The radio part is one hop of that path; the rest is the operator's.
+| Bearer, PDU session | A data session and its QoS: a PDN connection made of EPS bearers in LTE, a PDU session made of QoS flows in 5G (section 12) |
+| Modem | The processor and firmware that implement the UE side of all of the above. The host only asks it for sessions and exchanges IP packets with it |
 
 ---
 
@@ -104,31 +111,30 @@ The examples reuse network B of the [fundamentals note](../../networking/fundame
 flowchart LR
     subgraph DEV["Device (UE)"]
         host["Host processor<br/>applications, IP stack"]
-        modem["Modem<br/>LTE Cat 4 and 5G NSA<br/>USIM: IMSI 001010000012345"]
+        modem["Modem<br/>LTE Cat 4, NR NSA and SA<br/>USIM: IMSI 001010000012345"]
         host --- modem
     end
     subgraph RAN["Operator RAN"]
         enb["eNB, cell 1<br/>band 20, EARFCN 6300, 10 MHz<br/>PCI 123, TAC 6699"]
-        gnb["gNB, cell 2<br/>n78, NR-ARFCN 636666, 100 MHz<br/>secondary for EN-DC"]
+        gnb["gNB, cell 2<br/>n78, NR-ARFCN 636666, 100 MHz<br/>PCI 456"]
     end
-    subgraph CORE["Operator core (EPC)"]
-        mme["MME"]
-        hss["HSS"]
-        sgw["S-GW"]
-        pgw["P-GW<br/>APN internet: CGNAT<br/>APN mgmt.example"]
+    subgraph CORE["Operator core"]
+        epc["EPC<br/>MME, S-GW, HSS"]
+        fgc["5GC<br/>AMF, SMF, UDM"]
+        gw["Combined gateway<br/>P-GW and UPF<br/>APN internet: CGNAT<br/>APN mgmt.example"]
     end
     inet(("Internet"))
     srv["api.example.com<br/>198.51.100.20"]
     mgmt["Device management<br/>10.250.0.0/16"]
     modem -.-|"LTE radio"| enb
     modem -.-|"NR radio"| gnb
-    enb --- mme
-    mme --- hss
-    enb --- sgw
-    gnb --- sgw
-    sgw --- pgw
-    pgw --- inet --- srv
-    pgw --- mgmt
+    enb --- epc
+    gnb --- epc
+    gnb --- fgc
+    epc --- gw
+    fgc --- gw
+    gw --- inet --- srv
+    gw --- mgmt
 ```
 
 | Element | Value | Notes |
@@ -136,68 +142,256 @@ flowchart LR
 | PLMN | MCC `001`, MNC `01` | The 3GPP test network code: the role a documentation range plays for IP |
 | IMSI | `001010000012345` | MCC + MNC + MSIN (section 10) |
 | IMEI | `490154203237518` | Identifies the modem hardware, not the subscriber (section 10) |
-| LTE cell | Band 20 (800 MHz, FDD), EARFCN 6300 = 806 MHz downlink, 10 MHz, PCI 123, TAC 6699 | The anchor cell: coverage and control |
-| NR cell | n78 (3.5 GHz, TDD), NR-ARFCN 636666 = 3549.99 MHz, 100 MHz, 30 kHz subcarrier spacing | Added as a secondary cell in non-standalone mode (section 9) |
-| Internet session | APN `internet`, IPv4v6: `100.72.15.9`, prefix `2001:db8:c0:1::/64`, DNS `192.0.2.53`, MTU 1430 | `wwan0` in the fundamentals note. `100.72.15.9` is in the CGNAT range (RFC 6598) |
-| Management session | APN `mgmt.example`, IPv4 `10.200.0.15` | A private APN that only reaches the operator's device-management servers. `wwan1` in the fundamentals note |
-| Server | `api.example.com`, `198.51.100.20` | Reached through the P-GW's CGNAT |
+| LTE cell | Band 20 (800 MHz, FDD), EARFCN 6300 = 806 MHz downlink, 10 MHz, PCI 123, TAC 6699 (0x1A2B) | The coverage layer, and the anchor in NSA mode |
+| NR cell | n78 (3.5 GHz, TDD), NR-ARFCN 636666 = 3549.99 MHz, 100 MHz, 30 kHz subcarrier spacing, PCI 456 | A secondary cell in NSA (EN-DC with the LTE cell), or a standalone cell connected to the 5GC (section 4) |
+| Internet session | APN/DNN `internet`, IPv4v6: `100.72.15.9`, prefix `2001:db8:c0:1::/64`, DNS `192.0.2.53`, MTU 1430 | `wwan0` in the fundamentals note. `100.72.15.9` is in the CGNAT range (RFC 6598) |
+| Management session | APN/DNN `mgmt.example`, IPv4 `10.200.0.15` | A private APN that only reaches the operator's device-management servers. `wwan1` in the fundamentals note |
+| Server | `api.example.com`, `198.51.100.20` | Reached through the gateway's CGNAT |
 
-`198.51.100.0/24` and `192.0.2.0/24` are IPv4 documentation ranges (RFC 5737), `2001:db8::/32` the IPv6 one (RFC 3849). The IMSI, IMEI, cell identities and APNs are placeholders.
+The operator runs both cores with a combined gateway (P-GW + UPF, with a combined SMF/P-GW-C), so the device keeps its sessions when it moves between LTE and 5G SA (section 14). `198.51.100.0/24` and `192.0.2.0/24` are IPv4 documentation ranges (RFC 5737), `2001:db8::/32` the IPv6 one (RFC 3849). The IMSI, IMEI, cell identities and APNs are placeholders.
 
 ---
 
-## 3. Generations, 3GPP releases and device categories
+## 3. Generations, 3GPP releases and device capabilities
 
-**3GPP** (3rd Generation Partnership Project) writes the specifications for GSM, UMTS, LTE and 5G, in numbered **releases**. Each release is a frozen set of specifications; vendors implement a subset of a release's features, and operators enable a subset of those. Specifications are numbered by series: `TS 36.xxx` for LTE radio, `TS 38.xxx` for NR radio, `TS 23.xxx` for architecture and procedures, `TS 24.xxx` for NAS protocols, `TS 33.xxx` for security (references at the end). "4G" and "5G" are ITU and marketing names; specifications and modem logs say E-UTRA/LTE and NR.
+**3GPP** (3rd Generation Partnership Project) writes the specifications for GSM, UMTS, LTE and 5G, in numbered **releases**. A release is a frozen set of specifications; later releases add features while keeping older devices working. Vendors implement a subset of a release's optional features, and operators enable a subset of those. Specifications are numbered by series: `TS 36.xxx` for LTE radio, `TS 38.xxx` for NR radio, `TS 23.xxx` for architecture and procedures, `TS 24.xxx` for NAS protocols, `TS 33.xxx` for security, `TS 27.xxx` and `TS 31.xxx` for the terminal and the USIM (references at the end). "4G" and "5G" are ITU and marketing names; specifications and modem logs say E-UTRA/LTE and NR.
 
-| Generation | Technology | 3GPP release | Access | Peak rates (spec) | Status |
+| Generation | Technology | 3GPP release | Radio access | Peak rates (spec) | Status |
 |---|---|---|---|---|---|
-| 2G | GSM, GPRS, EDGE | Phase 1 and 2, R97, R99 | TDMA, 200 kHz carriers | Up to a few hundred kb/s (EDGE) | Switched off in many countries, kept in others for IoT and voice fallback |
-| 3G | UMTS (WCDMA), HSPA, HSPA+ | R99, Rel-5 to Rel-8 | CDMA, 5 MHz carriers | 42 Mb/s (HSPA+ dual carrier) | Mostly switched off in the US and much of Europe |
-| 4G | LTE | Rel-8, Rel-9 | OFDMA down, SC-FDMA up, 1.4 to 20 MHz | 300 Mb/s (4 layers, 20 MHz) | The coverage layer everywhere |
-| 4G | LTE-Advanced | Rel-10 to Rel-12 | + carrier aggregation, 8 layers down | 3 Gb/s (spec maximum) | Common: aggregation of 2 to 5 carriers |
-| 4G | LTE-Advanced Pro | Rel-13, Rel-14 | + LTE-M, NB-IoT, LAA (unlicensed), V2X | | LTE-M and NB-IoT are the IoT workhorses |
-| 5G | NR, phase 1 | Rel-15 (2018) | OFDMA both ways, flexible numerology, up to 100 MHz (FR1) and 400 MHz (FR2) | About 20 Gb/s (ITU target) | NSA first, SA since |
-| 5G | NR, phase 2 | Rel-16 (2020) | + URLLC, industrial IoT, NR-U, NR V2X, positioning | | |
-| 5G | NR | Rel-17 (2022) | + RedCap, NTN (satellite), bands up to 71 GHz | | |
-| 5G-Advanced | NR | Rel-18 (2024), Rel-19 | + eRedCap, AI/ML studies, more NTN, energy saving | | Deployment starting |
-| 6G | | Studies from Rel-20 | | | First specifications expected around the end of the decade |
+| 2G | GSM, GPRS, EDGE | Phase 1/2, R97, R99 | TDMA, 200 kHz carriers | A few hundred kb/s (EDGE) | Switched off in the US, Australia and several European countries; kept elsewhere for IoT and voice fallback |
+| 3G | UMTS (WCDMA), HSPA, HSPA+ | R99, Rel-5 to Rel-8 | WCDMA, 5 MHz carriers | 42 Mb/s (dual-carrier HSPA+) | Mostly switched off in the US and Europe |
+| 4G | LTE | Rel-8, Rel-9 | OFDMA down, SC-FDMA up, 1.4 to 20 MHz | 300 Mb/s (4 layers, 20 MHz) | The coverage layer almost everywhere |
+| 4G | LTE-Advanced | Rel-10 to Rel-12 | + carrier aggregation, 8 layers down, relays, eICIC | 3 Gb/s (Cat 8, spec maximum) | Aggregation of 2 to 5 carriers is common |
+| 4G | LTE-Advanced Pro | Rel-13, Rel-14 | + LTE-M, NB-IoT, LAA (unlicensed), C-V2X sidelink | | LTE-M and NB-IoT are the IoT workhorses |
+| 5G | NR, phase 1 | Rel-15 (2018) | OFDM both ways, flexible numerology, up to 100 MHz (FR1) and 400 MHz (FR2) carriers | About 20 Gb/s (IMT-2020 target) | NSA first, SA since |
+| 5G | NR, phase 2 | Rel-16 (2020) | + URLLC, industrial IoT and TSN, NR-U, NR sidelink, IAB, positioning | | |
+| 5G | NR | Rel-17 (2022) | + RedCap, NTN, 52.6-71 GHz, multicast and broadcast, small data in RRC_INACTIVE | | |
+| 5G-Advanced | NR | Rel-18 (2024), Rel-19 (2025) | + eRedCap, network energy saving, L1/L2-triggered mobility, AI/ML for the air interface, XR, ambient IoT studies, 256-bit algorithms | | Deployment starting |
+| 6G | | Studies in Rel-20, first specifications expected in Rel-21 | | | Around the end of the decade |
 
 **What each step changed for a device engineer:**
-- **2G to 3G:** packet data became usable; the network authenticated itself to the SIM (2G only authenticates the device, section 13).
-- **3G to LTE:** all-IP, no circuit-switched domain: voice became VoIP (VoLTE over IMS, section 16). An LTE device gets an IP address as part of attaching (section 11). Latency dropped to tens of ms.
-- **LTE to 5G NR:** flexible numerology and wide channels, beams, a new service-based core, network slicing, a third RRC state (inactive). Early 5G (NSA) still runs its control plane on LTE (section 9).
+- **2G to 3G:** usable packet data; the network authenticates itself to the SIM (2G only authenticates the device, section 13).
+- **3G to LTE:** all-IP with no circuit-switched domain: voice became VoIP over IMS (section 17). Attaching to LTE always creates an IP session (section 11). Latency dropped to tens of ms, and the base station took over functions of the 3G radio network controller (RNC), which no longer exists.
+- **LTE to NR:** flexible numerology and wide carriers, beam-based operation, no always-on reference signals, a third RRC state (inactive), a service-based core with network slicing and finer QoS. Early 5G (NSA) still runs its control plane on LTE and the EPC (section 4).
+
+### 5G feature map
+
+The features most likely to show up in a device's capabilities or an operator's announcements:
+
+| Release | Features |
+|---|---|
+| Rel-15 | eMBB: NSA (EN-DC) and SA, FR1 and FR2, bandwidth parts, beam management, LDPC and polar codes, 5GC with slicing and QoS flows, RRC_INACTIVE |
+| Rel-16 | URLLC (mini-slots, configured grants, PDCP duplication, high-reliability MCS/CQI tables), industrial IoT and time-sensitive networking, NR-U (unlicensed), NR sidelink (V2X), integrated access and backhaul (IAB), 2-step random access, conditional handover and DAPS, UE power saving (wake-up signal on PDCCH), positioning (multi-RTT, angles), non-public networks, LTE-M/NB-IoT connected to the 5GC |
+| Rel-17 | RedCap, NTN (NR and IoT), up to 71 GHz, small data transmission (SDT) in RRC_INACTIVE, multicast/broadcast services, paging early indication, coverage enhancements, sidelink relays, multi-SIM support |
+| Rel-18 | eRedCap, network energy saving, L1/L2-triggered mobility (LTM), XR traffic, uplink enhancements, NTN in more bands, AI/ML studies, low-power wake-up receiver study |
+| Rel-19 | AI/ML for the air interface (beam management, positioning), ambient IoT, 256-bit security algorithms, NTN and RedCap enhancements |
 
 ### Device categories and capabilities
 
-An LTE device declares a **UE category** (TS 36.306): the peak rates and features its modem supports. Since Rel-12, downlink and uplink categories are separate. 5G NR has no categories: the UE reports individual capabilities (bands, combinations, layers, modulation).
+An LTE device declares a **UE category** (TS 36.306): its peak rates, buffer sizes and number of layers. Since Rel-12, downlink and uplink categories are declared separately. NR has no categories: the UE sends a detailed **capability** report (bands, band combinations, feature sets per combination, layers, modulation, optional features), and only RedCap is a defined device type.
 
 | Category | Downlink / uplink peak (Mb/s) | Receive antennas | Typical use |
 |---|---|---|---|
-| Cat NB1 / NB2 (NB-IoT) | About 0.03 / 0.06 (NB1), 0.13 / 0.16 (NB2) | 1 | Meters, sensors: small, rare messages, deep indoor |
-| Cat M1 / M2 (LTE-M) | About 1 / 1 (M1), 4 / 7 (M2) | 1 | Trackers, wearables, alarms: mobility and voice possible |
+| NB-IoT Cat NB1 / NB2 | About 0.026 / 0.06 (NB1), 0.13 / 0.16 (NB2) | 1 | Meters, sensors: small, rare messages, deep indoor |
+| LTE-M Cat M1 / M2 | About 1 / 1 (M1), 4 / 7 (M2) | 1 | Trackers, wearables, alarms: mobility and voice possible |
 | Cat 1 | 10 / 5 | 2 | Telematics, payment terminals, alarm panels |
-| Cat 1bis | 10 / 5 | 1 | Same, with one antenna (Rel-13): smaller devices |
-| Cat 4 | 150 / 50 | 2 | Routers, gateways, the example device |
+| Cat 1bis | 10 / 5 | 1 | Same with one antenna (Rel-13): smaller devices |
+| Cat 4 | 150 / 50 | 2 | Routers and gateways, the example device |
 | Cat 6 | 300 / 50 | 2 | Carrier aggregation of 2 carriers |
-| Cat 12 (+ uplink Cat 13) | 600 / 150 | 2 to 4 | Aggregation of 3+ carriers, 256-QAM |
-| NR RedCap (Rel-17) | About 150 / 50 (2 RX, 20 MHz) | 1 or 2 | 5G for wearables, cameras, industrial sensors: replaces Cat 4 class |
-| NR eRedCap (Rel-18) | About 10 (5 MHz baseband) | 1 | 5G for the Cat 1 class |
+| Cat 12 (+ uplink Cat 13) | 600 / 150 | 2 to 4 | Aggregation of 3 or more carriers, 256-QAM |
+| NR RedCap (Rel-17) | About 100-200 / 50-100, depending on antennas, layers and modulation (20 MHz FR1) | 1 or 2 | Wearables, cameras, industrial sensors: the 5G successor of Cat 4 |
+| NR eRedCap (Rel-18) | About 10 / 10 (5 MHz data baseband) | 1 or 2 | The 5G successor of Cat 1 |
 | NR eMBB | Hundreds of Mb/s to several Gb/s | 2 to 4 | Phones, fixed wireless access, high-end routers |
 
-Peak rates assume the best signal and an empty cell: real throughput is a fraction of them (sections 7 and 8). LTE-M and NB-IoT trade throughput for coverage, cost and battery life (section 15).
+Peak rates assume the best signal and an empty cell; real throughput is a fraction of them (sections 8 and 9). LTE-M and NB-IoT trade throughput for coverage, cost and battery life (section 16).
+
+**Capability, support and configuration are different things.** A feature works only if it is (1) specified in a release, (2) implemented and declared by the UE in its capability report, (3) implemented by the network vendor, and (4) enabled by the operator for that cell, that subscription and that band combination. "The module supports 5G SA" can still mean NSA-only on a given network, or SA without the band combinations the operator uses. The UE's capability report (section 11) and the network's RRC configuration (section 18) are the evidence for (2) and (4).
 
 ### Sunsets
 
-Operators switch off old generations to reuse their spectrum, on their own schedules:
+Operators switch off old generations to reuse their spectrum, each on its own schedule:
 
-- **3G** is gone in the US and most of Europe; **2G** is gone in the US, Australia and several European countries, and kept elsewhere for older IoT devices and voice fallback. Dates differ per operator: check the target operators' plans before choosing a fallback technology.
-- Consequences: a device that needed 2G/3G for voice (circuit-switched fallback), SMS, or simply for coverage must work on LTE alone, or on LTE-M/NB-IoT. Voice requires VoLTE (section 16), and emergency call systems built on circuit-switched calls, such as the EU's in-vehicle eCall, move to IMS-based versions.
-- LTE-M and NB-IoT are expected to outlive the LTE broadband generation, since they share LTE carriers and are also specified to run inside NR carriers.
+- **3G** is gone in the US and most of Europe. **2G** is gone in the US and Australia and in several European countries, and kept elsewhere, sometimes for years, for older IoT devices and voice fallback. Check each target operator's published plans before relying on a fallback technology.
+- A device that used 2G/3G for voice (circuit-switched fallback), SMS or coverage must work on LTE alone, or on LTE-M/NB-IoT. Voice then requires IMS (VoLTE, section 17), and emergency systems built on circuit-switched calls, such as the EU's in-vehicle eCall, move to IMS-based versions.
+- LTE-M and NB-IoT are expected to outlive LTE broadband: they can run inside an LTE carrier and, since Rel-16, coexist inside an NR carrier.
 
 ---
 
-## 4. Spectrum: bands, duplexing and channel numbers
+## 4. Architecture and protocol stacks: EPS, 5GS, NSA and SA
+
+### The two systems
+
+The **EPS** (evolved packet system) is LTE's E-UTRAN plus the **EPC** core; the **5GS** is NG-RAN plus the **5GC**. Both separate the radio network from the core and the control plane from the user plane.
+
+```mermaid
+flowchart LR
+    ue["UE"]
+    subgraph EPS["EPS: LTE"]
+        enb["eNB"]
+        mme["MME<br/>NAS: attach, mobility,<br/>bearer signaling"]
+        hss["HSS<br/>subscriptions,<br/>authentication vectors"]
+        sgw["S-GW<br/>user plane anchor<br/>between eNBs"]
+        pgw["P-GW<br/>IP address, APN,<br/>policy enforcement"]
+        pcrf["PCRF<br/>policy rules"]
+    end
+    subgraph FGS["5GS"]
+        gnb["gNB"]
+        amf["AMF<br/>registration, mobility,<br/>NAS termination"]
+        smf["SMF<br/>PDU sessions,<br/>IP addresses"]
+        upf["UPF<br/>user plane"]
+        ausf["AUSF, UDM<br/>authentication,<br/>subscriptions"]
+        pcf["PCF<br/>policy rules"]
+    end
+    dn(("Data networks<br/>internet, private APNs/DNNs"))
+    ue -.-|"Uu"| enb
+    ue -.-|"Uu"| gnb
+    enb ---|"S1-MME"| mme
+    enb ---|"S1-U"| sgw
+    enb ---|"X2"| gnb
+    mme ---|"S6a"| hss
+    mme ---|"S11"| sgw
+    sgw ---|"S5/S8"| pgw
+    pgw ---|"Gx"| pcrf
+    pgw ---|"SGi"| dn
+    gnb ---|"N2"| amf
+    gnb ---|"N3"| upf
+    amf ---|"N12"| ausf
+    amf ---|"N11"| smf
+    smf ---|"N4"| upf
+    smf ---|"N7"| pcf
+    upf ---|"N6"| dn
+```
+
+| Role | EPC (LTE) | 5GC |
+|---|---|---|
+| Base station | eNB | gNB; ng-eNB for LTE cells connected to the 5GC |
+| NAS termination, registration, mobility, paging | MME | AMF |
+| Session management (create, modify, release sessions; IP allocation) | MME (signaling) + P-GW control | SMF |
+| User plane: tunnels, forwarding, the IP anchor | S-GW (mobility anchor) + P-GW (IP anchor) | UPF, possibly several in a chain (an anchor UPF and intermediate UPFs) |
+| Subscriber data, authentication | HSS | UDM/UDR + AUSF |
+| Policy and charging rules | PCRF | PCF |
+| Exposure to applications, non-IP data | SCEF | NEF |
+| Slice selection, function discovery | | NSSF, NRF |
+
+| Interface | EPS | 5GS | Carries |
+|---|---|---|---|
+| Radio | Uu | Uu | RRC, user data |
+| Base station to control plane | S1-MME (S1AP over SCTP) | N2 (NGAP over SCTP) | UE context setup, NAS transport, paging, handover signaling |
+| Base station to user plane | S1-U (GTP-U) | N3 (GTP-U) | User data tunnels |
+| Between base stations | X2 (X2AP, GTP-U) | Xn (XnAP, GTP-U) | Handover preparation, data forwarding, dual connectivity |
+| Gateway to gateway | S5 (home), S8 (roaming) | N9 | User data, and GTP-C control in LTE |
+| Control to user plane | S11 (GTP-C); Sx (PFCP) with CUPS | N4 (PFCP) | Tunnel and forwarding rules |
+| To the data network | SGi | N6 | Plain IP |
+
+- **5GC is service-based:** its control functions expose HTTP/2 APIs to each other (the N11, N12, N7 links above are service interactions), which makes slicing and distributed user planes easier to build. The radio side and the UE see none of it.
+- **CUPS** (control and user plane separation, Rel-14) split the EPC gateways the same way, so LTE user planes can also be distributed. Most operators now run combined EPC/5GC functions (SMF+P-GW-C, UPF+P-GW-U, HSS+UDM).
+
+### Protocol stacks
+
+```mermaid
+flowchart LR
+    subgraph UE["UE"]
+        direction TB
+        unas["NAS"] --- urrc["RRC"]
+        uip["IP (user data)"] --- usdap["SDAP (NR)"]
+        urrc --- updcp["PDCP"]
+        usdap --- updcp
+        updcp --- urlc["RLC"] --- umac["MAC"] --- uphy["PHY"]
+    end
+    subgraph BS["eNB / gNB"]
+        direction TB
+        brrc["RRC"] --- bpdcp["PDCP, SDAP"] --- brlc["RLC"] --- bmac["MAC"] --- bphy["PHY"]
+        bs1["S1AP / NGAP<br/>over SCTP"]
+        bgtp["GTP-U over UDP/IP"]
+    end
+    subgraph CN["Core"]
+        direction TB
+        cnas["NAS<br/>MME / AMF"]
+        cgw["IP anchor<br/>P-GW / UPF"]
+    end
+    uphy -.-|"Uu"| bphy
+    bs1 ---|"S1-MME / N2"| cnas
+    bgtp ---|"S1-U, S5 / N3, N9"| cgw
+```
+
+| Plane | UE | Base station | Core |
+|---|---|---|---|
+| Control plane | NAS / RRC / PDCP / RLC / MAC / PHY | Terminates RRC and the radio layers. Relays NAS messages, unread, inside RRC on one side and S1AP/NGAP on the other | NAS ends at the MME or AMF |
+| User plane | IP / SDAP (NR) / PDCP / RLC / MAC / PHY | Terminates the radio layers; puts each packet in a GTP-U tunnel (GTP-U / UDP / IP) | GTP-U ends at the P-GW or anchor UPF, which routes the inner IP packet |
+
+- **NAS** carries mobility management (EMM in LTE, 5GMM in 5G: attach or registration, tracking area updates, authentication, security mode) and session management (ESM / 5GSM: bearers, PDU sessions). In LTE, ESM messages travel inside EMM messages during the attach; in 5G, 5GSM messages travel in 5GMM transport messages.
+- **RRC** carries system information, connection setup and release, security activation for the radio, measurement configuration and reports, handover commands, and the configuration of every lower layer. Most of what a modem log shows about the radio is RRC.
+- The layers below are covered in sections 6 to 8: PDCP (ciphering, integrity, header compression, reordering), RLC (segmentation, retransmissions), MAC (multiplexing, HARQ, scheduling requests), PHY.
+
+**Radio bearers** are the RRC-level pipes. **Signaling radio bearers** carry RRC and NAS: SRB0 (before a connection exists), SRB1 (RRC, and NAS piggybacked), SRB2 (NAS, lower priority), SRB3 (direct NR RRC in EN-DC), SRB4 (application layer measurement reports, Rel-17). **Data radio bearers** (DRB) carry user data: one per EPS bearer in LTE; in NR, the base station maps the QoS flows of a PDU session onto DRBs as it sees fit (section 12).
+
+**Channel hierarchy:** the layers talk through three kinds of channels, which appear by name in logs:
+
+| Level | Channels | Meaning |
+|---|---|---|
+| Logical (RLC to MAC): what is carried | BCCH (system information), PCCH (paging), CCCH (before a connection: SRB0), DCCH (dedicated signaling: SRB1-3), DTCH (user data) | Type of information |
+| Transport (MAC to PHY): how it is carried | BCH, PCH, DL-SCH, UL-SCH, RACH | Format, coding, HARQ |
+| Physical: where on the air | PBCH, PDSCH, PDCCH, PUSCH, PUCCH, PRACH (section 7) | Resources and modulation |
+
+The MIB travels BCCH → BCH → PBCH; the SIBs, paging and all dedicated data travel on the shared channels (DL-SCH → PDSCH, UL-SCH → PUSCH).
+
+### State machines at a glance
+
+A UE runs several state machines at once, one per layer, and logs report them separately:
+
+| Layer | LTE | 5G | What it means |
+|---|---|---|---|
+| Registration (NAS) | EMM-DEREGISTERED / EMM-REGISTERED | RM-DEREGISTERED / RM-REGISTERED | Whether the core knows the UE (section 11) |
+| Signaling connection (NAS) | ECM-IDLE / ECM-CONNECTED | CM-IDLE / CM-CONNECTED | Whether a NAS signaling connection (RRC + S1/N2) exists |
+| Radio (AS) | RRC_IDLE / RRC_CONNECTED | RRC_IDLE / RRC_INACTIVE / RRC_CONNECTED | Whether the base station holds a context (section 14) |
+| Sessions (NAS) | PDN connections and their EPS bearers | PDU sessions and their QoS flows | Whether the UE has IP connectivity (section 12) |
+
+In LTE, a registered UE always has at least one PDN connection, and RRC_IDLE always coincides with ECM-IDLE. In 5G, a UE can be registered without any PDU session, and RRC_INACTIVE is a **CM-CONNECTED** state: the core still considers the UE connected, while the radio connection is suspended (section 14). "Idle" in a log means nothing until you know which layer reports it.
+
+### Where your packets actually go
+
+```
+ Device ──radio──► eNB/gNB ══GTP-U══► S-GW ══GTP-U══► P-GW  ──► CGNAT, firewall ──► internet
+ 100.72.15.9                (operator transport)        or UPF                           198.51.100.20
+                                                      "default gateway"
+```
+
+- The **P-GW or anchor UPF is the first IP hop**. Everything before it is a tunnel from the IP point of view. A traceroute from the device shows the gateway (or nothing, if it doesn't answer) and then the operator's network.
+- Each bearer or QoS-flow aggregate has its own tunnel, identified by a tunnel endpoint ID (TEID). The UE's packets travel inside with 36 bytes of outer IPv4 + UDP + GTP-U headers (56 with an IPv6 transport, plus 8 for the 5G PDU session container extension header), one reason operators advertise a device MTU below 1500 (section 12).
+- The gateway allocates the device's address, applies per-APN policy (firewall, NAT, rate limits, zero-rating, content filtering) and is where a private APN connects to a customer's network (VPN or leased line).
+- **Location matters:** operators run few anchor gateways, sometimes one or two per country, and roaming devices are usually home-routed to their home country (section 12). The server should be near the gateway, not near the device. 5G user planes can be placed closer to the edge (local UPFs), but only if the operator does so.
+- Inbound connections usually fail: CGNAT for IPv4 and often a stateful firewall for IPv6 (see the [fundamentals note](../../networking/fundamentals/fundamentals.md#13-nat-and-address-translation)). Private APNs with routable addresses avoid both.
+
+### NSA and SA
+
+3GPP defined several ways to combine LTE, NR, the EPC and the 5GC ("options"). Two are deployed widely:
+
+| | NSA, option 3x (EN-DC) | SA, option 2 |
+|---|---|---|
+| Core | EPC | 5GC |
+| Control plane | LTE: LTE RRC on the LTE cell (master node), LTE NAS (EMM/ESM) | NR RRC, 5G NAS (5GMM/5GSM) |
+| NR's role | Secondary node: adds NR carriers to an LTE connection for capacity | The only radio |
+| Idle mode | Camps on LTE. The NR leg is added again at every connection, after measurements | Camps on NR |
+| User data | Split bearer: PDCP in the gNB, data sent over NR, LTE or both (section 8) | NR only |
+| Features | Higher downlink rates, and uplink on NR | Lower latency, RRC_INACTIVE, slicing, 5G QoS, RedCap, VoNR, 5G security (SUCI) |
+| Device needs | LTE and NR bands, and the operator's EN-DC band combinations | NR bands; SA enabled in the modem and allowed for the subscription |
+
+- **Option 4** (NR master, LTE secondary, 5GC) and **option 7** (LTE master connected to the 5GC, NR secondary) exist but are rare. **Option 5** (ng-eNB: LTE cells connected to the 5GC) is used mainly for LTE-M/NB-IoT and private networks. In multi-radio dual connectivity terms, EN-DC is LTE master + NR secondary on the EPC; NGEN-DC and NE-DC are the 5GC variants; NR-DC pairs two NR nodes (FR1 + FR2).
+- A "5G" indicator on a device may only mean that NR is available nearby (`upperLayerIndication` in LTE SIB2), not that data flows over NR. The modem's serving cell report or the RRC configuration tells the truth (section 18).
+- **DSS** (dynamic spectrum sharing) runs LTE and NR on the same carrier, sharing resources dynamically (NR rate-matches around LTE's reference signals). An operator's "5G on 700 MHz" may be an LTE carrier shared with NR.
+- **Interworking between EPS and 5GS:** with the **N26** interface between MME and AMF and combined gateways, a UE moves between LTE and SA 5G in idle and connected mode and keeps its IP sessions (section 14).
+
+### Circuit-switched remnants
+
+2G and 3G had a separate circuit-switched core (MSC) for voice and SMS. LTE can still reach it for **CS fallback** (moving to 2G/3G for a call) and **SMS over SGs** (SMS relayed by the MME to the MSC over the SGs interface). Both disappear with the 2G/3G sunsets, replaced by IMS voice and SMS over IMS or NAS (section 17).
+
+### Private networks
+
+Enterprises run their own LTE or 5G networks on dedicated spectrum (local licenses such as 3.7-3.8 GHz in Germany, CBRS in the US) with their own core and SIMs. 5G calls them **non-public networks** (NPN): standalone (SNPN, identified by a PLMN ID plus a network identifier, NID, and possibly using credentials other than a USIM) or integrated with a public network (PNI-NPN, typically through a dedicated slice or DNN with a closed access group). For a device, they are the same protocols with different identities and credentials.
+
+---
+
+## 5. Spectrum: bands, duplexing and channel numbers
 
 ### Duplexing
 
@@ -290,7 +484,7 @@ NR also has a coarser **synchronization raster** (GSCN) where the UE looks for t
 
 ---
 
-## 5. The physical layer: OFDM, numerology, resource grid, MCS and MIMO
+## 6. The physical layer: OFDM, numerology, resource grid, MCS and MIMO
 
 ### OFDMA down, SC-FDMA up
 
@@ -394,7 +588,7 @@ For LTE, a 20 MHz carrier carries 100 RBs × 12 subcarriers × 14 symbols per ms
 
 ---
 
-## 6. Physical channels, cell search and system information
+## 7. Physical channels, cell search and system information
 
 ### Channels and signals
 
@@ -467,7 +661,7 @@ sequenceDiagram
 
 ---
 
-## 7. Scheduling, HARQ and layer 2
+## 8. Scheduling, HARQ and layer 2
 
 ### The scheduler
 
@@ -564,7 +758,7 @@ Real values depend on the network's configuration (SR periods, TDD pattern, core
 
 ---
 
-## 8. Signal measurements and link budget
+## 9. Signal measurements and link budget
 
 ### What the UE measures
 
@@ -631,109 +825,6 @@ The 13 dB between B20 and n78 come before walls, which also attenuate more at hi
 Each +10 dB reaches roughly one more wall or floor deeper indoors (rule of thumb). The extra margin of LTE-M and NB-IoT comes from repetitions: more energy per bit, paid in latency and battery (section 15).
 
 **Example:** the device in a basement, 2 km from the site on B20: 96.6 dB free space, plus about 20-30 dB of urban clutter, 15-20 dB to enter the building and 10-20 dB more for the basement (rule of thumb) gives 140-165 dB. Broadband LTE is marginal there; NB-IoT works.
-
----
-
-## 9. Network architecture: RAN, EPC, 5GC, NSA and SA
-
-```mermaid
-flowchart LR
-    ue["UE"]
-    subgraph EPS["LTE: EPS"]
-        enb["eNB"]
-        mme["MME<br/>NAS: attach, mobility,<br/>session signaling"]
-        hss["HSS<br/>subscriptions,<br/>authentication vectors"]
-        sgw["S-GW<br/>user plane anchor<br/>between eNBs"]
-        pgw["P-GW<br/>IP address, APN,<br/>policy, charging"]
-        pcrf["PCRF<br/>policy"]
-    end
-    subgraph FGS["5G: 5GS"]
-        gnb["gNB"]
-        amf["AMF<br/>registration, mobility"]
-        smf["SMF<br/>PDU sessions,<br/>IP addresses"]
-        upf["UPF<br/>user plane"]
-        udm["UDM, AUSF<br/>subscriptions,<br/>authentication"]
-        pcf["PCF<br/>policy"]
-    end
-    dn(("Data networks<br/>internet, private APNs"))
-    ue -.-|"Uu"| enb
-    ue -.-|"Uu"| gnb
-    enb ---|"S1-MME"| mme
-    enb ---|"S1-U, GTP-U"| sgw
-    mme ---|"S6a"| hss
-    mme ---|"S11"| sgw
-    sgw ---|"S5/S8, GTP"| pgw
-    pgw ---|"Gx"| pcrf
-    pgw ---|"SGi"| dn
-    gnb ---|"N2"| amf
-    gnb ---|"N3, GTP-U"| upf
-    amf --- udm
-    amf ---|"N11"| smf
-    smf ---|"N4, PFCP"| upf
-    smf --- pcf
-    upf ---|"N6"| dn
-```
-
-### Network functions
-
-| Role | LTE (EPC) | 5G (5GC) |
-|---|---|---|
-| Base station | eNB | gNB (ng-eNB for LTE attached to a 5GC) |
-| Mobility and access signaling with the UE (NAS) | MME | AMF |
-| Session management | MME + P-GW control | SMF |
-| User plane: forwarding, tunnels, the IP anchor | S-GW + P-GW | UPF (one or several in a chain) |
-| Subscriber data, authentication | HSS | UDM/UDR + AUSF |
-| Policy and charging rules | PCRF | PCF |
-| Exposure to applications, non-IP data | SCEF | NEF |
-| Slice selection, function discovery | | NSSF, NRF |
-
-- **Control and user plane are separated:** signaling goes UE → base station → MME/AMF; data goes UE → base station → S-GW/UPF → P-GW/UPF. The control functions program the user plane (GTP-C in LTE, PFCP from 5G and from later EPC versions with CUPS).
-- **5GC is service-based:** its functions expose HTTP/2 APIs to each other instead of point-to-point protocols. It changes nothing on the radio, but makes slicing (section 16) and edge deployments easier to build.
-- **Between base stations:** X2 (LTE) and Xn (NR) carry handover preparation and dual connectivity coordination.
-
-### Protocol stacks
-
-| | UE | Base station | Core |
-|---|---|---|---|
-| Control plane | NAS / RRC / PDCP / RLC / MAC / PHY | RRC ends here; NAS is relayed in S1AP or NGAP over SCTP | NAS ends at the MME or AMF |
-| User plane | IP / (SDAP) / PDCP / RLC / MAC / PHY | Radio layers end here; packets go into a GTP-U tunnel (GTP-U / UDP / IP) | GTP-U ends at the P-GW or UPF, which routes the inner IP packet |
-
-**GTP-U tunnels:** each bearer or PDU session has a tunnel between the base station and the gateway, identified by a tunnel endpoint ID (TEID). The UE's IP packets travel inside, with 36 bytes of outer IPv4 + UDP + GTP headers (56 with IPv6): one reason operators advertise a device MTU below 1500 (section 12).
-
-### Where your packets actually go
-
-```
- Device ──radio──► eNB/gNB ══GTP-U══► S-GW ══GTP-U══► P-GW / UPF ──► CGNAT, firewall ──► internet
- 100.72.15.9                (operator transport)        "default gateway"                   198.51.100.20
-```
-
-- The **P-GW or UPF is the first IP hop**: everything before it is a layer 2 tunnel from the IP point of view. A traceroute from the device shows the gateway (or nothing, if it doesn't answer) and then the operator's network.
-- The gateway allocates the device's address, applies per-APN policy (firewall, NAT, rate limits, zero-rating, content filtering) and is where an IoT platform's private APN connects to a customer's network (VPN or leased line).
-- **Location matters:** operators run few gateways, sometimes one per country; roaming devices with home routing reach a gateway in their home country (section 12). The server should be near the gateway, not near the device.
-- Inbound connections usually fail: CGNAT for IPv4 and often a stateful firewall for IPv6 (see the [fundamentals note](../../networking/fundamentals/fundamentals.md#13-nat-and-address-translation)). Private APNs with fixed addresses avoid both.
-
-### Non-standalone and standalone 5G
-
-| | NSA (option 3x) | SA (option 2) |
-|---|---|---|
-| Core | EPC (LTE core) | 5GC |
-| Control plane | LTE: the UE attaches over LTE, LTE RRC, LTE NAS | NR RRC, 5G NAS |
-| NR's role | Secondary node (EN-DC) adding capacity in connected mode | The only radio |
-| Idle mode | Camps on LTE; NR is added again at each connection | Camps on NR |
-| Features | Higher downlink rates | Lower latency, RRC inactive, slicing, RedCap, VoNR, better power saving |
-| What a device needs | LTE + NR bands and the right EN-DC combinations | NR bands; SA must be enabled in the modem and offered for the subscription |
-
-- Most early "5G" networks were NSA. A "5G" indicator on a device may mean that NR is available in the area (an LTE SIB flag), not that data is flowing over NR: check the modem's report of the serving cells.
-- **DSS** (dynamic spectrum sharing) runs LTE and NR on the same carrier, sharing resources dynamically: an operator's "5G on 700 MHz" may be an LTE carrier shared with NR.
-- **Interworking:** an MME and an AMF connected by **N26** let a UE move between LTE and SA 5G in connected mode while keeping its IP address (combined P-GW/SMF+UPF anchors).
-
-### Circuit-switched remnants
-
-2G and 3G had a separate circuit-switched core (MSC) for voice and SMS. LTE can still reach it for **CS fallback** (dropping to 2G/3G for a call) and **SMS over SGs** (SMS through the MME to the MSC). Both disappear with the 2G/3G sunsets, replaced by IMS (section 16).
-
-### Private networks
-
-Enterprises run their own LTE or 5G networks on dedicated spectrum (local licenses such as 3.7-3.8 GHz in Germany, CBRS in the US) with their own core and SIMs. 5G calls them **non-public networks** (NPN): standalone (SNPN, identified by a PLMN ID plus a network identifier, NID) or integrated with a public network (PNI-NPN, often through a dedicated slice or DNN). For a device, it's the same protocol with different identities and SIM credentials.
 
 ---
 
@@ -1193,7 +1284,7 @@ TCP keepalives and NAT behavior are covered in the [fundamentals note](../../net
 
 ---
 
-## 15. Cellular IoT: LTE-M, NB-IoT and RedCap
+## 16. Cellular IoT: LTE-M, NB-IoT and RedCap
 
 LTE and NR were designed for phones. Cellular IoT variants remove what small devices don't need (bandwidth, MIMO, high-order modulation) in exchange for cost, coverage and battery life.
 
@@ -1251,7 +1342,7 @@ Support varies: each feature must be in the module, enabled in the network, and 
 
 ---
 
-## 16. Beyond data: SMS, voice, positioning, slicing, NTN
+## 17. Beyond data: SMS, voice, positioning, slicing, NTN
 
 ### SMS
 
@@ -1294,7 +1385,7 @@ Rel-17 adapts NR (**NR-NTN**) and NB-IoT/LTE-M (**IoT-NTN**) to satellites: the 
 
 ---
 
-## 17. Observing the protocol: AT commands, modem logs and captures
+## 18. Observing the protocol: AT commands, modem logs and captures
 
 The operator's network is a black box: what a device engineer can see is what the modem reports. Three levels of detail are available: standard AT commands, vendor commands, and the modem's diagnostic logs. On Linux, ModemManager (`mmcli`) presents much of the same information; driving it is left to the planned embedded Linux note (meanwhile, see the [gateway note](../../networking/gateway/gateway.md#method-2-cellular-modem-quectel-ec25)).
 
@@ -1397,7 +1488,7 @@ The modem firmware can trace its own internal state, including **every RRC and N
 
 ---
 
-## 18. Troubleshooting by layer
+## 19. Troubleshooting by layer
 
 ### Method
 
@@ -1477,7 +1568,7 @@ The module model and firmware version, the SIM's operator (MCC-MNC) and plan typ
 
 ---
 
-## 19. Not covered here
+## 20. Not covered here
 
 Topics for separate notes:
 

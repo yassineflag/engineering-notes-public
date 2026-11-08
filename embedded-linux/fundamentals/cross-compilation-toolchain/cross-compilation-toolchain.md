@@ -529,7 +529,27 @@ cbf43926  (libchk 1.0.0)
 
 ## 10. Troubleshooting
 
-Planned: symptoms, causes and fixes, marking what was reproduced.
+**Read this when something fails.** First ask: did it fail on the PC or on the board? Then run `file` on the program.
+
+The last column says whether the error was reproduced for this note.
+
+| Symptom | Likely cause | What to do | Reproduced |
+|---|---|---|---|
+| `Exec format error` on the PC | You ran a target program directly. Normal | Use `$QEMU` | Yes |
+| `Exec format error` on the board | Built for the wrong architecture, or by the PC's `gcc` | `file` on it. Is it `ARM`? | On PC only |
+| `Could not open '/lib/ld-linux-...'` from QEMU | QEMU can't find the target's loader | Add `-L` | Yes |
+| `No such file or directory` for a file that exists | The **loader** is missing on the board: built for another ABI or C library | `readelf -l` shows the path. Compare it with `/lib` on the board | Yes |
+| `error while loading shared libraries: libX.so.1` | The library isn't on the board, or isn't in the search path | `readelf -d`, `LD_LIBRARY_PATH`, `ldconfig` | Yes |
+| ``version `GLIBC_2.x' not found`` | Toolchain's glibc is newer than the board's | Section 11 | No |
+| `Illegal instruction` | Program uses instructions this CPU doesn't have | Section 11. Test with the board's `-cpu` | Yes |
+| `fatal error: foo.h: No such file or directory` | The library's development files aren't where the compiler looks | Section 12 | Yes |
+| `cannot find -lfoo` | Library not found at link time | Check the `-L` flags | Yes |
+| `skipping incompatible .../libfoo.so` | **Found the library, but it's for the wrong architecture**, often the PC's | `file` on it | Yes |
+| `file in wrong format`, or `Relocations in generic ELF` | An object file was built by a different compiler. `EM: 62` means x86_64 | Delete build files and rebuild | Yes |
+| `fatal error: gnu/stubs-soft.h` | Flags ask for an ABI the toolchain has no C library for | Section 11 | Yes |
+| `cannot run test program while cross compiling` | A `configure` script wants to run target code | Section 14 | Yes |
+| `Exec format error` in the middle of `make` | The project built a helper tool with the cross compiler, but it must run on the PC | Give the project a compiler for the build machine, usually `HOSTCC` or `CC_FOR_BUILD` | No |
+| Works in QEMU, fails on the board | Real kernel, real devices, less memory, or QEMU's CPU was too generous | Test with `-cpu`, then debug on the board | Not applicable |
 
 ---
 
@@ -811,4 +831,27 @@ gdb-multiarch -q ./dbg -ex 'set sysroot /path/to/sysroot' -ex 'target remote BOA
 
 ## References
 
-Planned: compiler, C library, build system and board documentation.
+Compilers and tools:
+
+- GCC manual: [ARM options](https://gcc.gnu.org/onlinedocs/gcc/ARM-Options.html), [AArch64 options](https://gcc.gnu.org/onlinedocs/gcc/AArch64-Options.html), [`--sysroot`](https://gcc.gnu.org/onlinedocs/gcc/Directory-Options.html)
+- [QEMU user-mode emulation](https://www.qemu.org/docs/master/user/main.html)
+- [GDB remote debugging](https://sourceware.org/gdb/current/onlinedocs/gdb.html/Remote-Debugging.html)
+
+C library and kernel:
+
+- [glibc NEWS](https://sourceware.org/git/?p=glibc.git;a=blob_plain;f=NEWS;hb=HEAD), including the removal of the kernel version check in 2.36
+- [Kernel: exporting headers](https://docs.kernel.org/kbuild/headers_install.html)
+- [Debian 13 release notes](https://www.debian.org/releases/trixie/release-notes/whats-new.html), section on 64-bit `time_t`
+- glibc in Debian: [12](https://packages.debian.org/bookworm/libc6), [13](https://packages.debian.org/trixie/libc6)
+
+Build systems:
+
+- [CMake toolchains manual](https://cmake.org/cmake/help/latest/manual/cmake-toolchains.7.html)
+- [Meson cross compilation](https://mesonbuild.com/Cross-compilation.html)
+- [Autoconf manual](https://www.gnu.org/software/autoconf/manual/autoconf.html), "Manual Configuration"
+- [Buildroot manual](https://buildroot.org/downloads/manual/manual.html)
+
+Boards:
+
+- BeagleBone Black: [board page](https://www.beagleboard.org/boards/beaglebone-black), [images](https://www.beagleboard.org/distros), [getting started](https://docs.beagleboard.org/intro/support/getting-started.html)
+- Raspberry Pi 4: [specifications](https://www.raspberrypi.com/products/raspberry-pi-4-model-b/specifications/), [operating systems](https://www.raspberrypi.com/software/operating-systems/)

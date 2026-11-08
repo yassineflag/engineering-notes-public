@@ -535,43 +535,277 @@ Planned: symptoms, causes and fixes, marking what was reproduced.
 
 ## 11. Matching the target
 
-Planned: glibc versions, CPU flags, silent type differences, float ABI, 64-bit time, the kernel.
+**Read this when** a program builds but fails on the board, or you pick a toolchain for a real product.
+
+### C library version
+
+glibc labels each function with the version that introduced it. Programs built against a newer glibc may need a label an older glibc doesn't have. Compatibility goes one way:
+
+- Built against an **older** glibc, the program runs on a newer one.
+- Built against a **newer** glibc, the program may refuse to start on an older one (**Illustrative**):
+
+  ```
+  ./app: /lib/arm-linux-gnueabihf/libc.so.6: version `GLIBC_2.38' not found (required by ./app)
+  ```
+
+Find what a program requires. Use the `objdump` of the toolchain that built it, because each one reads only its own architecture.
+
+**Tested (QEMU)**, Raspberry Pi settings:
+
+```console
+$ ${CROSS_COMPILE}objdump -T hello | grep -o 'GLIBC_[0-9.]*' | sort -Vu | tail -1
+GLIBC_2.34
+```
+
+Every dynamically linked program built against glibc 2.34 or newer requires at least 2.34, because the program's startup code uses a function versioned 2.34.
+
+**The rule: build against a C library no newer than the one on the target.** The same applies to `libstdc++` for C++ (``version `GLIBCXX_3.4.x'``).
+
+`-static` puts the C library inside the program and avoids this, at the cost of size, but glibc features such as name lookups still need shared libraries at run time. Prefer the matching toolchain.
+
+### CPU flags
+
+By default, the Debian and Ubuntu toolchains produce code for a baseline CPU, which runs on both boards. Flags can raise that baseline:
+
+| Flag | Meaning |
+|---|---|
+| `-mcpu=` | Build for this CPU: what it may use, and what it's tuned for |
+| `-march=` | Build for this instruction set |
+| `-mtune=` | Tune for this CPU, without changing what it needs |
+
+Typical values: `-mcpu=cortex-a8 -mfpu=neon -mfloat-abi=hard` on the BeagleBone Black, and `-mcpu=cortex-a72` on the Raspberry Pi 4.
+
+The classic mistake is building for a newer CPU than the board's. Here `div.c` divides two numbers from the command line, built for a Cortex-A7, which has a hardware divide instruction that the BeagleBone's Cortex-A8 doesn't have.
+
+**Tested (QEMU)**, BeagleBone Black settings:
+
+```console
+$ ${CROSS_COMPILE}gcc -O2 -mcpu=cortex-a7 -mfpu=neon-vfpv4 -mfloat-abi=hard div.c -o div-a7
+$ ${CROSS_COMPILE}objdump -d div-a7 | grep -m1 -w sdiv
+ 45e:	fb94 f2f2 	sdiv	r2, r4, r2
+
+$ $QEMU ./div-a7 7 2
+qemu: uncaught target signal 4 (Illegal instruction) - core dumped
+Illegal instruction (core dumped)
+
+$ qemu-arm-static -L /usr/arm-linux-gnueabihf ./div-a7 7 2
+3
+```
+
+The last command has no `-cpu`, and it runs. **That's why `$QEMU` sets `-cpu`:** QEMU's default CPU would have hidden this bug. Remember that `-march=native` means the PC's CPU, so remove it from any build for a board.
+
+### Differences that compile silently
+
+| Difference | PC (x86_64) | Pi 4 (AArch64) | BBB (32-bit Arm) | Risk |
+|---|---|---|---|---|
+| Size of `long` and pointers | 8 bytes | 8 bytes | 4 bytes | File formats, network messages |
+| Plain `char` | Signed | **Unsigned** | **Unsigned** | `char c = getchar(); if (c == EOF)` is never true |
+
+Use types like `uint32_t` for anything stored or sent.
+
+### 32-bit Arm only: float ABI and 2038
+
+**Float ABI.** `gnueabihf` means floating-point values are passed in FPU registers (`hard`). All code in a program must agree. Asking for another ABI fails with `gnu/stubs-soft.h: No such file or directory`, or at link time with `uses VFP register arguments, X does not`.
+
+**64-bit time.** On 32-bit glibc, `time_t` may be 32 bits, and a 32-bit time overflows in January 2038. It depends on the distribution: [Debian 13 moved its 32-bit Arm packages to 64-bit `time_t`](https://www.debian.org/releases/trixie/release-notes/whats-new.html), while the Debian 12 on the BeagleBone Black doesn't. With Ubuntu 22.04's toolchain, a small program `t.c` that prints both sizes gives:
+
+```console
+$ arm-linux-gnueabihf-gcc t.c -o t32 && $QEMU ./t32
+time_t=4 off_t=4
+$ arm-linux-gnueabihf-gcc -D_FILE_OFFSET_BITS=64 -D_TIME_BITS=64 t.c -o t64 && $QEMU ./t64
+time_t=8 off_t=8
+```
+
+(**Tested (QEMU)**, BeagleBone Black settings.) These flags change how libraries exchange time values, so a program and its libraries must use the same setting.
+
+### The kernel
+
+The toolchain contains the kernel's user-facing headers. [Older headers work on a newer kernel, but not always the reverse](https://docs.kernel.org/kbuild/headers_install.html), so [keep them the same as or older than the kernel you run](https://buildroot.org/downloads/manual/manual.html).
+
+You may read about `FATAL: kernel too old`. Programs printed it when the kernel was below glibc's minimum, but [glibc 2.36 removed that check](https://sourceware.org/git/?p=glibc.git;a=blob_plain;f=NEWS;hb=HEAD), so you will only see it with older versions.
 
 ---
 
 ## 12. Sysroots and leaks from the PC
 
-Planned: what a sysroot is, headers leaking from the PC, getting a sysroot.
+**Read this when** your project needs libraries from the board, such as zlib or OpenSSL.
+
+A **sysroot** is a folder laid out like the target's filesystem, with the headers and libraries the compiler needs: `usr/include`, `usr/lib`, and so on. `--sysroot=DIR` tells the compiler and linker to use it.
+
+Ubuntu 22.04's cross compilers also search the PC's `/usr/include`, and other releases may too. Check yours with `${CROSS_COMPILE}gcc -E -v - </dev/null`. A header installed on your PC can be picked up with no error.
+
+**Tested (QEMU)**, with zlib's development package installed on the PC only:
+
+```console
+$ printf '#include <zlib.h>\nint main(void) { return 0; }\n' > z.c
+$ ${CROSS_COMPILE}gcc -H -c z.c 2>&1 | head -1
+. /usr/include/zlib.h
+$ ${CROSS_COMPILE}gcc --sysroot=/nonexistent -c z.c 2>&1 | head -1
+z.c:1:10: fatal error: zlib.h: No such file or directory
+```
+
+The first compile succeeded with the **PC's** header. With a sysroot, the missing header is reported, and that failure is what you want. `-H` lists the headers used.
+
+**Getting a sysroot** (**Illustrative**):
+
+```sh
+# Copy from a running board that has the -dev packages installed
+rsync -aR $BOARD:/lib $BOARD:/usr/include $BOARD:/usr/lib ~/cross/sysroot/
+# Convert absolute symlinks, which would otherwise point into your PC
+symlinks -rc ~/cross/sysroot
+
+# Then build against it
+${CROSS_COMPILE}gcc --sysroot=$HOME/cross/sysroot app.c -lz -o app
+```
+
+Ubuntu 22.04's cross compiler keeps its own glibc headers ahead of the sysroot's, so use the same distribution release for both. Buildroot and Yocto generate matching toolchain and sysroot pairs, and they avoid this problem.
 
 ---
 
 ## 13. pkg-config
 
-Planned: search paths, the sysroot prefix, and the differences between pkg-config and pkgconf.
+**Read this when** a project finds its libraries with `pkg-config`.
+
+`pkg-config` prints the flags needed to use a library, and by default it reads the PC's files. For a cross build, point it at the target's:
+
+| Variable | Effect |
+|---|---|
+| `PKG_CONFIG_LIBDIR` | **Replaces** the search path. Use this one |
+| `PKG_CONFIG_PATH` | **Adds to** the search path, so the PC's libraries stay visible. Avoid it for a cross build |
+| `PKG_CONFIG_SYSROOT_DIR` | Added in front of the paths in the output |
+
+```sh
+export PKG_CONFIG_LIBDIR=$STAGING/usr/lib/pkgconfig
+export PKG_CONFIG_SYSROOT_DIR=$STAGING
+```
+
+The two common implementations behave differently here. For a library with `prefix=/usr` in `$STAGING`:
+
+| Tool (tested version) | Output |
+|---|---|
+| `pkgconf` 1.8.0 | `-I$STAGING/usr/include -L$STAGING/usr/lib -lchk` |
+| `pkg-config` 0.29.2 | `-lchk` |
+
+`pkg-config` 0.29 treats `/usr/include` and `/usr/lib` as standard paths and drops them. That's fine with a real `--sysroot`, but in a separate staging folder the compile can't find the headers. Setting `PKG_CONFIG_ALLOW_SYSTEM_CFLAGS=1` and `PKG_CONFIG_ALLOW_SYSTEM_LIBS=1` keeps them. (**Tested (QEMU)**, BeagleBone Black settings.)
 
 ---
 
 ## 14. Meson and Autotools
 
-Planned: short recipes: a cross file, --build and --host, and answering checks that cannot run.
+**Read this when** a project you're building uses one of these.
+
+### Meson
+
+Meson uses a cross file, the equivalent of CMake's toolchain file. `~/cross/bbb.ini`:
+
+```ini
+[binaries]
+c = 'arm-linux-gnueabihf-gcc'
+ar = 'arm-linux-gnueabihf-ar'
+strip = 'arm-linux-gnueabihf-strip'
+pkg-config = 'pkg-config'
+pkgconfig = 'pkg-config'
+
+[host_machine]
+system = 'linux'
+cpu_family = 'arm'
+cpu = 'cortex-a8'
+endian = 'little'
+```
+
+```sh
+meson setup build-meson --cross-file ~/cross/bbb.ini --prefix=/usr
+meson compile -C build-meson
+```
+
+**Tested (QEMU).** Both `pkg-config` keys are there on purpose: [Meson 1.3 renamed `pkgconfig` to `pkg-config`](https://mesonbuild.com/Release-notes-for-1-3-0.html), and setting both works on old and new versions.
+
+### Autotools
+
+```sh
+./configure --build=x86_64-linux-gnu --host=arm-linux-gnueabihf --prefix=/usr
+make
+make install DESTDIR=$STAGING
+```
+
+Give both `--build` and `--host`: with `--host` alone, `configure` tries running a test program to decide if it's cross-compiling, and with automatic QEMU emulation that test can succeed. (`--host` here means the board, as warned in section 2.)
+
+When a check needs to run target code, `configure` stops. Find the variable in the project's `configure.ac`, work out the right answer for your board, and pass it.
+
+**Tested (QEMU)**, with a test check named `my_cv_mmap_ok`:
+
+```console
+$ ./configure --host=aarch64-linux-gnu
+checking whether mmap works here... configure: error: in `/home/me/runtest':
+configure: error: cannot run test program while cross compiling
+
+$ ./configure --host=aarch64-linux-gnu my_cv_mmap_ok=yes
+checking whether mmap works here... (cached) yes
+```
 
 ---
 
 ## 15. Choosing a toolchain
 
-Planned: one rule and a short table.
+**Read this when** you go beyond this tutorial, on a real product.
+
+**The rule: use the toolchain from whoever built the board's software.**
+
+| Your board's software | Use |
+|---|---|
+| Built with Buildroot | Its toolchain (`output/host/bin`), or `make sdk` |
+| Built with Yocto | Its SDK (`bitbake <image> -c populate_sdk`) |
+| A Debian or Ubuntu release | The cross packages of the same release, plus a sysroot from that release |
+| A vendor's image | The vendor's SDK |
+| None of those | A toolchain whose glibc isn't newer than the board's: [Arm GNU Toolchain](https://developer.arm.com/downloads/-/arm-gnu-toolchain-downloads), [Bootlin](https://toolchains.bootlin.com), or one you configure with [crosstool-NG](https://crosstool-ng.github.io/docs/) |
+
+A newer compiler isn't automatically better for a product. Keep one fixed toolchain per release, because a compiler update changes every binary.
+
+Other options exist, like `clang --target=arm-linux-gnueabihf` (one compiler for all architectures), which still needs a target C library. Prebuilt toolchains weren't tested for this note.
 
 ---
 
 ## 16. Debugging with GDB
 
-Planned: QEMU's GDB server, then gdbserver on a board.
+**Read this when** you need to step through a program on the target. Install `gdb-multiarch` on the PC.
+
+Build with `-g`. QEMU has a built-in GDB server, so you can try this without a board. The `-g 1234` given to `$QEMU` makes it wait for the debugger.
+
+**Tested (QEMU)**, Raspberry Pi settings, with the first lines of GDB's output trimmed:
+
+```console
+$ ${CROSS_COMPILE}gcc -g -O0 hello.c -o dbg
+$ $QEMU -g 1234 ./dbg &
+$ gdb-multiarch -q -batch -ex 'set sysroot /usr/aarch64-linux-gnu' \
+      -ex 'target remote :1234' -ex 'break main' -ex c -ex bt -ex c ./dbg
+Breakpoint 1, main () at hello.c:5
+5	    printf("hello from glibc %s\n", gnu_get_libc_version());
+#0  main () at hello.c:5
+[Inferior 1 (process 1) exited normally]
+```
+
+On a board, `gdbserver` plays the part of QEMU's server.
+
+**Expected (board):** with `gdbserver` installed on the board and `dbg` copied there:
+
+```sh
+# on the board
+gdbserver :2345 ./dbg
+
+# on the PC
+gdb-multiarch -q ./dbg -ex 'set sysroot /path/to/sysroot' -ex 'target remote BOARD_IP:2345'
+```
+
+`set sysroot` must point at copies of the board's libraries, or backtraces through them are unusable. You should see the same breakpoint output as above.
 
 ---
 
 ## 17. Where the rest is covered
 
-Planned: links to the kernel, bootloader, root filesystem and build system notes.
+- **Cross-compiling the kernel and U-Boot** (`ARCH=` and `CROSS_COMPILE=`): the [kernel](../kernel/) and [bootloader](../bootloader/) notes.
+- **Root filesystems, and full-system emulation in QEMU:** the [root filesystem](../rootfs/) note.
+- **Toolchains and SDKs from build systems:** the [Buildroot](../../linux-build-systems/buildroot/) and [Yocto](../../linux-build-systems/yocto/) notes.
+- **How a toolchain is built, bare-metal toolchains, Go and Rust:** not covered here.
 
 ---
 

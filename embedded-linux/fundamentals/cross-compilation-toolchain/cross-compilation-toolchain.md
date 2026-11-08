@@ -135,19 +135,131 @@ If your row says No, build inside a Debian 12 container, for example with `docke
 
 ## 4. Install and check the toolchain
 
-Planned: install the cross compilers and QEMU; one settings file per board; check the compiler and its glibc.
+Install the cross compilers, QEMU and the build tools:
+
+```sh
+sudo apt install gcc-arm-linux-gnueabihf gcc-aarch64-linux-gnu \
+    qemu-user-static make cmake
+mkdir -p ~/cross/hello ~/cross/project/lib ~/cross/project/app
+```
+
+Create one settings file per board. These are the only places where the two boards differ.
+
+`~/cross/target-bbb.sh`:
+
+```sh
+export CROSS_COMPILE=arm-linux-gnueabihf-
+export QEMU="qemu-arm-static -cpu cortex-a8 -L /usr/arm-linux-gnueabihf"
+export STAGING=$HOME/cross/staging-bbb
+export BOARD=debian@192.168.6.2
+```
+
+`~/cross/target-pi4.sh`:
+
+```sh
+export CROSS_COMPILE=aarch64-linux-gnu-
+export QEMU="qemu-aarch64-static -cpu cortex-a72 -L /usr/aarch64-linux-gnu"
+export STAGING=$HOME/cross/staging-pi4
+export BOARD=yourname@raspberrypi.local
+```
+
+Load the one for your board. Do this in every new terminal. If you have no board, either one works:
+
+```sh
+. ~/cross/target-bbb.sh
+```
+
+If your distribution installs `qemu-arm` and `qemu-aarch64` instead, without `-static`, change those names here.
+
+`CROSS_COMPILE` holds the start of the tool names, so `${CROSS_COMPILE}gcc` becomes the right compiler. The Linux kernel uses the same variable name.
+
+Check the compiler, and find which glibc it builds against.
+
+**Tested (QEMU)**, BeagleBone Black settings:
+
+```console
+$ ${CROSS_COMPILE}gcc --version | head -1
+arm-linux-gnueabihf-gcc (Ubuntu 11.4.0-1ubuntu1~22.04.3) 11.4.0
+$ ${CROSS_COMPILE}gcc -dumpmachine
+arm-linux-gnueabihf
+$ ${CROSS_COMPILE}gcc -dM -E -include features.h -x c /dev/null | grep -E '__GLIBC(_MINOR)?__ '
+#define __GLIBC__ 2
+#define __GLIBC_MINOR__ 35
+```
+
+The last command says this toolchain uses glibc 2.35.
 
 ---
 
 ## 5. Build your first program
 
-Planned: compile hello.c, see why it does not run on the PC, read it with file and readelf.
+`~/cross/hello/hello.c` prints the version of the C library it is running with:
+
+```c
+#include <stdio.h>
+#include <gnu/libc-version.h>
+
+int main(void)
+{
+    printf("hello from glibc %s\n", gnu_get_libc_version());
+    return 0;
+}
+```
+
+Compile it the way you would with `gcc`, using the cross compiler. It won't run on the PC, and that's expected.
+
+**Tested (QEMU)**, BeagleBone Black settings:
+
+```console
+$ cd ~/cross/hello
+$ ${CROSS_COMPILE}gcc -Wall -O2 hello.c -o hello
+$ ./hello
+./hello: Exec format error
+```
+
+Your PC's CPU can't execute Arm code. (If `qemu-user-static` set up automatic emulation, you get a different error about a missing `ld-linux` file. Section 6 fixes that one.)
+
+**Always check what you built.** `file` and `readelf` read a program without running it:
+
+```console
+$ file hello
+hello: ELF 32-bit LSB pie executable, ARM, EABI5 version 1 (SYSV), dynamically linked,
+interpreter /lib/ld-linux-armhf.so.3, for GNU/Linux 3.2.0, not stripped
+$ readelf -d hello | grep NEEDED
+ 0x00000001 (NEEDED)                     Shared library: [libc.so.6]
+```
+
+With the Raspberry Pi settings, `file` says `ELF 64-bit LSB pie executable, ARM aarch64` and the interpreter is `/lib/ld-linux-aarch64.so.1`.
+
+| What the output says | What it means |
+|---|---|
+| `ARM`, or `ARM aarch64` | The architecture the program is built for. **Check this first** |
+| `interpreter /lib/ld-linux-armhf.so.3` | The **loader**, the small program that starts this one and connects its libraries. It must exist at exactly this path on the board |
+| `NEEDED libc.so.6` | A library that must be found when the program starts |
 
 ---
 
 ## 6. Run it in QEMU
 
-Planned: QEMU user mode, why -L and -cpu matter, what QEMU does and does not prove.
+QEMU's "user mode" runs one Arm program on your PC. `$QEMU` from your settings file does it.
+
+**Tested (QEMU)**, same result with either settings file:
+
+```console
+$ $QEMU ./hello
+hello from glibc 2.35
+```
+
+The two options in `$QEMU` matter:
+
+| Option | Why |
+|---|---|
+| `-L /usr/arm-linux-gnueabihf` | The program needs an Arm loader and C library, and those on your PC are x86. This folder holds Arm copies, installed with the cross compiler. Without `-L`: `Could not open '/lib/ld-linux-armhf.so.3'` |
+| `-cpu cortex-a8` | Emulate exactly the board's CPU. Without it, QEMU enables every feature it knows and hides mistakes (section 11) |
+
+A folder that looks like the target's filesystem and holds its headers and libraries is called a **sysroot**. `/usr/arm-linux-gnueabihf` is a small one. Section 12 has more.
+
+**What QEMU proves, and what it doesn't.** QEMU shows that the program is correctly built for the CPU and starts. It doesn't test your real kernel, your devices, your memory limits or timing. For those you need the board.
 
 ---
 

@@ -326,13 +326,204 @@ In QEMU the program said 2.35, and on the board it says the board's version. **I
 
 ## 8. Add a shared library
 
-Planned: a small library and program: soname, NEEDED, LD_LIBRARY_PATH, deployment.
+Real programs use libraries. This small project has one library, `libchk`, and one program, `crcsum`.
+
+`~/cross/project/lib/chk.h`:
+
+```c
+#ifndef CHK_H
+#define CHK_H
+#include <stddef.h>
+#include <stdint.h>
+uint32_t chk_crc32(const void *data, size_t len);
+const char *chk_version(void);
+#endif
+```
+
+`~/cross/project/lib/chk.c`:
+
+```c
+#include "chk.h"
+
+uint32_t chk_crc32(const void *data, size_t len)
+{
+    const uint8_t *p = data;
+    uint32_t crc = 0xffffffffu;
+
+    while (len--) {
+        crc ^= *p++;
+        for (int i = 0; i < 8; i++)
+            crc = (crc >> 1) ^ (0xedb88320u & -(crc & 1));
+    }
+    return ~crc;
+}
+
+const char *chk_version(void)
+{
+    return "1.0.0";
+}
+```
+
+`~/cross/project/app/crcsum.c`:
+
+```c
+#include <stdio.h>
+#include <chk.h>
+
+int main(void)
+{
+    static char buf[65536];
+    size_t n = fread(buf, 1, sizeof(buf), stdin);
+
+    printf("%08x  (libchk %s)\n", chk_crc32(buf, n), chk_version());
+    return 0;
+}
+```
+
+Build the library, then the program that uses it.
+
+**Tested (QEMU)**, BeagleBone Black settings:
+
+```console
+$ cd ~/cross/project
+$ mkdir -p out
+$ ${CROSS_COMPILE}gcc -O2 -Wall -fPIC -shared -Wl,-soname,libchk.so.1 lib/chk.c -o out/libchk.so.1
+$ ${CROSS_COMPILE}gcc -O2 -Wall -Ilib app/crcsum.c out/libchk.so.1 -o out/crcsum
+$ readelf -d out/crcsum | grep NEEDED
+ 0x00000001 (NEEDED)                     Shared library: [libchk.so.1]
+ 0x00000001 (NEEDED)                     Shared library: [libc.so.6]
+```
+
+`-Wl,-soname,libchk.so.1` gives the library its official name, the **soname**. Programs that link to it record that name in `NEEDED`, and that's the file name the loader will look for on the target.
+
+Running it needs the library to be found:
+
+```console
+$ echo -n 123456789 | $QEMU out/crcsum
+out/crcsum: error while loading shared libraries: libchk.so.1: cannot open shared object file: No such file or directory
+
+$ echo -n 123456789 | $QEMU -E LD_LIBRARY_PATH=out out/crcsum
+cbf43926  (libchk 1.0.0)
+```
+
+`cbf43926` is the standard check value of CRC-32 for that input, so the result is correct. `-E` sets a variable for the emulated program.
+
+**On the board** (**Expected (board)**):
+
+```console
+$ scp out/libchk.so.1 out/crcsum $BOARD:
+$ echo -n 123456789 | ssh $BOARD 'LD_LIBRARY_PATH=$HOME ./crcsum'
+cbf43926  (libchk 1.0.0)
+```
+
+The single quotes make `$HOME` expand on the board. To install the library permanently: `sudo cp libchk.so.1 /usr/local/lib/ && sudo ldconfig`. The program then runs without `LD_LIBRARY_PATH`, at least on systems where `/usr/local/lib` is on the loader's path, as on Debian.
 
 ---
 
 ## 9. Use Make or CMake
 
-Planned: the same project with a Makefile and with a CMake toolchain file; staging and deployment.
+Typing those commands doesn't scale. Either tool below builds the same project, for the board chosen by your settings file.
+
+### Make
+
+`~/cross/project/Makefile`:
+
+```make
+CC     := $(CROSS_COMPILE)gcc
+CFLAGS := -O2 -Wall
+OUT    := build/$(CROSS_COMPILE:-=)
+
+all: $(OUT)/crcsum
+
+$(OUT)/libchk.so.1: lib/chk.c lib/chk.h
+	mkdir -p $(OUT)
+	$(CC) $(CFLAGS) -fPIC -shared -Wl,-soname,libchk.so.1 $< -o $@
+
+$(OUT)/crcsum: app/crcsum.c $(OUT)/libchk.so.1
+	$(CC) $(CFLAGS) -Ilib $^ -o $@
+
+clean:
+	rm -rf build
+
+.PHONY: all clean
+```
+
+Two details do the cross-compiling work. The compiler comes from `CROSS_COMPILE`, and each target gets its own output folder (`build/arm-linux-gnueabihf`), so files for one board can't get mixed with the other's.
+
+**Tested (QEMU)**, BeagleBone Black settings:
+
+```console
+$ make
+mkdir -p build/arm-linux-gnueabihf
+arm-linux-gnueabihf-gcc -O2 -Wall -fPIC -shared -Wl,-soname,libchk.so.1 lib/chk.c -o build/arm-linux-gnueabihf/libchk.so.1
+arm-linux-gnueabihf-gcc -O2 -Wall -Ilib app/crcsum.c build/arm-linux-gnueabihf/libchk.so.1 -o build/arm-linux-gnueabihf/crcsum
+$ T=build/${CROSS_COMPILE%-}
+$ echo -n 123456789 | $QEMU -E LD_LIBRARY_PATH=$T $T/crcsum
+cbf43926  (libchk 1.0.0)
+```
+
+### CMake
+
+`~/cross/project/CMakeLists.txt` says nothing about cross-compiling:
+
+```cmake
+cmake_minimum_required(VERSION 3.16)
+project(crcsum C)
+
+add_library(chk SHARED lib/chk.c)
+set_target_properties(chk PROPERTIES VERSION 1.0.0 SOVERSION 1)
+target_include_directories(chk PUBLIC lib)
+
+add_executable(crcsum app/crcsum.c)
+target_link_libraries(crcsum PRIVATE chk)
+
+install(TARGETS chk crcsum)
+```
+
+The target is described in a separate **toolchain file**. `~/cross/bbb.cmake`:
+
+```cmake
+set(CMAKE_SYSTEM_NAME Linux)
+set(CMAKE_SYSTEM_PROCESSOR arm)
+set(CMAKE_C_COMPILER arm-linux-gnueabihf-gcc)
+
+# Search for libraries and headers only in the staging folder, never on the PC
+set(CMAKE_FIND_ROOT_PATH "$ENV{STAGING}")
+set(CMAKE_FIND_ROOT_PATH_MODE_PROGRAM NEVER)
+set(CMAKE_FIND_ROOT_PATH_MODE_LIBRARY ONLY)
+set(CMAKE_FIND_ROOT_PATH_MODE_INCLUDE ONLY)
+```
+
+For the Raspberry Pi, create `~/cross/pi4.cmake` with `aarch64` as the processor and `aarch64-linux-gnu-gcc` as the compiler.
+
+The **staging folder** (`$STAGING`) is where we install what we built, laid out like the board's filesystem. `DESTDIR` sends the files there, and `--prefix /usr` is where they will live on the board.
+
+**Tested (QEMU)**, BeagleBone Black settings:
+
+```console
+$ cmake -S . -B build-cmake-bbb -DCMAKE_TOOLCHAIN_FILE=$HOME/cross/bbb.cmake
+-- The C compiler identification is GNU 11.4.0
+-- Check for working C compiler: /usr/bin/arm-linux-gnueabihf-gcc - skipped
+$ cmake --build build-cmake-bbb
+[100%] Built target crcsum
+$ DESTDIR=$STAGING cmake --install build-cmake-bbb --prefix /usr
+-- Installing: /home/me/cross/staging-bbb/usr/bin/crcsum
+-- Set runtime path of ".../usr/bin/crcsum" to ""
+```
+
+CMake reads the toolchain file only the first time in a build folder. To change target, use a new folder.
+
+**Deploy from `$STAGING`, not from the build folder.** A built program contains a path to the build folder on your PC so that it can run there, and installing removes it: that's the `Set runtime path` line.
+
+**On the board** (**Expected (board)**): `scp` follows the symlink, so the board gets a file named `libchk.so.1`.
+
+```console
+$ scp $STAGING/usr/bin/crcsum $STAGING/usr/lib/libchk.so.1 $BOARD:
+$ echo -n 123456789 | ssh $BOARD 'LD_LIBRARY_PATH=$HOME ./crcsum'
+cbf43926  (libchk 1.0.0)
+```
+
+**This is the end of the essential path.** You can now build a project with a library, test it in QEMU, and run it on a board.
 
 ---
 

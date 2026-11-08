@@ -265,7 +265,62 @@ A folder that looks like the target's filesystem and holds its headers and libra
 
 ## 7. Run it on a board
 
-Planned: connect to each board, check what it runs, copy and run the program, with expected output.
+Everything here is **Expected (board)**: not run on hardware for this note. The version numbers come from each distribution's packages, and the patch numbers on your board may differ.
+
+### Connect to the board
+
+**BeagleBone Black:**
+
+1. Write the [Debian 12 IoT microSD image for AM335x](https://www.beagleboard.org/distros) to a card.
+2. Insert the card. Hold the S2 button while powering on, so the board boots from the card instead of its internal eMMC.
+3. Connect the board to your PC by USB. It appears as a network adapter.
+4. Log in. The default password is `temppwd`.
+
+```sh
+ssh debian@192.168.6.2
+```
+
+The [board's address over USB](https://docs.beagleboard.org/intro/support/getting-started.html) is `192.168.6.2` or `192.168.7.2`, depending on the USB network adapter your PC uses. BeagleBoard's table lists `.6.2` for Linux. If the other one is yours, change `BOARD` in `target-bbb.sh`.
+
+**Raspberry Pi 4:**
+
+1. In [Raspberry Pi Imager](https://www.raspberrypi.com/software/), choose **Raspberry Pi OS Lite (64-bit)**.
+2. In the OS customisation settings, set the hostname to `raspberrypi`, choose a username and password, and enable SSH.
+3. Boot the Pi on your network with Ethernet.
+4. Put your username in `BOARD` in `target-pi4.sh`, then log in:
+
+```sh
+ssh yourname@raspberrypi.local
+```
+
+### Check what the board runs
+
+Run this on the board, and compare it with the table in section 3:
+
+```console
+$ uname -m
+armv7l                                   # BeagleBone Black
+aarch64                                  # Raspberry Pi 4, 64-bit OS
+$ ldd --version | head -1
+ldd (Debian GLIBC 2.36-9+deb12u...) 2.36  # BeagleBone Black
+ldd (Debian GLIBC 2.41-...) 2.41          # Raspberry Pi OS
+```
+
+The board's glibc must be the same as or newer than the toolchain's version from section 4.
+
+### Copy and run
+
+From the PC, with your settings file loaded:
+
+```console
+$ cd ~/cross/hello
+$ scp hello $BOARD:
+$ ssh $BOARD ./hello
+hello from glibc 2.36                    # BeagleBone Black
+hello from glibc 2.41                    # Raspberry Pi OS
+```
+
+In QEMU the program said 2.35, and on the board it says the board's version. **It's the same file.** The C library is loaded from wherever the program runs, which is the point of section 3.
 
 ---
 

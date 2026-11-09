@@ -337,13 +337,158 @@ On QEMU the variables are stored in `envstore.img`. On a board they're usually a
 
 ## 7. Boot Linux from U-Boot
 
-Planned: load Debian's installer kernel and initramfs over TFTP and start it with bootz or booti.
+The [kernel note](../kernel/) builds a kernel. Until then, we use Debian's installer kernel and initramfs. They're built for many Arm machines, including QEMU's `virt` and the BeagleBone Black.
+
+```sh
+mkdir -p $BOOTDIR/tftp
+wget -O $BOOTDIR/tftp/kernel $NETBOOT/$NETBOOT_KERNEL
+wget -O $BOOTDIR/tftp/initrd.gz $NETBOOT/initrd.gz
+```
+
+Start QEMU, stop the countdown, and load the two files over the network with TFTP.
+
+**Expected (QEMU)**, BeagleBone Black settings, shortened. Sizes change with Debian updates.
+
+```console
+=> setenv autoload no
+=> dhcp
+BOOTP broadcast 1
+DHCP client bound to address 10.0.2.15 (2 ms)
+=> setenv serverip 10.0.2.2
+=> tftp ${kernel_addr_r} kernel
+Using e1000#0 device
+TFTP from server 10.0.2.2; our IP address is 10.0.2.15
+Filename 'kernel'.
+Load address: 0x40400000
+Loading: #################################################################
+...
+done
+Bytes transferred = 6046208 (5c4200 hex)
+=> tftp ${ramdisk_addr_r} initrd.gz
+...
+Bytes transferred = 25985449 (18c81a9 hex)
+=> setenv bootargs console=ttyAMA0
+=> bootz ${kernel_addr_r} ${ramdisk_addr_r}:${filesize} ${fdt_addr}
+Kernel image @ 0x40400000 [ 0x000000 - 0x5c4200 ]
+...
+Starting kernel ...
+
+[    0.000000] Booting Linux on physical CPU 0x0
+[    0.000000] Linux version 6.12...
+...
+```
+
+After the kernel messages, the Debian installer asks for a language. You have started Linux from U-Boot. Press Ctrl-A, then X, to quit.
+
+**With the Raspberry Pi settings, use `booti` instead of `bootz`.** Everything else is the same.
+
+What each step did:
+
+| Step | Why |
+|---|---|
+| `setenv autoload no` | Otherwise `dhcp` also tries to download a file named by the DHCP server |
+| `dhcp` | Gets an address from QEMU's DHCP server. Inside QEMU, the guest is `10.0.2.15` and the PC is `10.0.2.2` |
+| `setenv serverip 10.0.2.2` | The TFTP server: QEMU's built-in one, serving `$BOOTDIR/tftp` |
+| `tftp ADDR FILE` | Copies the file into RAM at that address. Afterwards `filesize` holds its size |
+| `setenv bootargs console=ttyAMA0` | The kernel command line. `ttyAMA0` is the name Linux gives to `virt`'s serial port |
+| `bootz KERNEL INITRD:SIZE DTB` | Starts a zImage. The initramfs needs its size, which is why it is loaded last and `${filesize}` is used. Use `-` for "no initramfs" |
+
+**Which command starts the kernel:**
+
+| Command | For |
+|---|---|
+| `bootz` | A 32-bit Arm zImage |
+| `booti` | A 64-bit Arm Image |
+| `bootm` | A legacy uImage, or a FIT image (section 12) |
+| `bootefi` | An EFI program, such as GRUB, or a kernel started through its EFI stub |
+
+Before jumping, `bootz` and `booti` check the kernel's header, copy the device tree and the initramfs to a safe place, write `bootargs` and the initramfs location into the device tree, and turn off U-Boot's devices. On QEMU, the device tree is the one QEMU generated, at `fdt_addr`. On a real board you load a `.dtb` file, as in section 9.
 
 ---
 
 ## 8. Make it boot by itself
 
-Planned: bootcmd, a boot script made with mkimage, and standard boot with extlinux.conf.
+Typing those commands at every boot doesn't scale. There are three ways to make it automatic, from simplest to most flexible.
+
+### Put the commands in `bootcmd`
+
+**Expected (QEMU)**, BeagleBone Black settings:
+
+```console
+=> setenv netboot 'setenv autoload no; dhcp; setenv serverip 10.0.2.2; tftp ${kernel_addr_r} kernel; tftp ${ramdisk_addr_r} initrd.gz; setenv bootargs console=ttyAMA0; bootz ${kernel_addr_r} ${ramdisk_addr_r}:${filesize} ${fdt_addr}'
+=> setenv bootcmd 'run netboot'
+=> saveenv
+=> reset
+```
+
+After the countdown, Linux starts with no typing. To get back to the prompt, press a key during the countdown. To undo, run `env default -a` and `saveenv`.
+
+### Use a boot script
+
+The commands can live in a file on the PC instead, so you change them with an editor and no `saveenv`. Create `$BOOTDIR/tftp/boot.cmd`:
+
+```sh
+echo "== boot.cmd: loading Linux over TFTP"
+setenv bootargs console=ttyAMA0
+tftp ${kernel_addr_r} kernel
+tftp ${ramdisk_addr_r} initrd.gz
+bootz ${kernel_addr_r} ${ramdisk_addr_r}:${filesize} ${fdt_addr}
+```
+
+U-Boot runs scripts in a small wrapper made by `mkimage`, which adds a header with a checksum. **Expected (QEMU):**
+
+```console
+$ mkimage -A arm -O linux -T script -C none -n "QEMU netboot" \
+      -d $BOOTDIR/tftp/boot.cmd $BOOTDIR/tftp/boot.scr
+Image Name:   QEMU netboot
+...
+Image Type:   ARM Linux Script (uncompressed)
+...
+```
+
+Then make `bootcmd` load and run it:
+
+```console
+=> setenv bootcmd 'setenv autoload no; dhcp; setenv serverip 10.0.2.2; tftp ${scriptaddr} boot.scr; source ${scriptaddr}'
+=> saveenv
+=> reset
+...
+## Executing script at 40200000
+== boot.cmd: loading Linux over TFTP
+...
+Starting kernel ...
+```
+
+From now on, edit `boot.cmd`, run `mkimage` again, and restart QEMU. With the Pi settings, write `booti` in `boot.cmd`, and use `-A arm64`.
+
+### Let standard boot find it
+
+The default `bootcmd` is `bootflow scan -lb`. This is **standard boot**: U-Boot searches devices in the order of `boot_targets`, and on each one looks for something it knows how to boot:
+
+| It looks for | Written by |
+|---|---|
+| `extlinux/extlinux.conf`, in `/` or `/boot/` | Distributions, Buildroot, Yocto. The format comes from the Syslinux bootloader |
+| `boot.scr` | You, as above |
+| An EFI program, such as `EFI/BOOT/BOOTAA64.EFI` | Distributions that boot with UEFI |
+
+The first one it finds, it boots. **Expected (QEMU):**
+
+```console
+=> printenv boot_targets
+boot_targets=qfw usb scsi virtio nvme dhcp
+```
+
+An `extlinux.conf` describes the boot in a few lines (**Illustrative**):
+
+```
+label linux
+    kernel /zImage
+    fdt /am335x-boneblack.dtb
+    initrd /initrd.gz
+    append console=ttyS0,115200n8 root=/dev/mmcblk0p2 rw rootwait
+```
+
+Section 9 puts an `extlinux.conf` on the BeagleBone's SD card. Some boards, the BeagleBone among them, still start the older `run distro_bootcmd` instead of `bootflow`. It searches for the same files.
 
 ---
 

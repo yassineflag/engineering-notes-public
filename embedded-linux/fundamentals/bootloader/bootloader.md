@@ -494,7 +494,202 @@ Section 9 puts an `extlinux.conf` on the BeagleBone's SD card. Some boards, the 
 
 ## 9. Run it on a board
 
-Planned: the serial console, then U-Boot on a BeagleBone Black SD card and on a Raspberry Pi 4, booting Linux by hand and automatically.
+Everything here is **Expected (board)**: not run on hardware for this note.
+
+### The serial console
+
+You need a USB-to-serial cable with **3.3 V** signals, such as an FTDI TTL-232R-3V3. **A 5 V or RS-232 cable can damage the board.** Connect GND to GND, the cable's TX to the board's RX, and the cable's RX to the board's TX. Don't connect the cable's power wire.
+
+On the PC:
+
+```sh
+sudo apt install picocom
+sudo usermod -aG dialout $USER     # then log out and in again
+picocom -b 115200 /dev/ttyUSB0     # Ctrl-A, then Ctrl-X, quits
+```
+
+| | BeagleBone Black | Raspberry Pi 4 |
+|---|---|---|
+| Where | J1, the 6-pin header next to the P9 header | The 40-pin header |
+| GND | Pin 1, marked with a dot | Pin 6 |
+| Board's RX (cable TX goes here) | Pin 4 | Pin 10, GPIO 15 |
+| Board's TX (cable RX goes here) | Pin 5 | Pin 8, GPIO 14 |
+
+### BeagleBone Black
+
+Build U-Boot for the board:
+
+```console
+$ . ~/cross/target-bbb.sh
+$ cd ~/boot/u-boot
+$ make O=$BOOTDIR/build-board $UBOOT_BOARD
+$ make O=$BOOTDIR/build-board -j$(nproc)
+$ ls $BOOTDIR/build-board/MLO $BOOTDIR/build-board/u-boot.img
+```
+
+`MLO` is the SPL with the header the boot ROM expects. `u-boot.img` is U-Boot proper, packed with the device trees of the supported BeagleBones so one build runs on all of them.
+
+**Prepare a spare microSD card. Everything on it will be erased.** Find its name with `lsblk`, here `/dev/sdX`, and make one FAT partition marked bootable. The AM335x boot ROM looks for `MLO` on a FAT partition with the bootable flag set.
+
+```sh
+sudo sfdisk /dev/sdX <<'EOF'
+label: dos
+start=2048, size=256MiB, type=c, bootable
+EOF
+sudo mkfs.vfat -F 32 -n BOOT /dev/sdX1
+sudo mount /dev/sdX1 /mnt
+sudo cp $BOOTDIR/build-board/MLO /mnt/
+sudo cp $BOOTDIR/build-board/u-boot.img /mnt/
+sudo cp $BOOTDIR/tftp/kernel $BOOTDIR/tftp/initrd.gz /mnt/
+sudo wget -P /mnt ${NETBOOT%/netboot}/device-tree/am335x-boneblack.dtb
+sudo umount /mnt
+```
+
+The kernel and initramfs are Debian's from section 7, and Debian also publishes the BeagleBone's device tree. Copying `MLO` first is an old habit from earlier TI chips. It costs nothing.
+
+**Boot from the card.** The BeagleBone boots from its eMMC first. To boot from the SD card, hold the S2 button, near the card slot, while you apply power, then release it. In picocom:
+
+```
+U-Boot SPL 2026.10 (Nov 09 2026 - 21:30:12 +0100)
+...
+U-Boot 2026.10 (Nov 09 2026 - 21:30:12 +0100)
+
+...
+Model: TI AM335x BeagleBone Black
+DRAM:  512 MiB
+...
+Hit any key to stop autoboot:  2
+=>
+```
+
+The SPL line proves the boot ROM found `MLO`. If the version or date isn't yours, the board booted from eMMC: hold S2 again.
+
+Stop the countdown, find the device tree's name, and boot. The commands are the ones from QEMU, with `load` from the SD card instead of `tftp`:
+
+```console
+=> run findfdt
+=> printenv board_name fdtfile
+board_name=A335BNLT
+fdtfile=am335x-boneblack.dtb
+=> ls mmc 0:1
+=> load mmc 0:1 ${kernel_addr_r} kernel
+=> load mmc 0:1 ${fdt_addr_r} ${fdtfile}
+=> load mmc 0:1 ${ramdisk_addr_r} initrd.gz
+=> setenv bootargs console=ttyS0,115200n8
+=> bootz ${kernel_addr_r} ${ramdisk_addr_r}:${filesize} ${fdt_addr_r}
+...
+Starting kernel ...
+```
+
+| Detail | Why |
+|---|---|
+| `run findfdt` | Sets `fdtfile` from the board name stored in the board's EEPROM. The default `bootcmd` runs it, so it's missing when you stop the countdown |
+| `mmc 0:1` | Device 0, partition 1. On the BeagleBone, MMC 0 is the SD card and MMC 1 is the eMMC |
+| `${fdt_addr_r}` | Unlike on QEMU, the device tree comes from a file |
+| `ttyS0` | Debian's kernel names the serial port `ttyS0`. U-Boot's `console` variable says `ttyO0`, the name used by an older driver |
+
+**Make it boot by itself** with an `extlinux.conf` on the card, in `/mnt/extlinux/extlinux.conf`:
+
+```
+label debian-installer
+    kernel /kernel
+    fdt /am335x-boneblack.dtb
+    initrd /initrd.gz
+    append console=ttyS0,115200n8
+```
+
+At the next boot, the default `bootcmd` finds it:
+
+```
+Found /extlinux/extlinux.conf
+Retrieving file: /extlinux/extlinux.conf
+1:	debian-installer
+Retrieving file: /kernel
+...
+Starting kernel ...
+```
+
+`saveenv` works too. On this board it writes the variables to a file named `uboot.env` on the card's FAT partition.
+
+**About `uEnv.txt`.** Many BeagleBone guides, and BeagleBoard.org's own images, use a `uEnv.txt` file with a `uenvcmd` variable. Mainline U-Boot's `am335x_evm` configuration doesn't read it in v2026.10. Use `extlinux.conf` or `boot.scr`, or import it yourself: `load mmc 0:1 ${loadaddr} uEnv.txt; env import -t ${loadaddr} ${filesize}; run uenvcmd`.
+
+### Raspberry Pi 4
+
+Build U-Boot for the board:
+
+```console
+$ . ~/cross/target-pi4.sh
+$ cd ~/boot/u-boot
+$ make O=$BOOTDIR/build-board $UBOOT_BOARD
+$ make O=$BOOTDIR/build-board -j$(nproc)
+$ scp $BOOTDIR/build-board/u-boot.bin $BOARD:
+```
+
+This uses the Raspberry Pi OS card from the cross-compilation note. On the Pi, the FAT boot partition is mounted at `/boot/firmware`. Install U-Boot and keep a copy of `config.txt`:
+
+```sh
+ssh $BOARD
+sudo cp u-boot.bin /boot/firmware/
+sudo cp /boot/firmware/config.txt /boot/firmware/config.txt.orig
+```
+
+Add these lines at the end of `/boot/firmware/config.txt`:
+
+```ini
+[all]
+enable_uart=1
+arm_64bit=1
+kernel=u-boot.bin
+```
+
+`kernel=u-boot.bin` makes the firmware start U-Boot instead of Linux. `enable_uart=1` turns on the serial port on pins 8 and 10. `arm_64bit=1` starts the CPU in 64-bit mode, which `rpi_4_defconfig` needs. Run `sudo reboot`, and in picocom stop the countdown:
+
+```
+U-Boot 2026.10 (Nov 09 2026 - 21:40:51 +0100)
+
+DRAM:  ...
+RPI 4 Model B (0x...)
+...
+Hit any key to stop autoboot:  2
+U-Boot>
+```
+
+This build's prompt is `U-Boot>` instead of `=>`. Start Raspberry Pi OS:
+
+```console
+U-Boot> fatls mmc 0:1
+U-Boot> load mmc 0:1 ${kernel_addr_r} kernel8.img
+U-Boot> booti ${kernel_addr_r} - ${fdt_addr}
+...
+Starting kernel ...
+```
+
+Raspberry Pi OS boots to its login prompt.
+
+| Detail | Why |
+|---|---|
+| `kernel8.img` | Raspberry Pi OS's 64-bit kernel. If it's compressed, `booti` decompresses it using `kernel_comp_addr_r` and `kernel_comp_size`, which the Pi's default variables set |
+| `-` | No initramfs: the kernel can mount the SD card by itself |
+| `${fdt_addr}` | The device tree the **firmware** prepared, with its overlays and the contents of `cmdline.txt`. Because `bootargs` is empty, U-Boot keeps that command line |
+
+**Make it boot by itself** with a boot script on the boot partition. Standard boot finds `boot.scr` there. On the PC, create `boot.cmd`:
+
+```sh
+load mmc 0:1 ${kernel_addr_r} kernel8.img
+booti ${kernel_addr_r} - ${fdt_addr}
+```
+
+```sh
+mkimage -A arm64 -O linux -T script -C none -d boot.cmd boot.scr
+scp boot.scr $BOARD:
+ssh $BOARD sudo cp boot.scr /boot/firmware/
+```
+
+When Raspberry Pi OS updates its kernel, it replaces `kernel8.img`, and the script loads the new one.
+
+**To undo**, put the original `config.txt` back: `sudo cp /boot/firmware/config.txt.orig /boot/firmware/config.txt`. If the Pi doesn't boot, do it from the PC by mounting the card's first partition.
+
+**This is the end of the essential path.** You can now build U-Boot, use its command line, start Linux by hand and automatically, in QEMU and on a board.
 
 ---
 

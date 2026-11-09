@@ -50,19 +50,84 @@ A beginner's path from power-on to a running Linux kernel: what a bootloader doe
 
 ## 1. What a bootloader does
 
-Planned: why a board needs a bootloader, its four steps, and why it matters when something fails.
+When a board is powered on, its main memory (DRAM) doesn't work yet, and nothing knows where Linux is stored. The Linux kernel can't start itself. Something has to prepare the hardware, copy the kernel into RAM, tell it about the board, and jump to it. That is the **bootloader**.
+
+Its job, in four steps:
+
+| Step | In plain words | In U-Boot |
+|---|---|---|
+| **1. Bring up the hardware** | Set the clocks, start the DRAM controller so RAM can be used, start a serial port to print messages | Done by the SPL on the BeagleBone, by the firmware on the Raspberry Pi |
+| **2. Find the files** | Read the kernel, the device tree and maybe an initramfs from an SD card, eMMC, USB or the network | `load`, `tftp` |
+| **3. Prepare the hand-off** | Write the kernel command line and the RAM size into the device tree | Automatic, from the `bootargs` variable |
+| **4. Jump to the kernel** | Start the kernel with the CPU in the state Linux expects | `bootz`, `booti`, `bootm` |
+
+After step 4 the bootloader is gone: Linux takes over the whole RAM, including where U-Boot was.
+
+**Why you should care.** The bootloader is the first thing you can change on a board. When the serial port shows nothing, or Linux stops right after `Starting kernel ...`, the cause is very often here. It is also the tool you use to test a new kernel without rewriting the SD card, to boot over the network, and to recover a board.
+
+This note uses **U-Boot**, the bootloader of most embedded Linux boards, including both boards here.
 
 ---
 
 ## 2. The words you need
 
-Planned: boot ROM, SPL, MLO, U-Boot proper, firmware, serial console, environment, bootcmd, bootargs, device tree, load address, kernel image, initramfs, TFTP, defconfig.
+| Word | Meaning |
+|---|---|
+| **Boot ROM** | Code written into the chip at the factory. It runs first, and can only load a small program from a few fixed places. You can't change it |
+| **SPL** (secondary program loader) | A small first stage of U-Boot that fits in the chip's internal memory (SRAM). It starts the DRAM, then loads full U-Boot into it |
+| **MLO** | The file name the BeagleBone's boot ROM looks for on an SD card. It holds the SPL |
+| **U-Boot proper** | The full U-Boot, with drivers and a command line. Usually just called U-Boot |
+| **Firmware** | On the Raspberry Pi, closed-source programs from Raspberry Pi Ltd that run before U-Boot or Linux |
+| **Serial console** | The board's serial port (UART), connected to the PC with a USB-to-serial cable. On most boards it is the only way to talk to the bootloader |
+| **Environment** | U-Boot's variables, as `name=value` text. They can be saved to storage |
+| **`bootcmd`** | The variable U-Boot runs when the countdown ends |
+| **`bootargs`** | The kernel command line. Linux shows it in `/proc/cmdline` |
+| **Device tree** | A description of the board's hardware for the kernel: which devices exist and at which addresses. The source is a `.dts` file, the compiled form a `.dtb` |
+| **Load address** | The address in RAM where a file is copied before it is used |
+| **Kernel image** | The kernel file. On 32-bit Arm it is a **zImage**, which decompresses itself. On 64-bit Arm it is an **Image** |
+| **initramfs** (or initrd) | A small filesystem loaded into RAM with the kernel. Linux uses it before, or instead of, a root filesystem on disk |
+| **TFTP** | A very simple file transfer protocol. U-Boot uses it to load files from the PC over the network |
+| **defconfig** | A file that selects U-Boot's options for one board, such as `am335x_evm_defconfig` |
 
 ---
 
 ## 3. How each board boots
 
-Planned: the boot chain of the BeagleBone Black, the Raspberry Pi 4 and QEMU, side by side, and what QEMU can and can't prove.
+Each board has a different chain before Linux starts. QEMU is the third "board", and the simplest.
+
+```
+BeagleBone Black              Raspberry Pi 4                  QEMU virt
+────────────────              ──────────────                  ─────────
+Boot ROM in the AM3358        Boot ROM in the BCM2711         QEMU puts u-boot.bin in
+  │ finds MLO on SD or eMMC     │ runs the bootloader stored    emulated flash, a device
+  ▼                             │ in an EEPROM on the board     tree in RAM, and starts
+SPL (MLO), in internal SRAM     ▼                               the CPU at address 0
+  │ starts DRAM               EEPROM bootloader                    │
+  │ loads u-boot.img            │ reads the SD card's              │
+  ▼                             │ FAT partition                    │
+U-Boot                          ▼                                  │
+  │ loads kernel and DTB      GPU firmware (start4.elf)            │
+  ▼                             │ reads config.txt, cmdline.txt    │
+Linux                           │ loads the DTB and the kernel     ▼
+                                ▼                               U-Boot
+                              Linux, or U-Boot then Linux          │
+                                                                   ▼
+                                                                Linux
+```
+
+**The Raspberry Pi 4 doesn't need U-Boot.** Its firmware can start Linux directly, and Raspberry Pi OS does this by default. You add U-Boot for a command line, network boot, boot scripts or safe updates, and to boot the same way as other boards.
+
+| | BeagleBone Black | Raspberry Pi 4 | QEMU |
+|---|---|---|---|
+| First code you can replace | MLO (the SPL) | `config.txt` and the kernel file | `u-boot.bin` |
+| Who starts the DRAM | The SPL | The firmware | Nobody needs to, RAM just works |
+| Where U-Boot is stored | `MLO` and `u-boot.img` on the SD card's FAT partition, or in eMMC | `u-boot.bin` on the FAT boot partition, loaded by the firmware as if it were the kernel | Emulated flash |
+| Where the device tree comes from | A `.dtb` file that U-Boot loads | The firmware, from `bcm2711-rpi-4-b.dtb` plus overlays | QEMU generates it |
+| U-Boot defconfig | `am335x_evm_defconfig` | `rpi_4_defconfig` | `qemu_arm_defconfig` (32-bit) or `qemu_arm64_defconfig` (64-bit) |
+| Command that starts the kernel | `bootz` | `booti` | `bootz` (32-bit) or `booti` (64-bit) |
+| Serial console | J1 header, 115200 baud | GPIO 14 and 15 (pins 8 and 10), 115200 baud | Your terminal |
+
+**What QEMU proves, and what it doesn't.** QEMU's `virt` machine is a generic Arm computer, not an emulated AM3358 or BCM2711. It shows how U-Boot works: its commands, its environment, and how it starts Linux. It can't test the board's SPL, DRAM, SD card or serial wiring. For those you need the board.
 
 ---
 

@@ -695,7 +695,32 @@ When Raspberry Pi OS updates its kernel, it replaces `kernel8.img`, and the scri
 
 ## 10. Troubleshooting
 
-Planned: symptoms, causes and fixes, from a silent serial port to a kernel panic.
+**Read this when something fails.** First find the last line that worked: nothing at all, the SPL line, U-Boot's prompt, or `Starting kernel ...`.
+
+Nothing in this table was reproduced for this note.
+
+| Symptom | Likely cause | What to do |
+|---|---|---|
+| Nothing on the serial console | TX and RX not crossed, GND missing, wrong speed, or the wrong `/dev/ttyUSB*` | Swap TX and RX. Check `-b 115200`. Look at `dmesg` after plugging the cable |
+| Pi: nothing on the serial console, but HDMI shows the rainbow screen | `enable_uart=1` missing, or `kernel=` names a file that isn't there | Check `config.txt` from the PC |
+| BBB: the U-Boot banner shows an old version or date | The board booted from its eMMC | Hold S2 while applying power |
+| BBB: nothing at all, even with S2 held | `MLO` not found: the partition isn't FAT or isn't marked bootable | `sudo fdisk -l /dev/sdX` should show `*` under Boot |
+| BBB: `U-Boot SPL` line, then an error | The SPL can't find `u-boot.img` on the FAT partition | Check the file name, and that both files come from the same build |
+| `Unknown command 'bootz' - try 'help'` | That command isn't enabled in this configuration | `make O=... menuconfig`, or use the command `help` lists |
+| `zimage: Bad magic!` | The file at that address isn't a zImage: the load failed, it's the wrong file, or it's a 64-bit Image | Check `filesize` after loading. Use `booti` for 64-bit |
+| `Bad Linux ARM64 Image magic!` | Not a 64-bit Image: a zImage, a compressed Image without `kernel_comp_addr_r`, or the wrong file | Use the matching command and file (section 12) |
+| `Wrong Ramdisk Image Format` | The initramfs was given without its size | `${ramdisk_addr_r}:${filesize}`, with `filesize` from the initramfs load |
+| `Starting kernel ...` and then nothing | Wrong `console=` for this kernel, or the wrong device tree | Use `ttyAMA0` on QEMU, `ttyS0` on the BBB. Add `earlycon` to `bootargs` to see early messages |
+| `Kernel panic - not syncing: VFS: Unable to mount root fs` | No initramfs and a wrong or missing `root=`, or the kernel lacks the driver for that disk | Check `bootargs`. The [root filesystem](../rootfs/) note covers this |
+| `*** Warning - bad CRC, using default environment` | Nothing saved yet, or the saved copy was erased | Normal on a first boot. `saveenv` |
+| `saveenv` fails in QEMU | QEMU started without the `-drive if=pflash,index=1` option | Use `run-qemu.sh` |
+| `Retry count exceeded; starting again` during `tftp` or `dhcp` | No answer from the server | `printenv serverip ipaddr`. On a board, check the cable and the PC's firewall |
+| `TFTP error: 'File not found' (1)` | The file isn't in the TFTP folder, or the name differs | File names are case-sensitive |
+| `** Reading file would overwrite reserved memory **` | The load address is where U-Boot itself lives | Use the `*_addr_r` variables (section 11) |
+| `** Bad device specification mmc 2 **` | That device or partition doesn't exist | `mmc list`, then `part list mmc 0` |
+| BBB: `WARNING: Could not determine device tree to use` | `fdtfile` is `undefined` | `run findfdt`, or `setenv fdtfile am335x-boneblack.dtb` |
+| BBB: U-Boot ignores `uEnv.txt` | Mainline U-Boot doesn't read it | Section 9, "About `uEnv.txt`" |
+| The board reboots in a loop | `bootcmd` fails or starts a kernel that crashes | Press a key during the countdown, then fix or reset the variables |
 
 ---
 
@@ -960,4 +985,26 @@ Breakpoints and backtraces then work as usual. U-Boot's [GDB guide](https://docs
 
 ## References
 
-Planned: U-Boot, Linux, QEMU and board documentation.
+U-Boot:
+
+- [U-Boot documentation](https://docs.u-boot.org/en/latest/), and the [source](https://git.u-boot-project.org/u-boot/u-boot)
+- [Building with GCC](https://docs.u-boot.org/en/latest/build/gcc.html)
+- Boards: [QEMU Arm](https://docs.u-boot.org/en/latest/board/emulation/qemu-arm.html), [AM335x](https://docs.u-boot.org/en/latest/board/ti/am335x_evm.html), [Raspberry Pi](https://docs.u-boot.org/en/latest/board/broadcom/raspberrypi.html)
+- [Environment variables](https://docs.u-boot.org/en/latest/usage/environment.html), [standard boot](https://docs.u-boot.org/en/latest/develop/bootstd/index.html), [extlinux.conf format](https://docs.u-boot.org/en/latest/usage/pxe.html)
+- Commands: [bootz](https://docs.u-boot.org/en/latest/usage/cmd/bootz.html), [booti](https://docs.u-boot.org/en/latest/usage/cmd/booti.html), [source](https://docs.u-boot.org/en/latest/usage/cmd/source.html), [fdt](https://docs.u-boot.org/en/latest/usage/cmd/fdt.html)
+- [FIT images](https://docs.u-boot.org/en/latest/usage/fit/index.html), [device tree overlays](https://docs.u-boot.org/en/latest/usage/fdt_overlays.html), [boot count](https://docs.u-boot.org/en/latest/api/bootcount.html), [debugging with GDB](https://docs.u-boot.org/en/latest/develop/gdb.html)
+
+Linux:
+
+- Booting the kernel: [32-bit Arm](https://docs.kernel.org/arch/arm/booting.html), [64-bit Arm](https://docs.kernel.org/arch/arm64/booting.html)
+- [Mounting the root filesystem over NFS](https://docs.kernel.org/admin-guide/nfs/nfsroot.html)
+- [Debian installer images for armhf](https://deb.debian.org/debian/dists/trixie/main/installer-armhf/current/images/) and [arm64](https://deb.debian.org/debian/dists/trixie/main/installer-arm64/current/images/)
+
+QEMU:
+
+- [The `virt` machine](https://www.qemu.org/docs/master/system/arm/virt.html), [network emulation](https://www.qemu.org/docs/master/system/devices/net.html)
+
+Boards:
+
+- BeagleBone Black: [documentation](https://docs.beagleboard.org/boards/beaglebone/black/index.html), [AM335x technical reference manual](https://www.ti.com/lit/pdf/spruh73), chapter "Initialization"
+- Raspberry Pi 4: [config.txt](https://www.raspberrypi.com/documentation/computers/config_txt.html), [boot sequence and EEPROM](https://www.raspberrypi.com/documentation/computers/raspberry-pi.html), [UARTs](https://www.raspberrypi.com/documentation/computers/configuration.html)

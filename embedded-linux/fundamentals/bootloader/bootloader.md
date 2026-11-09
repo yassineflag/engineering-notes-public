@@ -701,49 +701,260 @@ Planned: symptoms, causes and fixes, from a silent serial port to a kernel panic
 
 ## 11. Memory and load addresses
 
-Planned: RAM start and load address variables on each board, and how to avoid overlapping loads.
+**Read this when** you choose where to load files, or a kernel crashes right after a load that looked fine.
+
+Each board's RAM starts at a different address, and each default environment has variables with safe places to load things. The `_r` means "in RAM".
+
+| Variable | Used for | QEMU `virt` | BeagleBone Black | Raspberry Pi 4 |
+|---|---|---|---|---|
+| RAM start | | `0x40000000` | `0x80000000` | `0x00000000` |
+| `kernel_addr_r` | The kernel | `0x40400000` | `0x82000000` | `0x00080000` |
+| `fdt_addr_r` | A device tree loaded from a file | Not set | `0x88000000` | `0x05600000` |
+| `fdt_addr` | The device tree a previous stage provided | `0x40000000`, from QEMU | Not set | Set at boot, from the firmware |
+| `ramdisk_addr_r` | The initramfs | `0x44000000` | `0x88080000` | `0x05700000` |
+| `scriptaddr` | A boot script | `0x40200000` | `0x80000000` | `0x05400000` |
+
+Values from U-Boot v2026.10's default environments.
+
+**Nothing stops a load from overwriting another one.** On the BeagleBone, the device tree at `0x88000000` has `0x80000` bytes (512 KiB) before the initramfs starts, which is plenty for a `.dtb`. A kernel bigger than the gap to the next address would be silently cut by the next load. After each load, compare `filesize` with the gap.
+
+**Why the kernel isn't at the start of RAM.** A zImage decompresses itself near the start of RAM. The BeagleBone's `0x82000000` leaves 32 MiB below it for that.
+
+**What U-Boot protects.** U-Boot moves itself to the top of RAM, and refuses loads over that area. Before starting the kernel, it copies the device tree and initramfs to a place the kernel can reach early. `bootm_size` limits that place: the BeagleBone's `0x10000000` keeps them in the first 256 MiB of RAM.
 
 ---
 
 ## 12. Kernel image formats and FIT
 
-Planned: zImage, Image, uImage and FIT; recognising them; a FIT example.
+**Read this when** a kernel won't start with "bad magic", or you need a single signed boot file.
+
+| Format | How to recognise it | Command | Made by |
+|---|---|---|---|
+| **zImage** | 32-bit Arm. Bytes `18 28 6f 01` at offset `0x24` | `bootz` | The kernel build: `arch/arm/boot/zImage` |
+| **Image** | 64-bit Arm. Text `ARMd` at offset `0x38` | `booti` | The kernel build: `arch/arm64/boot/Image` |
+| **Image.gz** | A compressed Image | `booti`, if `kernel_comp_addr_r` and `kernel_comp_size` are set | The kernel build |
+| **uImage** | A 64-byte U-Boot header in front of a kernel. Starts with `27 05 19 56` | `bootm` | `mkimage -T kernel`. Older guides use it |
+| **FIT** (`.itb`) | A device tree that contains files. Starts with `d0 0d fe ed` | `bootm` | `mkimage -f` |
+
+Check the first bytes of the kernels from section 7. **Expected (QEMU):**
+
+```console
+$ od -A x -t x1z -j 0x24 -N 4 ~/boot/bbb/tftp/kernel
+000024 18 28 6f 01                                      >.(o.<
+000028
+$ od -A x -t x1z -j 0x38 -N 4 ~/boot/pi4/tftp/kernel
+000038 41 52 4d 64                                      >ARMd<
+00003c
+```
+
+### FIT images
+
+A **FIT** (flattened image tree) puts the kernel, one or more device trees and the initramfs in one file, with a checksum for each part. It is the format to use for products, because the parts can't get mixed up, and the file can be signed (section 16).
+
+`bbb.its` describes the file (**Illustrative**):
+
+```dts
+/dts-v1/;
+
+/ {
+    description = "BeagleBone Black: kernel, device tree, initramfs";
+    #address-cells = <1>;
+
+    images {
+        kernel {
+            data = /incbin/("kernel");
+            type = "kernel_noload";
+            arch = "arm";
+            os = "linux";
+            compression = "none";
+            load = <0>;
+            entry = <0>;
+            hash { algo = "sha256"; };
+        };
+        fdt {
+            data = /incbin/("am335x-boneblack.dtb");
+            type = "flat_dt";
+            arch = "arm";
+            compression = "none";
+            hash { algo = "sha256"; };
+        };
+        initrd {
+            data = /incbin/("initrd.gz");
+            type = "ramdisk";
+            arch = "arm";
+            os = "linux";
+            compression = "none";
+            hash { algo = "sha256"; };
+        };
+    };
+
+    configurations {
+        default = "bbb";
+        bbb {
+            kernel = "kernel";
+            fdt = "fdt";
+            ramdisk = "initrd";
+        };
+    };
+};
+```
+
+`kernel_noload` runs the zImage where it is in the file, since a zImage can run from any address. Build it, list it, and boot it (**Illustrative**):
+
+```sh
+mkimage -f bbb.its bbb.itb
+mkimage -l bbb.itb
+
+# in U-Boot
+load mmc 0:1 ${loadaddr} bbb.itb
+setenv bootargs console=ttyS0,115200n8
+bootm ${loadaddr}
+```
 
 ---
 
 ## 13. The device tree in the bootloader
 
-Planned: what U-Boot changes in the device tree, the fdt command, and overlays.
+**Read this when** you need to change the hardware description at boot, or add an overlay.
+
+U-Boot edits the device tree before starting the kernel. It writes `bootargs` and the initramfs location into the `/chosen` node, fills in the real RAM size, and adds details such as MAC addresses. You can look at it and change it with the `fdt` command.
+
+**Expected (QEMU):**
+
+```console
+=> fdt addr ${fdt_addr}
+=> fdt print /chosen
+chosen {
+	...
+	stdout-path = "/pl011@9000000";
+};
+```
+
+`stdout-path` is how the device tree says which serial port is the console. That's also what `earlycon`, with no options, uses.
+
+**Overlays** are small device tree fragments applied on top of the board's device tree, for example for a cape or a sensor. On the BeagleBone (**Illustrative**):
+
+```
+load mmc 0:1 ${fdt_addr_r} am335x-boneblack.dtb
+fdt addr ${fdt_addr_r}
+fdt resize 8192
+load mmc 0:1 ${fdtoverlay_addr_r} my-sensor.dtbo
+fdt apply ${fdtoverlay_addr_r}
+```
+
+`fdt resize` makes room for the new nodes. Both the base `.dtb` and the overlay must be compiled with symbols (`dtc -@`), or `fdt apply` fails. In `extlinux.conf`, an `fdtoverlays /my-sensor.dtbo` line does the same.
+
+On the Raspberry Pi, keep using `dtoverlay=` lines in `config.txt`. The firmware applies them before U-Boot starts, and U-Boot passes the result on.
 
 ---
 
 ## 14. Booting over the network
 
-Planned: TFTP and an NFS root from the PC, with the BeagleBone's netboot variable.
+**Read this when** you rebuild the kernel or root filesystem often. Booting from the PC avoids rewriting the SD card each time.
+
+The board loads the kernel and device tree with TFTP, and the kernel mounts its root filesystem from the PC with **NFS**. On the PC (**Illustrative**):
+
+```sh
+sudo apt install tftpd-hpa nfs-kernel-server
+sudo cp zImage am335x-boneblack.dtb /srv/tftp/
+echo '/srv/nfs/bbb *(rw,sync,no_subtree_check,no_root_squash)' | sudo tee -a /etc/exports
+sudo exportfs -ra
+```
+
+`/srv/tftp` is the folder the `tftpd-hpa` package serves. `/srv/nfs/bbb` holds a root filesystem, which the [root filesystem](../rootfs/) note builds.
+
+The BeagleBone's default environment already has a `netboot` variable that does all of it: `dhcp`, `tftp` of `${bootfile}` and `${fdtfile}`, then `bootz` with an NFS root. Connect the board's Ethernet port to your network. **Expected (board)**, with the PC at `192.168.1.10`:
+
+```console
+=> run findfdt
+=> setenv console ttyS0,115200n8
+=> setenv serverip 192.168.1.10
+=> setenv bootfile zImage
+=> setenv rootpath /srv/nfs/bbb
+=> run netboot
+Booting from network ...
+...
+```
+
+The kernel needs the Ethernet driver and NFS root support built in, not as modules, because it needs them before any root filesystem exists. If your network's DHCP server names another TFTP server, it replaces `serverip`; check with `printenv serverip`.
 
 ---
 
 ## 15. The environment from Linux
 
-Planned: fw_printenv and fw_setenv, fw_env.config, and a redundant environment.
+**Read this when** a program on the board must change U-Boot's variables, for example to switch to a new system after an update.
+
+`fw_printenv` and `fw_setenv` read and write U-Boot's saved variables from Linux. They come in the `libubootenv-tool` package, or `u-boot-tools` on older releases. They need `/etc/fw_env.config` to say where the variables are and how big the area is. On the Raspberry Pi 4, where they're a file on the boot partition (**Illustrative**):
+
+```
+# File or device          Offset    Size
+/boot/firmware/uboot.env  0x0000    0x4000
+```
+
+```sh
+fw_printenv bootdelay
+sudo fw_setenv bootdelay 5
+```
+
+**The size must equal U-Boot's `CONFIG_ENV_SIZE`**: `0x4000` in `rpi_4_defconfig`, `0x20000` for the BeagleBone. Otherwise the checksum doesn't match and the tools report a bad CRC. Find it with `grep CONFIG_ENV_SIZE $BOOTDIR/build-board/.config`.
+
+**Redundant environment.** If power is lost during `saveenv`, the saved variables are corrupted, and U-Boot falls back to its defaults. With `CONFIG_ENV_REDUNDANT`, U-Boot keeps two copies and writes them in turn, so one is always valid. Products should enable it.
 
 ---
 
 ## 16. Safe updates and verified boot
 
-Planned: bootcount and A/B updates, signed FIT images, and locking down the command line.
+**Read this when** you design how a product updates itself, or must ensure it only runs your software.
+
+### Falling back after a bad update
+
+U-Boot can count boots. The **`bootcount`** value goes up at each boot, and Linux resets it once the system is known to work. If it goes above **`bootlimit`**, U-Boot runs **`altbootcmd`** instead of `bootcmd`.
+
+With two copies of the system, A and B, an update writes the inactive copy and switches `bootcmd` to it. If the new system fails to reset `bootcount` a few times in a row, `altbootcmd` boots the old one. Update tools such as RAUC, SWUpdate and Mender work this way with U-Boot. The BeagleBone's configuration stores `bootcount` in a register of the chip's real-time clock, which survives a reset.
+
+### Verified boot
+
+U-Boot can refuse a kernel that isn't signed with your key. You sign a FIT image (section 12) with a private key, and U-Boot checks it with the public key stored in its own device tree. Both defconfigs here enable it (`CONFIG_FIT_SIGNATURE`). U-Boot's documentation has a [complete example for the BeagleBone Black](https://docs.u-boot.org/en/latest/usage/fit/beaglebone_vboot.html).
+
+This only helps if U-Boot itself can't be replaced, and that needs the chip's boot ROM to verify the first stage. The BeagleBone's AM3358 is a general-purpose part that doesn't do this. TI's high-security parts do, and Raspberry Pi has its own signed-boot scheme for the Pi 4. In a product, also stop people from stopping the countdown: `CONFIG_AUTOBOOT_KEYED` requires a secret string, and disabling `CONFIG_CMDLINE` removes the command line entirely.
 
 ---
 
 ## 17. Debugging U-Boot
 
-Planned: debug messages, and GDB with QEMU across U-Boot's relocation.
+**Read this when** U-Boot itself crashes or misbehaves, or you change its code.
+
+**Print more.** Add `#define DEBUG` at the top of a source file, before its `#include` lines, and rebuild: that file's `debug()` messages are printed.
+
+**Use GDB with QEMU.** `-s` starts QEMU's GDB server on port 1234, and `-S` waits for the debugger before running. Install `gdb-multiarch` on the PC. **Expected (QEMU):**
+
+```sh
+# Terminal 1
+~/boot/run-qemu.sh -s -S
+
+# Terminal 2
+gdb-multiarch $BOOTDIR/build-qemu/u-boot -ex 'target remote :1234'
+```
+
+**U-Boot moves itself during boot**, so after the move the symbols in the ELF file no longer match the addresses. Find where it went: `relocaddr` in `bdinfo`, or from GDB, where the `r9` register (`x18` on 64-bit) points to U-Boot's global data. Then reload the symbols at that address (**Illustrative**):
+
+```
+(gdb) p/x (*(struct global_data *)$r9)->relocaddr
+$1 = 0x7f...
+(gdb) symbol-file
+(gdb) add-symbol-file build-qemu/u-boot 0x7f...
+```
+
+Breakpoints and backtraces then work as usual. U-Boot's [GDB guide](https://docs.u-boot.org/en/latest/develop/gdb.html) has the details.
 
 ---
 
 ## 18. Where the rest is covered
 
-Planned: links to the kernel, root filesystem and build system notes, and what isn't covered.
+- **Building the kernel and device trees** (`zImage`, `Image`, `.dtb`): the [kernel](../kernel/) note.
+- **Root filesystems, initramfs, and an NFS root:** the [root filesystem](../rootfs/) note.
+- **U-Boot built for you as part of a whole system:** the [Buildroot](../../linux-build-systems/buildroot/) and [Yocto](../../linux-build-systems/yocto/) notes.
+- **Not covered here:** Trusted Firmware-A and OP-TEE, which many 64-bit chips run before U-Boot; UEFI boot with GRUB; other bootloaders such as barebox; porting U-Boot to a new board.
 
 ---
 

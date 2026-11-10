@@ -70,15 +70,98 @@ This note starts at the kernel's first instruction and ends when `init` runs. Th
 
 ## 1. The mental model: what the kernel does on an embedded board
 
-*Planned: the kernel's inputs (image, DTB, command line, initramfs) and who provides them, what it must find on its own, the boot stages from the decompressor to init, and the three things that must agree: configuration, device tree, root filesystem.*
+The bootloader ends with a jump. When the kernel's first instruction runs, there is RAM, a CPU, a compressed kernel image somewhere in that RAM, and a device tree blob whose address is in a register. Nothing else is set up: no drivers, no filesystems, no processes. When the kernel's own boot ends, one program, `init`, runs with process ID 1 from a root filesystem, with `/dev/console` as its standard input and output. Everything in this note happens between those two points, or explains how to produce the files involved.
+
+A word used throughout: **userspace** means the programs that run outside the kernel, starting with `init`. They reach the hardware only through the kernel, with system calls, device files in `/dev` and the virtual filesystems `/proc` and `/sys`. The kernel runs in a privileged CPU mode; userspace doesn't. On the board, "the kernel booted" means userspace started.
+
+**What the kernel receives, and from whom:**
+
+| Input | Comes from | On the BeagleBone Black |
+|---|---|---|
+| The kernel image in RAM | The bootloader, loaded from storage or the network | `zImage` at `0x82000000` ([bootloader note](../bootloader/bootloader.md)) |
+| A description of the hardware | The device tree blob (DTB), address in `r2` | `am335x-boneblack.dtb`, built with the kernel (section 12) |
+| The command line | `/chosen/bootargs` in the DTB, written by U-Boot from its `bootargs` variable | `console=ttyS0,115200n8 root=/dev/mmcblk0p2 rootwait` (section 10) |
+| Optionally, an initramfs | Built into the kernel, or loaded by the bootloader next to the DTB | none by default (section 13) |
+
+**What it must find on its own:** a driver for the serial port, to print anything; a driver for the storage that holds the root filesystem (the AM3358's SD/MMC controller); the code for that filesystem (ext4); and an executable `init` on it. If any of these is missing, the boot stops, and the last line on the console tells you which one (section 24).
+
+**The stages**, from source (`init/main.c`, `init/do_mounts.c`, `arch/arm/kernel/`):
+
+```
+ zImage entry          decompressor: relocates if needed, unpacks the kernel
+      │                (prints nothing on this kernel, section 11)
+      ▼
+ start_kernel()        reads the DTB: machine, memory, command line
+      │                sets up memory management, interrupts, timers,
+      │                the scheduler; the console starts here
+      ▼
+ kernel_init()         runs the initcalls: buses, then drivers; each driver
+      │                matches device tree nodes and "probes" its device
+      ▼
+ root filesystem       unpacks the initramfs if any; otherwise waits for the
+      │                root= device, mounts it, mounts devtmpfs on /dev
+      ▼
+ init (PID 1)          /sbin/init or init=...; the kernel's boot is over
+```
+
+**Three things that must agree.** Most boot problems are a disagreement between them:
+
+| The kernel configuration (`.config`) | The device tree (`.dtb`) | The root filesystem |
+|---|---|---|
+| Which drivers exist, and whether they are built in or modules | Which devices exist on this board, at which addresses, which are enabled | Which modules are installed (`/lib/modules/<release>/`), which `init` runs |
+| Changed with `menuconfig`, fragments (section 5) | Changed by editing a `.dts` or by overlays (section 12) | Changed by the rootfs build ([rootfs note](../rootfs/)) |
+
+A driver that's enabled in the configuration does nothing if the device tree doesn't describe its device; a device in the tree stays silent if its driver isn't built; a driver built as a module needs a matching `/lib/modules/<release>/` on the root filesystem, where `<release>` is the exact version string of the running kernel (section 8).
 
 ## 2. The example board, kernel and files
 
-*Planned: the BeagleBone Black, the 7.1-rc1 tree, omap2plus_defconfig, the toolchain, ARCH and CROSS_COMPILE, and the files the board needs.*
+The board is the one from the bootloader note: a **BeagleBone Black** (TI AM3358, one Cortex-A8 core, 512 MiB of DDR3L, 4 GB eMMC, microSD slot), with U-Boot loading the kernel from the SD card and the serial console on J1 at 115200 8N1.
+
+| Element | Value |
+|---|---|
+| Kernel source | Mainline Linux at commit `66edb901bf87` (2 May 2026), just after 7.1-rc1. `make kernelversion` prints `7.1.0-rc1` |
+| Configuration | `omap2plus_defconfig`, the mainline configuration for TI's 32-bit Arm SoCs (OMAP3/4/5, AM335x, AM437x, DRA7) |
+| Cross-compiler | Arm GNU Toolchain 15.2.Rel1, prefix `arm-none-linux-gnueabihf-`. The distribution's `arm-linux-gnueabihf-gcc` works too: the kernel needs no C library ([toolchain note](../cross-compilation-toolchain/cross-compilation-toolchain.md)) |
+| Source directory | `~/bbb/linux` |
+| Build directory | `~/bbb/build`, separate from the source (`O=`, section 6) |
+| Root filesystem | ext4 on SD card partition 2 (`/dev/mmcblk0p2`), or NFS during development |
+
+The build commands in this note use two variables, which every cross build of the kernel needs:
+
+```sh
+$ export ARCH=arm
+$ export CROSS_COMPILE=arm-none-linux-gnueabihf-
+```
+
+`ARCH` selects the `arch/` subdirectory (and so the Kconfig tree, the defconfigs and the image formats); `CROSS_COMPILE` is the prefix in front of `gcc`, `ld`, `objcopy` and the other tools. Both must be set for every `make` call in the same build directory, including `menuconfig` and `modules_install`: a missing `ARCH` makes `make` use the build machine's architecture, with a different set of options.
+
+The files the board needs, with their sizes in the earlier build of this tree (section 7):
+
+| File | Produced by | Size | Read by | Where it goes |
+|---|---|---|---|---|
+| `arch/arm/boot/zImage` | `make zImage` | 5,813,512 bytes | U-Boot (`bootz`) | boot partition, or `/boot` on the rootfs |
+| `arch/arm/boot/dts/ti/omap/am335x-boneblack.dtb` | `make dtbs` | 98,077 bytes | U-Boot, then the kernel | next to the `zImage` |
+| `lib/modules/<release>/`: 860 `.ko` files plus index files | `make modules`, `make modules_install` | tens of MiB | the kernel, through `modprobe` | the root filesystem |
+
+The `zImage` and DTB are the same files the bootloader note decoded.
 
 ## 3. Which kernel: mainline, stable, LTS or vendor
 
-*Planned: where kernels come from, version numbers, and how to choose for a product.*
+Kernel versions come from several places, and the choice decides how much of this note works as written.
+
+| Source | What it is | Release rhythm | Use it when |
+|---|---|---|---|
+| **Mainline** (Linus Torvalds' tree) | Where development lands. A two-week merge window ends with `-rc1`, then weekly release candidates until the release | A release about every 9 to 10 weeks | Your SoC is well supported upstream, you want the newest drivers, or you work on the kernel itself |
+| **Stable** (`linux-7.0.y`) | Bug and security fixes backported to a release | Until shortly after the next release, then end of life | You follow mainline releases but want fixes |
+| **Longterm (LTS)** | A stable branch kept for several years; usually the last mainline release of each year | Fixes for at least two years, longer for some | Products: one base for the product's life, with fixes |
+| **Civil Infrastructure Platform (CIP)** | Some LTS kernels maintained for about 10 years by the CIP project | Long | Industrial products that ship for a decade |
+| **Vendor kernel** (TI's `ti-linux-kernel`, BeagleBoard.org's kernels) | An LTS kernel plus the vendor's patches for features not upstream yet | Follows the vendor's SDK | The SoC needs drivers that mainline lacks (GPU, some remoteproc and PRU uses, new SoCs) |
+
+Version numbers: `7.1` is a mainline release, `7.1.3` is the third stable update of it, `7.1-rc1` is the first release candidate. The `make kernelversion` form adds a `.0` (`7.1.0-rc1`), and the release string the running kernel reports may add a suffix (section 8). kernel.org lists the current stable and longterm branches and their end-of-life dates; check it rather than a date written in a note.
+
+The AM335x has been supported in mainline for over a decade, so a mainline or LTS kernel with `omap2plus_defconfig` boots a BeagleBone Black with Ethernet, SD/eMMC, USB, I2C, SPI, GPIO and the PMIC working. This note uses a mainline snapshot because it's what the example build used; a product would start from an LTS release and follow its stable updates (section 22).
+
+**Rule of thumb for a new board:** start with whatever kernel the board's vendor ships, and check how far mainline is from it. The further it is, the more of your time goes into carrying the vendor's patches rather than your own.
 
 ## 4. The source tree and Kbuild
 

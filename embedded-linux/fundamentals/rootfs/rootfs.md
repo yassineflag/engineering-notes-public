@@ -357,11 +357,187 @@ $ ${CROSS_COMPILE}strip --strip-unneeded $ROOTFS/lib/*.so*
 
 ## 6. /dev: devtmpfs, mdev and udev
 
-*Planned: Device nodes, the four ways to manage /dev, mdev configuration, module autoloading, firmware, /dev/pts and /dev/shm.*
+A **device node** is a special file, character or block, whose major and minor numbers point to a driver: `/dev/ttyS0`, `/dev/mmcblk0p2`, `/dev/null`. Programs open these files to reach the hardware. Something must create them, with the right owners and permissions, including for devices that appear later (a USB stick, a module loaded at run time).
+
+**Four ways, from simplest to fullest:**
+
+| Method | Who creates the nodes | Owners, permissions, symbolic links | Loads modules for new devices | Use |
+|---|---|---|---|---|
+| Static nodes | You, with `mknod` when building the image | Fixed at build time | No | Old kernels without devtmpfs; an initramfs's `/dev/console` |
+| devtmpfs alone | The kernel, as drivers register devices | Kernel defaults: mostly `root`, `0600` | No | The simplest working system |
+| devtmpfs + `mdev` | The kernel; BusyBox `mdev` applies rules | `/etc/mdev.conf` | Yes, with a rule | BusyBox systems |
+| devtmpfs + `udev` | The kernel; `systemd-udevd` (or the standalone `eudev`) applies rules | `/etc/udev/rules.d/`, `/lib/udev/rules.d/` | Yes | Distributions, systemd systems |
+
+**devtmpfs** is a filesystem in which the kernel itself creates a node for every device with a major and minor number, named as the driver says. `CONFIG_DEVTMPFS=y` creates it and `CONFIG_DEVTMPFS_MOUNT=y` mounts it on `/dev` after mounting a disk or NFS root. `omap2plus_defconfig` has both (kernel note, section 13). Two consequences:
+
+- **The root filesystem needs an empty `/dev` directory and nothing in it.** Nodes created with `mknod` in the image are hidden as soon as devtmpfs is mounted over them. `/dev/console` isn't needed either: the kernel opened the console in its built-in initramfs, before mounting the root.
+- **`CONFIG_DEVTMPFS_MOUNT` doesn't apply to an initramfs.** When the kernel runs `/init` from an initramfs, it never reaches the code that mounts devtmpfs; the initramfs must run `mount -t devtmpfs devtmpfs /dev` itself (section 10).
+
+**mdev.** BusyBox's `mdev` has two modes:
+
+- **`mdev -s`** ("scan") walks `/sys` once and applies the rules to the devices that already exist (coldplug).
+- **`mdev -d`** runs as a daemon and receives the kernel's device events (uevents) over a netlink socket, for devices that appear later (hotplug). The older way to receive them is `echo /sbin/mdev > /proc/sys/kernel/hotplug`, which makes the kernel start one `mdev` process per event. It needs `CONFIG_UEVENT_HELPER`, and the netlink daemon is the better choice.
+
+Start the daemon first, then scan, so that no event falls between the two (section 7 shows the script).
+
+**`/etc/mdev.conf`** is a list of rules. The first rule whose regular expression matches the device name applies, and the rest are ignored:
+
+```
+# <device regex>  <uid>:<gid> <mode>  [>link or =newname]  [@cmd on creation, $cmd on removal, *cmd both]
+null              0:0   666
+zero              0:0   666
+full              0:0   666
+random            0:0   666
+urandom           0:0   666
+tty               0:5   666
+ttyS[0-9]*        0:20  660
+mmcblk[0-9].*     0:6   660
+rtc0              0:0   644   >rtc
+$MODALIAS=.*      0:0   660   @modprobe "$MODALIAS"
+```
+
+The group numbers match `/etc/group` of section 8 (`tty` 5, `disk` 6, `dialout` 20). `>rtc` creates a `/dev/rtc` link to `rtc0`. The last line handles events that carry a `MODALIAS` variable, which are devices without a driver yet, and runs `modprobe` on it. Without `/etc/mdev.conf` at all, `mdev` creates every node as `root:root 0660`.
+
+**Loading modules for devices present at boot.** An event happens only once. Devices that the kernel found before `mdev -d` started already had their event, and `mdev -s` only scans devices that have nodes. The usual workaround, in the startup script, is to read every `modalias` file in `/sys` and load what matches:
+
+```sh
+find /sys/devices -name modalias | while read f; do modprobe -q "$(cat "$f")"; done 2>/dev/null
+```
+
+`modprobe` looks each alias up in `/lib/modules/$(uname -r)/modules.alias` (kernel note, section 14). Aliases with no matching module fail quietly. On a system with every needed driver built in, this line does nothing and can go.
+
+**Firmware.** Some drivers load a firmware file when they probe: Wi-Fi chips, some USB devices, the AM335x's power-management coprocessor (`am335x-pm-firmware.elf`, needed for suspend). The kernel reads these files from `/lib/firmware/` itself; no userspace helper is involved. A driver that probes **before** the root filesystem is mounted can't find them: build the firmware into the kernel (`CONFIG_EXTRA_FIRMWARE`), or build the driver as a module so it probes later.
+
+**`/dev/pts` and `/dev/shm`** aren't created by devtmpfs:
+
+- **`/dev/pts`** (filesystem `devpts`) holds the pseudo-terminals that SSH sessions, `script` and terminal multiplexers use. Without it, SSH logins fail to get a terminal.
+- **`/dev/shm`** (a tmpfs) holds POSIX shared memory (`shm_open()`).
+
+Create both directories in the startup script after devtmpfs is mounted, then mount them from `/etc/fstab` (section 9).
 
 ## 7. init: inittab and the startup scripts
 
-*Planned: BusyBox init, its default behavior, inittab, the rcS and rcK scripts, service scripts, console output.*
+**BusyBox `init`** reads `/etc/inittab` and runs the entries in order of action. **Without `/etc/inittab`** it uses built-in defaults:
+
+```
+::sysinit:/etc/init.d/rcS
+::askfirst:-/bin/sh                 (on the console, then on tty2, tty3 and tty4)
+::ctrlaltdel:/sbin/reboot
+::shutdown:/sbin/swapoff -a
+::shutdown:/bin/umount -a -r
+::restart:/sbin/init
+```
+
+That is enough to boot to a shell, which is why a BusyBox system with no `/etc` at all still reaches a prompt. It says `Please press Enter to activate this console.`, then opens a shell with no job control (`can't access tty; job control turned off`), because the console isn't a real terminal device.
+
+**The format** is `<id>:<runlevels>:<action>:<process>`:
+
+- **`id`** is the terminal the process runs on, without `/dev/` (`ttyS0`). Empty means `/dev/console`.
+- **`runlevels`** is ignored by BusyBox `init`. SysV `init` uses it (section 12).
+- **`process`** is a command line. A leading `-` starts the shell as a login shell, which reads `/etc/profile`.
+
+| Action | When | Waits for it | Typical use |
+|---|---|---|---|
+| `sysinit` | First, at boot | Yes | `/etc/init.d/rcS` |
+| `wait` | After `sysinit` | Yes | One-time setup that must finish first |
+| `once` | After `sysinit` | No | Starting something once |
+| `respawn` | After the above; restarted whenever it exits | No | `getty`; a daemon running in the foreground |
+| `askfirst` | Like `respawn`, but prints `Please press Enter to activate this console.` first | No | A development shell |
+| `ctrlaltdel` | When `init` receives `SIGINT` | | `reboot` |
+| `shutdown` | At `halt`, `reboot`, `poweroff` | Yes | Stop services, unmount |
+| `restart` | When `init` receives `SIGQUIT` | | Re-execute `init` |
+
+**`/etc/inittab`** for the BeagleBone Black:
+
+```
+# /etc/inittab - BusyBox init
+::sysinit:/etc/init.d/rcS
+
+# login prompt on the serial console (J1, 115200 8N1)
+ttyS0::respawn:/sbin/getty -L ttyS0 115200 vt100
+
+::ctrlaltdel:/sbin/reboot
+::shutdown:/etc/init.d/rcK
+::shutdown:/bin/umount -a -r
+::restart:/sbin/init
+```
+
+- **The terminal is `ttyS0`**: the kernel's name for UART0 with the 8250 driver. `ttyO0` is the name used by the old `omap-serial` driver, which mainline configurations no longer use. A `getty` on a terminal that doesn't exist respawns and fails in a loop (section 21).
+- `getty -L` treats the line as local, without modem control signals. `getty` prints `/etc/issue` and `<hostname> login:`, then runs `/bin/login`.
+- **For development, skip the login:** `ttyS0::respawn:-/bin/sh` gives a root shell on the serial console, with job control because `ttyS0` is a real terminal. Keep it out of products (section 17).
+
+**`/etc/init.d/rcS`**, the startup script, run once by the `sysinit` line:
+
+```sh
+#!/bin/sh
+# /etc/init.d/rcS - run once at boot by init
+
+# filesystems from /etc/fstab: /proc, /sys, /dev/pts, /dev/shm, /tmp, /run (section 9)
+mkdir -p /dev/pts /dev/shm
+mount -a
+mkdir -p /run/lock
+
+hostname -F /etc/hostname
+
+# devices: hotplug daemon first, then existing devices, then their modules (section 6)
+mdev -d
+mdev -s
+find /sys/devices -name modalias | while read f; do modprobe -q "$(cat "$f")"; done 2>/dev/null
+
+# keep kernel messages off the console once userspace runs (still in dmesg)
+dmesg -n 1
+
+# services, in name order: S01syslog, S10network, ...
+for s in /etc/init.d/S[0-9][0-9]*; do
+    [ -x "$s" ] && "$s" start
+done
+```
+
+**`/etc/init.d/rcK`**, run at shutdown, stops the same services in reverse order:
+
+```sh
+#!/bin/sh
+# /etc/init.d/rcK - run at shutdown by init
+for s in $(ls -r /etc/init.d/S[0-9][0-9]* 2>/dev/null); do
+    [ -x "$s" ] && "$s" stop
+done
+```
+
+**A service script** follows the `S<two digits><name>` convention, which is also Buildroot's:
+
+```sh
+#!/bin/sh
+# /etc/init.d/S01syslog - system and kernel logs (section 9)
+case "$1" in
+    start) syslogd -C64; klogd ;;
+    stop)  killall klogd syslogd ;;
+    *)     echo "usage: $0 start|stop"; exit 1 ;;
+esac
+```
+
+Make them executable: `chmod 755 $ROOTFS/etc/init.d/rc* $ROOTFS/etc/init.d/S*`. Two rules prevent most startup-script failures: **Unix line endings** (a script saved with CRLF asks for the interpreter `/bin/sh\r`, which doesn't exist), and **`#!/bin/sh`**, not `#!/bin/bash`, unless bash is installed.
+
+**Supervision.** BusyBox `init` restarts only what `/etc/inittab` lists. A daemon started from a script that later crashes stays dead. For the application of a product, the simplest supervision is a `respawn` line that runs it **in the foreground**: `::respawn:/usr/bin/myapp`. Section 12 compares init systems that do more.
+
+**What the console shows** when this system boots. **Expected**, after the kernel lines of the kernel note's section 11:
+
+```
+[    ...] Run /sbin/init as init process
+
+bbb login: root
+Password:
+~ #
+```
+
+And at `reboot`, from BusyBox `init`. **Expected**:
+
+```
+The system is going down NOW!
+Sent SIGTERM to all processes
+Sent SIGKILL to all processes
+Requesting system reboot
+[    ...] reboot: Restarting system
+```
 
 ## 8. Users, logins and file ownership
 

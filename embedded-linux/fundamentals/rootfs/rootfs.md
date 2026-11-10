@@ -738,11 +738,201 @@ Options go in `/etc/modprobe.d/*.conf` (`options g_ether host_addr=...`), which 
 
 ## 10. Filesystem images: ext4, squashfs, UBIFS and initramfs
 
-*Planned: The filesystem formats and how to choose, building ext4, squashfs, UBIFS and initramfs images.*
+The staging tree becomes a **filesystem image**: a file holding a complete filesystem, written as is to a partition. The format depends on the storage and on whether the root must be writable.
+
+**Block device or raw flash first.** An SD card or eMMC has a controller that hides the flash behind a block device, with wear leveling and bad-block handling: it takes the same filesystems as a hard disk. Raw NAND or NOR flash, soldered without a controller, shows up as an MTD device and needs filesystems built for flash. The BeagleBone Black has eMMC and SD, so ext4 or squashfs; UBIFS is here for boards with raw NAND.
+
+| Format | Writable | Storage | Kernel option | Build tool | Use |
+|---|---|---|---|---|---|
+| ext4 | Yes (or mounted `ro`) | Block device | `CONFIG_EXT4_FS` | `mkfs.ext4 -d` | The default |
+| squashfs | No, compressed | Block device | `CONFIG_SQUASHFS` plus `_XZ` or `_ZSTD` | `mksquashfs` | Read-only root, dm-verity (sections 15, 17) |
+| EROFS | No, compressed | Block device | `CONFIG_EROFS_FS` | `mkfs.erofs` | A newer read-only alternative, used by Android |
+| F2FS | Yes | Block device | `CONFIG_F2FS_FS` | `mkfs.f2fs` | A writable alternative designed for flash |
+| UBIFS on UBI | Yes | Raw NAND | `CONFIG_MTD_UBI`, `CONFIG_UBIFS_FS` | `mkfs.ubifs`, `ubinize` | Boards with raw NAND |
+| JFFS2 | Yes | Small NOR | `CONFIG_JFFS2_FS` | `mkfs.jffs2` | Older and small-flash systems |
+| cpio (initramfs) | In RAM | Loaded with the kernel | `CONFIG_BLK_DEV_INITRD` | `cpio`, `gen_init_cpio` | Rescue, small systems that run from RAM |
+| tar | | | | `tar` | Transport: NFS, update tools, `mmdebstrap` |
+
+Whatever the format, the kernel needs its driver **built in** to mount it as root (kernel note, section 13). `omap2plus_defconfig` has ext4 built in. Check the others before relying on them: `grep -E 'SQUASHFS|EROFS|F2FS|UBIFS' ~/bbb/build/.config`.
+
+**ext4.** `mkfs.ext4 -d` (e2fsprogs 1.43 and later) fills the new filesystem from a directory, with no mount and no root. Run it inside the `fakeroot` session of section 8, so the files belong to root:
+
+```sh
+$ fakeroot sh -c "chown -R 0:0 $ROOTFS && mkfs.ext4 -q -L rootfs -d $ROOTFS ~/bbb/images/rootfs.ext4 256M"
+```
+
+Given a size, `mkfs.ext4` creates the image file. To write it to the card's second partition and grow it to the partition's size:
+
+```sh
+$ sudo dd if=~/bbb/images/rootfs.ext4 of=/dev/sdX2 bs=4M conv=fsync status=progress
+$ sudo e2fsck -f /dev/sdX2
+$ sudo resize2fs /dev/sdX2
+```
+
+A recent `mkfs.ext4` enables features (`metadata_csum`, `orphan_file`) that older tools may not know. A board-side `e2fsck` from an old e2fsprogs refuses such a filesystem. U-Boot reads it, but its ext4 write support refuses `metadata_csum` (`ext4write`, an environment stored on ext4). When that matters, disable the feature: `mkfs.ext4 -O ^metadata_csum ...`.
+
+**squashfs**, compressed and read-only:
+
+```sh
+$ mksquashfs $ROOTFS ~/bbb/images/rootfs.squashfs -comp xz -all-root -noappend
+```
+
+`-all-root` makes every file belong to root, so no `fakeroot` is needed. To keep a few files owned by other users, use `fakeroot` and leave the option out. Written to partition 2 with `dd`, it's booted with `root=/dev/mmcblk0p2 rootfstype=squashfs ro rootwait`. Since nothing can write to it, `/tmp`, `/run` and the other writable paths must be tmpfs or another partition (section 15).
+
+**UBIFS**, for raw NAND (not on this board). UBI manages the raw flash (wear leveling, bad blocks) and offers volumes; UBIFS is the filesystem in a volume. The parameters come from the NAND chip's geometry: page size, erase block size. For 2 KiB pages and 128 KiB erase blocks without subpages:
+
+```sh
+$ mkfs.ubifs -r $ROOTFS -m 2048 -e 126976 -c 2048 -o rootfs.ubifs
+$ cat ubinize.cfg
+[rootfs]
+mode=ubi
+image=rootfs.ubifs
+vol_id=0
+vol_type=dynamic
+vol_name=rootfs
+vol_flags=autoresize
+$ ubinize -o rootfs.ubi -m 2048 -p 128KiB -s 2048 ubinize.cfg
+```
+
+`-e` is the logical erase block: 128 KiB minus two pages for UBI's headers. `-c` is the maximum number of logical erase blocks the filesystem may grow to. The kernel mounts it with `ubi.mtd=<partition> root=ubi0:rootfs rootfstype=ubifs`. Wrong geometry is the usual failure, and the kernel's UBI messages name the mismatch.
+
+**initramfs.** An initramfs is a cpio archive that the kernel unpacks into RAM and runs `/init` from (kernel note, section 13). The same tree works with three changes:
+
+1. **`/init` must exist**: `ln -s sbin/init $ROOTFS/init`. With it, the kernel never looks at `root=`.
+2. **Mount devtmpfs yourself**: add `mountpoint -q /dev || mount -t devtmpfs devtmpfs /dev` at the top of `rcS`. `CONFIG_DEVTMPFS_MOUNT` doesn't apply to an initramfs (section 6), and the test keeps the same script working on a disk root, where the kernel already mounted it.
+3. **Mind the size**: the whole archive is unpacked into RAM and stays there. Leave the modules out, or keep only those needed.
+
+Packed by hand, loaded by U-Boot:
+
+```sh
+$ cd $ROOTFS
+$ find . | cpio -o -H newc -R 0:0 | gzip -9 > ~/bbb/images/initramfs.cpio.gz
+```
+
+`-H newc` is the only cpio format the kernel reads, and `-R 0:0` makes every file belong to root. The kernel unpacks gzip by itself (`CONFIG_RD_GZIP`). U-Boot passes it with the `initrd` line of `extlinux.conf`, or `bootz ${kernel_addr_r} ${ramdisk_addr_r}:${filesize} ${fdt_addr_r}` when loaded by hand (bootloader note). The archive needs no `/dev/console`: the kernel unpacks its built-in default list first, and that list has it.
+
+Built into the kernel instead, one file to boot:
+
+```
+CONFIG_INITRAMFS_SOURCE="/home/me/bbb/rootfs"
+CONFIG_INITRAMFS_ROOT_UID=1000
+CONFIG_INITRAMFS_ROOT_GID=1000
+```
+
+The build packs the directory into `zImage`. Files owned by UID and GID 1000 (your user) are stored as root. A directory source replaces the default list, so `/dev/console` must then be added: `CONFIG_INITRAMFS_SOURCE` also takes a file list in the format of `usr/gen_init_cpio`, next to the directory, separated by a space:
+
+```
+# ~/bbb/initramfs-extra.txt
+dir /dev 0755 0 0
+nod /dev/console 0600 0 0 c 5 1
+```
+
+Every change to the root filesystem then means rebuilding the kernel. That suits a recovery image that rarely changes, not daily development.
 
 ## 11. Installing: SD card, eMMC and NFS root
 
-*Planned: Copying to the SD card, kernel modules, root= and PARTUUID, whole-card images with genimage, the eMMC, NFS root.*
+**On the SD card**, partition 2 of the layout from the bootloader note (MBR; FAT partition 1 with `MLO`, `u-boot.img`, `zImage`, the DTB and `extlinux/extlinux.conf`; ext4 partition 2). Copying the tree is simpler than an image while developing:
+
+```sh
+$ sudo mount /dev/sdX2 /mnt/rootfs
+$ sudo cp -a $ROOTFS/. /mnt/rootfs/
+$ sudo chown -R 0:0 /mnt/rootfs
+$ sudo chmod 0600 /mnt/rootfs/etc/shadow
+$ sudo chmod 4755 /mnt/rootfs/bin/busybox        # only for setuid applets (section 8)
+$ sudo umount /mnt/rootfs
+```
+
+**The kernel modules** go in with the kernel, from the kernel build directory, as in section 9 of the kernel note. Installing them into the staging tree keeps the tree complete:
+
+```sh
+$ make -C ~/bbb/linux O=~/bbb/build INSTALL_MOD_PATH=$ROOTFS INSTALL_MOD_STRIP=1 modules_install
+$ ls $ROOTFS/lib/modules/
+7.1.0-rc1-g66edb901bf87
+$ rm -f $ROOTFS/lib/modules/$KREL/build       # points into the build machine; useless on the board
+```
+
+The directory name must equal `uname -r` on the board. A kernel rebuilt with a new release string needs its modules installed again (kernel note, section 8).
+
+**The kernel command line** from the kernel note's `extlinux.conf` boots this partition:
+
+```
+append console=ttyS0,115200n8 root=/dev/mmcblk0p2 rw rootfstype=ext4 rootwait
+```
+
+`mmcblk0` is the SD card and `mmcblk1` the eMMC, because of the `mmc0` alias in the device tree. To stop depending on the numbering, use the partition's identifier instead. On an MBR disk it's the disk identifier plus the partition number:
+
+```sh
+$ sudo blkid -s PARTUUID -o value /dev/sdX2
+1a2b3c4d-02
+```
+
+Then `root=PARTUUID=1a2b3c4d-02`.
+
+**A whole-card image.** For several boards, or for the eMMC, build one file with both partitions and their content. `genimage` (Pengutronix, used by Buildroot) does it from a description (**untested**):
+
+```
+# genimage.cfg
+image boot.vfat {
+    vfat {
+        files = { "MLO", "u-boot.img", "zImage", "am335x-boneblack.dtb" }
+        file extlinux/extlinux.conf { image = "extlinux.conf" }
+    }
+    size = 64M
+}
+
+image sdcard.img {
+    hdimage { }
+
+    partition boot {
+        partition-type = 0xC
+        bootable = "true"
+        offset = 4M
+        image = "boot.vfat"
+    }
+
+    partition rootfs {
+        partition-type = 0x83
+        image = "rootfs.ext4"
+    }
+}
+```
+
+```sh
+$ genimage --config genimage.cfg --inputpath ~/bbb/images --outputpath ~/bbb/images \
+           --rootpath $ROOTFS --tmppath /tmp/genimage
+$ sudo dd if=~/bbb/images/sdcard.img of=/dev/sdX bs=4M conv=fsync status=progress
+```
+
+The input files (`MLO`, `u-boot.img`, `zImage`, the DTB, `extlinux.conf`, `rootfs.ext4`) are expected in `--inputpath`. The partition starts at 4 MiB, like the bootloader note's layout.
+
+**On the eMMC.** Boot from the SD card, copy `sdcard.img` onto it (or fetch it over the network), and on the board:
+
+```
+# cat /sys/block/mmcblk1/device/type
+MMC
+# dd if=/root/sdcard.img of=/dev/mmcblk1 bs=4M conv=fsync
+```
+
+`MMC` confirms `mmcblk1` is the eMMC; an SD card says `SD`. Without the S2 button held at power-on, the ROM then boots from the eMMC (bootloader note). The image's `root=` must name `mmcblk1p2`, or better a `PARTUUID`, which stays right on either device.
+
+**Over NFS**, for development: the root filesystem is a directory on the build machine, and a change there is visible on the board without copying anything. On the build machine:
+
+```sh
+$ sudo apt install nfs-kernel-server
+$ sudo mkdir -p /srv/nfs/bbb
+$ sudo rsync -a --chown=0:0 $ROOTFS/ /srv/nfs/bbb/
+$ echo '/srv/nfs/bbb 192.168.0.50(rw,sync,no_subtree_check,no_root_squash)' | sudo tee -a /etc/exports
+$ sudo exportfs -ra
+```
+
+- `no_root_squash` lets the board's root user act as root on the export. Without it, root becomes `nobody` and the system can't write its own files.
+- `rsync --chown=0:0` (rsync 3.1 and later) copies with root ownership. Run the same line again after each change in `$ROOTFS`. Adding `--delete` makes the export an exact copy, but also deletes what the board wrote there (logs, keys).
+
+The kernel side, from the bootloader note: `root=/dev/nfs nfsroot=192.168.0.10:/srv/nfs/bbb,vers=3,tcp ip=192.168.0.50:192.168.0.10::255.255.255.0::eth0:off rw`, with `CONFIG_ROOT_NFS`, `CONFIG_IP_PNP` and the Ethernet driver built in. On the root filesystem side:
+
+- **Leave `eth0` alone.** The kernel configured it to mount the root. An `ifdown eth0`, a DHCP client restarting it, or a network manager taking it over cuts the root filesystem off and freezes the system. In `/etc/network/interfaces`, declare it `iface eth0 inet manual`, or leave it out.
+- **No `fsck`**, and no line for `/` in `/etc/fstab`.
+- **Clocks.** Files written by the board carry its clock, which without NTP is years behind (section 9). `make` and other tools on the build machine then warn about clock skew.
 
 ## 12. Init systems: BusyBox init, SysV init, systemd and others
 

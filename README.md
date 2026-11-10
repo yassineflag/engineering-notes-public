@@ -18,6 +18,7 @@ Every note aims to be practical, so you'll find configs and commands you can reu
 
 ## Latest notes
 
+- [The Linux Kernel for Embedded Linux](embedded-linux/fundamentals/kernel/kernel.md)
 - [Bootloaders for Embedded Linux: U-Boot](embedded-linux/fundamentals/bootloader/bootloader.md)
 - [Cross-Compilation and Toolchains for Embedded Linux](embedded-linux/fundamentals/cross-compilation-toolchain/cross-compilation-toolchain.md)
 - [Cellular Protocols: LTE, 5G NR and Cellular IoT](wireless-protocols-and-connectivity/cellular/cellular.md)

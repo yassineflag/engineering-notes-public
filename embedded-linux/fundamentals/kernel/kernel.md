@@ -1081,12 +1081,94 @@ Everything above applies to other architectures; the names change.
 
 ## 24. Troubleshooting by symptom
 
-*Planned: a table from the last console line to the cause and the section.*
+Read the console from the top: the last thing the kernel printed tells you which stage failed (section 11). Messages in quotes come from the kernel source.
+
+**At build time:**
+
+| Symptom | Likely cause | Check, then see |
+|---|---|---|
+| `The source tree is not clean, please run 'make mrproper'` | A `.config` or generated files in the source tree, with an `O=` build | One style per tree: `make mrproper` in the source, keep everything in `O=` (section 6) |
+| The build uses `gcc` instead of the cross-compiler, or options look like x86 | `ARCH` or `CROSS_COMPILE` missing for this call, often under `sudo` | Set both on every `make` call (sections 2, 9) |
+| An option you set is gone from `.config` | Its dependencies aren't met, a parent is `m`, it's a choice member, or the name is wrong | `menuconfig` and `/`; `merge_config.sh` without `-m`; `diffconfig` (section 5) |
+| `merge_config.sh`: `output directory ... does not exist` | `-O` names a directory that doesn't exist yet | `mkdir -p` it first (section 5) |
+| Hundreds of differences in `diffconfig` after a merge | The merge didn't happen and `olddefconfig` built a default configuration | Same as above (section 5) |
+| An out-of-tree module build warns that every symbol is undefined | No `Module.symvers`: the kernel wasn't built in `KDIR` | Build the kernel first, point `KDIR` at its `O=` directory (section 15) |
+
+**On the board:**
+
+| Symptom | Likely cause | Check, then see |
+|---|---|---|
+| `Starting kernel ...` then silence | Wrong or missing `console=`, `CONFIG_CMDLINE` with `ttyO2` used because `bootargs` is empty, wrong DTB, LPAE kernel on a Cortex-A8 | `printenv bootargs`; add `earlycon=uart8250,mmio32,0x44e09000,115200n8` (sections 10, 18) |
+| Output stops at `printk: legacy console [ttyS0] enabled` | The UART driver or its device tree node has a problem | `keep_bootcon` with `earlycon` (section 18) |
+| `Kernel panic - not syncing: VFS: Unable to mount root fs on ...` | Wrong `root=`, missing `rootwait`, storage or filesystem driver built as a module | Read the list of partitions printed before it; `mmcblk0` is the SD card; drivers `=y` (sections 10, 13) |
+| `Waiting for root device /dev/mmcblk0p2...` forever | The storage driver isn't there or its node is disabled, or the device doesn't exist | `mmcblk0` in the log? `sdhci-omap` built in? (sections 12, 13) |
+| `Disabling rootwait; root= is invalid.` | `root=` can't be parsed | Spelling of `root=`, `PARTUUID=` (section 13) |
+| `No working init found.` | No `/sbin/init`, or it can't run: wrong architecture, missing dynamic loader or library | `init=/bin/sh`; `file` and `readelf -l` on `init` (section 13, toolchain note) |
+| `Requested init /sbin/xyz failed (error -2).` | The `init=` program or its dynamic loader doesn't exist on the root | Same as above (section 13) |
+| `devtmpfs: error mounting -2` | No `/dev` directory on the root filesystem | `mkdir /dev` on the rootfs (section 13) |
+| `Warning: unable to open an initial console.` | No `/dev/console` in the initramfs that runs first | Add it to the initramfs (section 13) |
+| Kernel messages appear, but no login prompt | `getty` configured for `ttyO0` instead of `ttyS0`, or `init` misconfigured | `ttyS0` everywhere (section 10, rootfs note) |
+| `Unknown kernel command line parameters "...", will be passed to user space.` | A misspelled kernel parameter, or one for a driver that isn't built | Spelling; `/proc/config.gz` (section 10) |
+| `modprobe: ... Invalid module format`; `version magic '...' should be '...'` | Module built for another release or configuration | `uname -r` against `modinfo -F vermagic`; install modules with the kernel (section 8) |
+| `disagrees about version of symbol ...` | Module built against a different kernel tree | Rebuild against the running kernel's tree (sections 8, 15) |
+| `modprobe: FATAL: Module xyz not found in directory /lib/modules/<release>` | Modules not installed for this release, or installed under another release name | `ls /lib/modules/`; reinstall with `modules_install` (sections 8, 9) |
+| `Unknown symbol ...` when loading | A dependency isn't loaded (`insmod` doesn't load them), or the symbol is GPL-only and the module isn't GPL | `modprobe` instead of `insmod`; `MODULE_LICENSE` (sections 14, 15) |
+| A device doesn't appear | Driver not built, node `disabled`, probe deferred or failed | `/proc/config.gz`; `/proc/device-tree`; `/sys/kernel/debug/devices_deferred`; `dmesg` (sections 12, 20) |
+| A module isn't loaded automatically | No hotplug daemon, or `modules.alias` missing | `udev` or `mdev`; `depmod` (section 14) |
+| `Internal error: Oops` | A kernel bug, often in the newest driver | Decode with `decode_stacktrace.sh` (section 19) |
+| The board reboots in a loop after an update | Panic with `panic=`, or a watchdog | `dmesg-ramoops-0` from pstore; the bootloader's boot counter (sections 19, 22) |
 
 ## 25. Not covered here
 
-*Planned: what other notes cover.*
+- **The bootloader** and how it loads and starts the kernel: the [bootloader note](../bootloader/bootloader.md).
+- **The root filesystem**: init systems, BusyBox, `/dev` management, read-only roots and dm-verity: the [rootfs note](../rootfs/).
+- **Writing drivers**: the driver model, platform drivers, character devices, interrupts, DMA: [Linux kernel and device driver development](../../../linux-kernel-device-driver-development/).
+- **Building the kernel with Buildroot or Yocto**, which wrap the commands of this note: the [Buildroot](../../linux-build-systems/buildroot/) and [Yocto](../../linux-build-systems/yocto/) notes.
+- **Real-time Linux** (`PREEMPT_RT`, merged in mainline since 6.12) and latency measurement.
+- **Power management**: suspend to RAM on the AM335x (which needs the Cortex-M3 firmware), cpufreq, cpuidle.
+- **KGDB, JTAG and kernel tracing in depth** (perf, trace-cmd, eBPF).
+- **Porting the kernel to a new SoC**: clocks, pin control, interrupt controllers, the machine description.
 
 ## References
 
-*Planned: kernel documentation, source files and manuals used.*
+Kernel documentation (in the source tree under `Documentation/`, also at https://docs.kernel.org):
+
+- `admin-guide/kernel-parameters.txt`: every command line parameter.
+- `admin-guide/init.rst`: what to do when `init` doesn't start.
+- `admin-guide/README.rst`: building and installing a kernel.
+- `kbuild/kbuild.rst`, `kbuild/kconfig.rst`, `kbuild/makefiles.rst`, `kbuild/modules.rst`: Kbuild, Kconfig and external modules.
+- `arch/arm/booting.rst`, `arch/arm64/booting.rst`: the boot protocols.
+- `filesystems/ramfs-rootfs-initramfs.rst`, `driver-api/early-userspace/early_userspace_support.rst`: rootfs and initramfs.
+- `devicetree/usage-model.rst` and `devicetree/bindings/`: how the kernel uses the device tree, and the bindings.
+- `admin-guide/bug-hunting.rst`, `admin-guide/tainted-kernels.rst`: reading oopses and taint flags.
+- `admin-guide/ramoops.rst`, `admin-guide/dynamic-debug-howto.rst`, `trace/ftrace.rst`, `admin-guide/sysrq.rst`: pstore, dynamic debug, ftrace, SysRq.
+- `admin-guide/module-signing.rst`: module signing.
+- `process/submitting-patches.rst`: sending patches upstream.
+
+Linux source, 7.1-rc1 (commit `66edb901bf87`), files cited in the note:
+
+- `init/main.c`, `init/do_mounts.c`, `init/initramfs.c`, `usr/default_cpio_list`
+- `drivers/of/fdt.c`, `arch/arm/Kconfig`, `arch/arm/Kconfig.debug`, `arch/arm/boot/compressed/misc.c`
+- `arch/arm/configs/omap2plus_defconfig`, `arch/arm/mach-omap2/board-generic.c`
+- `arch/arm/boot/dts/ti/omap/Makefile`, `am335x-boneblack.dts`, `am335x-bone-common.dtsi`, `am33xx.dtsi`, `am33xx-l4.dtsi`
+- `drivers/tty/serial/8250/8250_omap.c`, `drivers/mmc/host/sdhci-omap.c`, `drivers/net/ethernet/ti/cpsw_new.c`, `drivers/base/devtmpfs.c`
+- `drivers/usb/gadget/legacy/Kconfig`, `drivers/usb/gadget/legacy/Makefile`
+- `kernel/printk/internal.h`, `kernel/module/main.c`, `kernel/module/version.c`, `include/linux/vermagic.h`
+- `scripts/setlocalversion`, `scripts/kconfig/merge_config.sh`, `scripts/config`, `scripts/diffconfig`, `scripts/Makefile.modinst`, `scripts/decode_stacktrace.sh`, `scripts/faddr2line`, `scripts/bootgraph.pl`
+
+Releases and maintenance:
+
+- kernel.org releases, stable and longterm branches: https://www.kernel.org/category/releases.html
+- Civil Infrastructure Platform kernel maintenance: https://www.cip-project.org
+- Kernel CVE process: `Documentation/process/cve.rst`
+
+Hardware and boards:
+
+- AM335x and AMIC110 Sitara Processors Technical Reference Manual, SPRUH73Q, Texas Instruments: https://www.ti.com/lit/ug/spruh73q/spruh73q.pdf
+- BeagleBone Black System Reference Manual: https://docs.beagleboard.org/boards/beaglebone/black/
+- Raspberry Pi documentation, "The Linux kernel": https://www.raspberrypi.com/documentation/computers/linux_kernel.html
+
+Books:
+
+- Chris Simmonds, *Mastering Embedded Linux Programming*: the kernel chapters, in the context of the whole system.
+- Jonathan Corbet, Alessandro Rubini, Greg Kroah-Hartman, *Linux Device Drivers*, 3rd edition: old, but still the clearest introduction to modules (freely available online).

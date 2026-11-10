@@ -1312,12 +1312,129 @@ The BusyBox build, `/dev`, `init`, configuration, images and updates are the sam
 
 ## 21. Troubleshooting by symptom
 
-*Planned: Symptom tables: building, first boot, login and shell, devices, network, programs, filesystems.*
+Read the console from `Run /sbin/init as init process` on. Before that line, see the kernel note.
+
+**Building:**
+
+| Symptom | Likely cause | Check, then see |
+|---|---|---|
+| BusyBox fails in `networking/tc.c` (`TCA_CBQ_...` undeclared) | Kernel headers 6.8 or later | Turn off `CONFIG_TC` (section 4) |
+| BusyBox installs into `_install` | No `CONFIG_PREFIX` on `make install` | Section 4 |
+| `mkfs.ext4: invalid option -- 'd'` | e2fsprogs older than 1.43 | Update it, or copy the tree to a mounted partition (sections 10, 11) |
+| Files on the board belong to UID 1000 | The tree was copied without changing owners | `chown` on the copy, or `fakeroot` (section 8) |
+| A program built for the board links against the build machine's libraries | `--prefix=$ROOTFS/usr`, `.la` files, or pkg-config finding the build machine's `.pc` files | `--prefix=/usr` with `DESTDIR`; delete `.la`; `PKG_CONFIG_LIBDIR` (section 14) |
+
+**First boot:**
+
+| Symptom | Likely cause | Check, then see |
+|---|---|---|
+| `devtmpfs: error mounting -2` | No `/dev` directory | `mkdir $ROOTFS/dev` (section 6) |
+| `/sbin/init exists but couldn't execute it (error -2)` | Missing loader, or a link into the build machine | `readelf -l`, `find -lname` (section 19) |
+| `... (error -8)` | Wrong architecture | `file` (section 19) |
+| `Attempted to kill init! exitcode=0x0000000b` | `init` crashed: libraries from another toolchain | Copy the libraries from `$SYSROOT` again (section 5) |
+| `can't run '/etc/init.d/rcS'` | CRLF line endings, missing `#!` shell, not executable | `file rcS` says "with CRLF line terminators"; `chmod 755` (sections 7, 19) |
+| `Please press Enter to activate this console.` and no login | No `/etc/inittab`: BusyBox defaults | Write `inittab` (section 7) |
+| Boot hangs in `rcS` | A command waiting: `ifup` with DHCP and no server, `ntpd` without the network | `init=/bin/sh`, then `sh -x /etc/init.d/rcS` (section 19) |
+| `mount: mounting devpts on /dev/pts failed: No such file or directory` | `/dev/pts` not created before `mount -a` | `mkdir -p /dev/pts /dev/shm` in `rcS` (section 7) |
+
+**Login and shell:**
+
+| Symptom | Likely cause | Check, then see |
+|---|---|---|
+| Kernel messages, then nothing on the serial port | `getty` on `ttyO0` or another wrong name | `ttyS0` in `inittab` (section 7) |
+| `getty` messages repeating, or `init` saying a process respawns too fast | The terminal in `inittab` doesn't exist | `ls /dev/ttyS*` from `init=/bin/sh` (section 7) |
+| `Login incorrect` with the right password | Unsupported hash, wrong `/etc/shadow` format or mode, user's shell missing | `$6$` needs `CONFIG_USE_BB_CRYPT_SHA`; `/etc/shells` (section 8) |
+| `can't access tty; job control turned off` | Shell on `/dev/console` | `ttyS0::` in `inittab` (section 7) |
+| Kernel messages mixed into the shell | Console log level | `dmesg -n 1` in `rcS` (section 7) |
+| `su: must be suid to work properly` | `busybox` not setuid | `chmod 4755` after `chown` (section 8) |
+
+**Devices and modules:**
+
+| Symptom | Likely cause | Check, then see |
+|---|---|---|
+| A device node has the wrong owner or mode | No `mdev`/`udev` rule, or `mdev` not started | `/etc/mdev.conf`; `mdev -s` in `rcS` (section 6) |
+| A module isn't loaded for a device present at boot | Its event happened before `mdev -d` started | The `modalias` loop in `rcS` (section 6) |
+| `modprobe: can't change directory to '7.1.0-...': No such file or directory` | Modules not installed for this release | `ls /lib/modules/`; `uname -r` (section 11; kernel note, section 8) |
+| A driver says firmware `failed to load` with error -2 | Firmware file missing, or the driver probed before the root was mounted | `/lib/firmware/`; built-in firmware or a module (section 6) |
+| SSH connects, then fails with a pseudo-terminal error | `/dev/pts` not mounted | `fstab` (sections 6, 9) |
+
+**Network:**
+
+| Symptom | Likely cause | Check, then see |
+|---|---|---|
+| `ifup: can't open '/var/run/ifstate'` | No writable `/var/run` | Link to `/run` on tmpfs (sections 3, 9) |
+| `udhcpc` gets a lease, the interface has no address | No `/usr/share/udhcpc/default.script` | Install `simple.script` there (section 9) |
+| The system freezes when the network starts, on an NFS root | `ifup`, DHCP or a network manager reconfiguring `eth0` | `iface eth0 inet manual` (section 11) |
+| Names don't resolve | No `/etc/resolv.conf`, no `hosts` line in `nsswitch.conf` | Sections 5, 9 |
+| TLS errors, `make` clock skew warnings | Clock in 2000 | `ntpd -q` (section 9) |
+
+**Programs:**
+
+| Symptom | Likely cause | Check, then see |
+|---|---|---|
+| `not found` for an existing program | Loader missing | `readelf -l` (sections 5, 19) |
+| `error while loading shared libraries` | Library not copied | `needed-libs.sh` (section 5) |
+| ``version `GLIBC_2.xx' not found`` | Built with a newer toolchain than the board's libraries | Same toolchain for programs and libraries (section 5) |
+| A program can't write its settings | Read-only root | `/data`, overlay (section 15) |
+
+**Filesystems:**
+
+| Symptom | Likely cause | Check, then see |
+|---|---|---|
+| `VFS: Unable to mount root fs` | Kernel side: driver, `root=`, `rootfstype=` | Kernel note, section 13 |
+| Kernel mounts the root read-only, `Read-only file system` errors | `ro` on the command line, or ext4 errors that made it remount read-only | `dmesg | grep EXT4`; `rw` (sections 9, 15) |
+| `e2fsck` on the board refuses the filesystem | Features from a newer `mkfs.ext4` | `-O ^metadata_csum` and friends (section 10) |
+| The initramfs boots, but `/dev` is empty | devtmpfs not mounted by the initramfs | `mount -t devtmpfs` in `rcS` (sections 6, 10) |
+| `switch_root: ...` error | `/newroot` isn't a mount point, or `switch_root` isn't PID 1 | `exec switch_root` (section 15) |
 
 ## 22. Not covered here
 
-*Planned: What this note leaves to other notes.*
+- **The kernel's side of mounting the root**: `root=`, `rootwait`, initramfs unpacking, `init` search: the [kernel note](../kernel/kernel.md), section 13.
+- **The bootloader**: loading the kernel, the initramfs and the DTB, the environment, boot counting: the [bootloader note](../bootloader/bootloader.md).
+- **Toolchains and cross-building packages in depth**: the [toolchain note](../cross-compilation-toolchain/cross-compilation-toolchain.md).
+- **Buildroot and Yocto themselves**: the [Buildroot](../../linux-build-systems/buildroot/) and [Yocto](../../linux-build-systems/yocto/) notes.
+- **systemd in depth**: units, targets, journald, networkd, the boot sequence.
+- **Networking configuration** beyond `ifup`: the [networking notes](../../../networking/).
+- **Graphics, audio and a user interface** (Wayland, Qt, ALSA).
+- **Containers on embedded Linux**, and full-disk encryption.
 
 ## References
 
-*Planned: Documentation, tools, standards and books.*
+BusyBox (https://busybox.net), in the source tree:
+
+- `INSTALL`: building, out-of-tree builds, installing.
+- `docs/mdev.txt`: `mdev`, its configuration and hotplug.
+- `examples/inittab`: every `inittab` action, with comments.
+- `examples/udhcp/simple.script`: the `udhcpc` script.
+
+Linux kernel documentation (https://docs.kernel.org):
+
+- `filesystems/ramfs-rootfs-initramfs.rst`: rootfs, initramfs, `gen_init_cpio`.
+- `admin-guide/init.rst`: when `init` doesn't start.
+- `admin-guide/nfs/nfsroot.rst`: NFS root and `ip=`.
+- `filesystems/overlayfs.rst`, `filesystems/squashfs.rst`, `filesystems/ubifs.rst`, `filesystems/erofs.rst`.
+- `admin-guide/device-mapper/verity.rst`, `admin-guide/device-mapper/dm-init.rst`: dm-verity and setting it up from the command line.
+- `driver-api/firmware/fw_search_path.rst`: where the kernel looks for firmware.
+
+Standards and manuals:
+
+- Filesystem Hierarchy Standard 3.0: https://refspecs.linuxfoundation.org/FHS_3.0/fhs/index.html
+- `ld.so(8)`: how the dynamic loader finds libraries.
+- `mke2fs(8)` (`-d`), `mksquashfs(1)`, `fakeroot(1)`, `cpio(1)`, `mmdebstrap(1)`, `veritysetup(8)`.
+- UBI and UBIFS: http://www.linux-mtd.infradead.org/doc/ubifs.html
+- genimage: https://github.com/pengutronix/genimage
+
+Build systems and update tools:
+
+- Buildroot manual: https://buildroot.org/downloads/manual/manual.html
+- Yocto Project documentation: https://docs.yoctoproject.org
+- SWUpdate: https://sbabic.github.io/swupdate/
+- RAUC: https://rauc.io
+- Mender: https://mender.io
+- Dropbear: https://matt.ucc.asn.au/dropbear/dropbear.html
+- systemd: `README` (kernel requirements) and https://systemd.io
+
+Books and courses:
+
+- Chris Simmonds, *Mastering Embedded Linux Programming*: the root filesystem, init and storage chapters.
+- Bootlin, *Embedded Linux system development* training materials (free): https://bootlin.com/training/embedded-linux/

@@ -18,6 +18,7 @@ Every note aims to be practical, so you'll find configs and commands you can reu
 
 ## Latest notes
 
+- [Root Filesystems for Embedded Linux](embedded-linux/fundamentals/rootfs/rootfs.md)
 - [The Linux Kernel for Embedded Linux](embedded-linux/fundamentals/kernel/kernel.md)
 - [Bootloaders for Embedded Linux: U-Boot](embedded-linux/fundamentals/bootloader/bootloader.md)
 - [Cross-Compilation and Toolchains for Embedded Linux](embedded-linux/fundamentals/cross-compilation-toolchain/cross-compilation-toolchain.md)

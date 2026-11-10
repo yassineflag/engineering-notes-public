@@ -541,11 +541,200 @@ Requesting system reboot
 
 ## 8. Users, logins and file ownership
 
-*Planned: passwd, group and shadow, how a login works, passwords, setuid BusyBox, file ownership on the board and fakeroot.*
+**The three files.** User and group names exist only in these files; the kernel knows only numbers.
+
+```
+# /etc/passwd   name:password:UID:GID:comment:home:shell
+root:x:0:0:root:/root:/bin/sh
+daemon:x:1:1:daemon:/usr/sbin:/bin/false
+nobody:x:65534:65534:nobody:/nonexistent:/bin/false
+```
+
+```
+# /etc/group    name:password:GID:members
+root:x:0:
+daemon:x:1:
+tty:x:5:
+disk:x:6:
+dialout:x:20:
+nogroup:x:65534:
+```
+
+```
+# /etc/shadow   name:hash:last change:min:max:warn:inactive:expire:
+root::20400:0:99999:7:::
+```
+
+- `x` in `/etc/passwd` means "the password is in `/etc/shadow`". `/etc/shadow` is readable only by root: mode `0600` (or `0640` with group `shadow`).
+- **An empty hash field means no password**: `login` accepts `root` without asking. That's convenient on a development board, and it must never ship (section 17).
+- The third field of `/etc/shadow` is the day of the last change, counted from 1 January 1970. Any value works here.
+- Add the shells to **`/etc/shells`** (`/bin/sh` and `/bin/ash`, one per line). Some programs, Dropbear among them, refuse logins for users whose shell isn't listed.
+
+**Setting a password.** Generate a SHA-512 hash on the build machine and paste it into the second field of `/etc/shadow`:
+
+```sh
+$ openssl passwd -6
+Password:
+Verifying - Password:
+$6$...
+```
+
+BusyBox `login` verifies `$6$` hashes when `CONFIG_USE_BB_CRYPT_SHA` is on (it is in `defconfig`). `passwd` on the board does the same, but on a read-only root filesystem it can't write `/etc/shadow` (section 15).
+
+**How a login works:** `init` starts `getty` on `ttyS0` (section 7). `getty` opens the line, sets its speed, prints the prompt and reads a user name, then runs `login`. `login` checks the hash in `/etc/shadow`, changes to the user's UID and GID, changes to the home directory and runs the shell from `/etc/passwd`. A login shell reads `/etc/profile`.
+
+**setuid BusyBox.** Commands like `su`, `passwd` and `ping` need root privileges when a non-root user runs them. With a single `busybox` binary, that means making it setuid root (`chmod 4755 bin/busybox`), and BusyBox drops the privileges for every applet that doesn't need them (`CONFIG_FEATURE_SUID`). A system where everything runs as root doesn't need it. In a product with non-root users, set it deliberately: it's the one setuid file in the system.
+
+**File ownership: the build machine and the board disagree.** Everything in `$ROOTFS` belongs to your user on the build machine, typically UID 1000. Copied as is, the board sees `/bin/busybox`, `/etc/shadow` and the rest owned by UID 1000, a user that doesn't exist there. Things then break in ways that don't point at the cause: a setuid bit that does nothing, an SSH server that refuses a key file not owned by root, `/etc/shadow` readable by "someone". The files on the board must belong to root (UID 0), except the few owned by service users.
+
+| Method | How | Notes |
+|---|---|---|
+| `sudo chown` on the copy | Copy the tree to the card or NFS export, then `sudo chown -R 0:0` it (section 11) | Simplest. Set setuid bits **after** `chown`, which clears them |
+| `fakeroot` | Run the ownership changes and the image creation inside one `fakeroot` session | No root needed on the build machine. The tree on disk keeps your UID; only the image has the right owners |
+| Options of the image tools | `mksquashfs -all-root`, `cpio -R 0:0`, the kernel's `CONFIG_INITRAMFS_ROOT_UID` (section 10) | Every file belongs to root, with no exceptions |
+| A device or permission table | Buildroot's `makedevs` format: one line per path with owner, mode and type | What build systems use |
+
+With `fakeroot`, everything that must see root ownership happens in the same session:
+
+```sh
+$ mkdir -p ~/bbb/images
+$ fakeroot sh -c "
+    chown -R 0:0 $ROOTFS
+    chmod 4755 $ROOTFS/bin/busybox
+    chmod 0600 $ROOTFS/etc/shadow
+    mkfs.ext4 -q -L rootfs -d $ROOTFS ~/bbb/images/rootfs.ext4 256M
+"
+```
+
+`fakeroot` intercepts `chown` and `stat` for the programs it runs and remembers the fake owners in memory, so `mkfs.ext4` writes root-owned files into the image. When the session ends, the fake owners are lost. To build several images from the same fake state, save and reload it with `fakeroot -s <file>` and `fakeroot -i <file>`.
+
+**Permissions to get right:**
+
+| Path | Mode |
+|---|---|
+| `/tmp` | `1777` (everyone writes, only the owner deletes) |
+| `/root` | `0700` |
+| `/etc/shadow` | `0600` |
+| `/etc/passwd`, `/etc/group` | `0644` |
+| Scripts in `/etc/init.d/` | `0755` |
+| `/bin/busybox` | `0755`, or `4755` for setuid applets |
 
 ## 9. Configuration: mounts, hostname, network, time and logs
 
-*Planned: fstab, mtab, hostname and hosts, profile, network with ifupdown and udhcpc, DNS, time without a battery, logs, modules at boot.*
+**`/etc/fstab`**, read by `mount -a` in `rcS`:
+
+```
+# <file system>  <mount point>  <type>   <options>                     <dump> <pass>
+proc             /proc          proc     defaults                       0      0
+sysfs            /sys           sysfs    defaults                       0      0
+devpts           /dev/pts       devpts   gid=5,mode=620,ptmxmode=666    0      0
+tmpfs            /dev/shm       tmpfs    mode=1777,nosuid,nodev         0      0
+tmpfs            /tmp           tmpfs    mode=1777,nosuid,nodev         0      0
+tmpfs            /run           tmpfs    mode=0755,nosuid,nodev         0      0
+```
+
+- The root filesystem isn't listed: the kernel already mounted it, read-write because of `rw` on the command line (kernel note, section 10). For a read-only root, see section 15.
+- `gid=5` is the `tty` group of section 8, so that terminals belong to it.
+- tmpfs lives in RAM and starts empty at every boot. Without a `size=` option, each one may grow to half the RAM.
+- The kernel options these lines rely on (`CONFIG_PROC_FS`, `CONFIG_SYSFS`, `CONFIG_TMPFS`, `CONFIG_UNIX98_PTYS`) are in `omap2plus_defconfig`.
+
+**`/etc/mtab`** should be a link to the kernel's list of mounts, so that `mount` and `df` show the truth:
+
+```sh
+$ ln -s /proc/self/mounts $ROOTFS/etc/mtab
+```
+
+**Name and hosts:**
+
+```sh
+$ echo bbb > $ROOTFS/etc/hostname
+$ printf '127.0.0.1\tlocalhost\n127.0.1.1\tbbb\n' > $ROOTFS/etc/hosts
+```
+
+**`/etc/profile`**, read by login shells:
+
+```sh
+# /etc/profile
+export PATH=/usr/sbin:/usr/bin:/sbin:/bin
+export PS1='\u@\h:\w\$ '
+export TZ=UTC0
+umask 022
+```
+
+**Network, with BusyBox `ifup`.** `/etc/network/interfaces` uses the Debian format:
+
+```
+# /etc/network/interfaces
+auto lo
+iface lo inet loopback
+
+auto eth0
+iface eth0 inet static
+    address 192.168.0.50
+    netmask 255.255.255.0
+    gateway 192.168.0.1
+
+# or, with a DHCP server:
+# iface eth0 inet dhcp
+```
+
+```sh
+#!/bin/sh
+# /etc/init.d/S10network
+case "$1" in
+    start) ifup -a ;;
+    stop)  ifdown -a ;;
+esac
+```
+
+- `ifup` keeps its state in `/var/run/ifstate`, so `/var/run` must exist and be writable. Here it's the link to `/run` of section 3. Without it, `ifup` fails with `can't open '/var/run/ifstate'`.
+- **`inet dhcp` runs `udhcpc`, which only negotiates the lease.** Configuring the interface, the route and `/etc/resolv.conf` is the job of a script, `/usr/share/udhcpc/default.script`, which BusyBox doesn't install. Copy `examples/udhcp/simple.script` from the BusyBox source to that path and make it executable. Without it, `udhcpc` reports a lease and the interface stays without an address.
+- **On an NFS root, don't touch `eth0`** (section 11): the kernel configured it to mount the root, and `ifdown` or a new DHCP lease cuts the root filesystem off.
+- DNS: `nameserver 192.168.0.1` in `/etc/resolv.conf` for a static setup; the `udhcpc` script writes it with DHCP.
+
+**Time.** The AM335x has an RTC, but the BeagleBone Black has no battery for it: after a power cut, the clock starts again from an arbitrary date, usually in 2000. A wrong date breaks TLS certificate checks, makes `make` complain about clock skew on NFS, and confuses log timestamps. Set the time from the network once it's up:
+
+```sh
+ntpd -q -n -p pool.ntp.org      # set once and exit; without -q, keeps running as a daemon
+hwclock -w                      # store it in the RTC, which keeps it across reboots, not power cuts
+```
+
+Time zones: `TZ=UTC0` in `/etc/profile` is a POSIX time-zone string, which needs no files. For named zones (`Europe/Paris`), copy that file from a zoneinfo database, built for the target or architecture-independent, to `/etc/localtime`.
+
+**Logs.** BusyBox `syslogd` collects messages from programs over the `/dev/log` socket; `klogd` copies kernel messages into it.
+
+| Command | Logs go to | Read with |
+|---|---|---|
+| `syslogd` | `/var/log/messages`, a file on the root filesystem | `cat`, `tail -f` |
+| `syslogd -C64` | A 64 KiB ring buffer in shared memory, nothing written to flash | `logread`, `logread -f` |
+| `syslogd -R 192.168.0.10` | A remote syslog server | The server's logs |
+
+The ring buffer suits an SD card or eMMC root, and needs `CONFIG_SYSVIPC` in the kernel. Kernel messages stay in `dmesg` either way.
+
+**Modules to load at boot**, when no device event loads them (section 6). BusyBox doesn't read `/etc/modules` by itself, so a script does:
+
+```sh
+#!/bin/sh
+# /etc/init.d/S05modules - load the modules listed in /etc/modules
+[ "$1" = start ] || exit 0
+sed 's/#.*//' /etc/modules 2>/dev/null | while read mod args; do
+    [ -n "$mod" ] && modprobe "$mod" $args
+done
+```
+
+Options go in `/etc/modprobe.d/*.conf` (`options g_ether host_addr=...`), which BusyBox `modprobe` reads like kmod's.
+
+**The `/etc` of the minimal system**, all together:
+
+| File | Section |
+|---|---|
+| `inittab`, `init.d/rcS`, `init.d/rcK`, `init.d/S01syslog`, `init.d/S05modules`, `init.d/S10network` | 7, 9 |
+| `fstab`, `mtab` (link) | 9 |
+| `mdev.conf` | 6 |
+| `passwd`, `group`, `shadow`, `shells` | 8 |
+| `hostname`, `hosts`, `profile`, `network/interfaces`, `resolv.conf` | 9 |
+| `nsswitch.conf` | 5 |
+| `modules`, `modprobe.d/` | 9 |
 
 ## 10. Filesystem images: ext4, squashfs, UBIFS and initramfs
 

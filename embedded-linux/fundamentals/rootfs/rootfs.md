@@ -1237,11 +1237,78 @@ $ ls -l ~/bbb/images/                               # the images themselves
 
 ## 19. When init doesn't start or a program doesn't run
 
-*Planned: The init failure messages, checking binaries on the build machine, init=/bin/sh, startup scripts, program errors, tools on the board.*
+**Find the stage first.** If the console stops before `Run /sbin/init as init process`, the problem is the kernel's, and the kernel note's sections 18 and 24 apply. After it, it's the root filesystem's.
+
+**The kernel's messages about `init`**, from `init/main.c`:
+
+| Message | Meaning |
+|---|---|
+| `Starting init: /sbin/init exists but couldn't execute it (error -8)` | `ENOEXEC`: not a program for this CPU (x86, aarch64, a corrupt file) |
+| `... (error -2)` | `ENOENT`: here the file exists, so its **loader** (`/lib/ld-linux-armhf.so.3`) doesn't, or a script's interpreter doesn't |
+| `... (error -13)` | `EACCES`: not executable (mode), or a filesystem mounted `noexec` |
+| `Kernel panic - not syncing: No working init found.` | None of `/sbin/init`, `/etc/init`, `/bin/init`, `/bin/sh` could run |
+| `Kernel panic - not syncing: Requested init /sbin/xyz failed (error -2).` | The `init=` program, or its loader, doesn't exist |
+| `Kernel panic - not syncing: Attempted to kill init! exitcode=0x00000100` | `init` started, then exited: `0x00000100` is exit status 1. `0x0000000b` is signal 11 (`SIGSEGV`), a crash, often libraries from another toolchain |
+
+**Checking a binary on the build machine**, before copying anything:
+
+```sh
+$ file $ROOTFS/bin/busybox                                         # ARM, EABI5, which interpreter
+$ ${CROSS_COMPILE}readelf -h $ROOTFS/bin/busybox | grep -E 'Class|Machine|Flags'
+$ ${CROSS_COMPILE}readelf -l $ROOTFS/bin/busybox | grep interpreter
+$ ls -l $ROOTFS/lib/ld-linux-armhf.so.3                            # present, and not a dangling link
+$ find $ROOTFS -xtype l                                            # all dangling links
+```
+
+The usual causes: a missing loader; libraries from another toolchain; a soft-float (`armel`, loader `/lib/ld-linux.so.3`) binary on this hard-float system; an aarch64 binary on the 32-bit Cortex-A8; and **an absolute link pointing into the build machine** (`bin/sh -> /home/me/bbb/rootfs/bin/busybox`), which exists on the build machine and not on the board. `find -xtype l` on the staging tree misses that last case, because the path exists there; look for links containing your home directory: `find $ROOTFS -type l -lname "$HOME/*"`.
+
+**Getting a shell without the startup scripts:** add `init=/bin/sh` to the kernel command line (in `extlinux.conf` or at the U-Boot prompt). The kernel runs a shell as PID 1, with nothing mounted except `/` and `/dev`. Then run the startup by hand, with tracing:
+
+```
+# mount -t proc proc /proc
+# mount -t sysfs sysfs /sys
+# sh -x /etc/init.d/rcS
+```
+
+`sh -x` prints each command before running it, so the last line printed is the one that hangs or fails. Don't `exit` this shell: it is PID 1, and the kernel panics with `Attempted to kill init!`. Remount the root read-write (`mount -o remount,rw /`) to fix files, then `sync` and reset the board. For an initramfs, the equivalent is `rdinit=/bin/sh`.
+
+**Common messages from userspace:**
+
+| Message | Cause |
+|---|---|
+| `can't run '/etc/init.d/rcS': No such file or directory` (BusyBox `init`), with the file present | CRLF line endings (interpreter `/bin/sh\r`), or a `#!` line naming a missing shell |
+| `can't run '/etc/init.d/rcS': Permission denied` | Not executable: `chmod 755` |
+| `/bin/sh: can't access tty; job control turned off` | A shell on `/dev/console` (an `askfirst` line, or no `inittab`). Use `ttyS0::` in `inittab` |
+| `-sh: ./myapp: not found`, for a file that exists | Its loader is missing: wrong toolchain or C library (section 5) |
+| `error while loading shared libraries: libfoo.so.1: cannot open shared object file: No such file or directory` | A library isn't on the board, or isn't in `/lib` or `/usr/lib` |
+| ``/lib/libc.so.6: version `GLIBC_2.xx' not found`` | The program was built with a newer glibc than the board's |
+| `Illegal instruction` | Built for a newer CPU (ARMv8, NEON flags the Cortex-A8 lacks) |
+
+**Tools on the board:**
+
+- **Logs:** `dmesg` for the kernel, `logread` or `/var/log/messages` for programs (section 9). `dmesg -n 8` puts all kernel messages back on the console.
+- **`strace`**, cross-built or taken from a Buildroot build, shows every system call: which file a program fails to open, which `exec` returns `ENOENT`.
+- **`gdbserver`**: the Arm GNU Toolchain ships a prebuilt one for the target (`find $SYSROOT -name gdbserver`). Debug from the build machine with the unstripped binaries and `set sysroot $SYSROOT` ([toolchain note](../cross-compilation-toolchain/cross-compilation-toolchain.md)).
+- **Boot time:** BusyBox's `bootchartd` (`init=/sbin/bootchartd`) records which processes ran when during startup.
+- **Without a board:** `sudo chroot $ROOTFS /bin/sh` on the build machine runs the tree's own programs through QEMU user-mode emulation (`qemu-user-static` and `binfmt-support` installed). It doesn't run the kernel, but it catches missing loaders and libraries.
 
 ## 20. Other architectures: arm64 and the Raspberry Pi 4
 
-*Planned: What changes for a 64-bit board: loader, lib64, console names, the Pi's boot partition, firmware, Debian arm64.*
+Everything above applies to a 64-bit board. What changes for a Raspberry Pi 4 (Cortex-A72) running a 64-bit kernel:
+
+| | BeagleBone Black | Raspberry Pi 4, 64-bit |
+|---|---|---|
+| Toolchain | `arm-none-linux-gnueabihf-` | `aarch64-none-linux-gnu-` |
+| Loader | `/lib/ld-linux-armhf.so.3` | `/lib/ld-linux-aarch64.so.1` |
+| Library directory | `/lib` | glibc's default for aarch64 is `/lib64` and `/usr/lib64`. Copy the libraries where the toolchain's sysroot has them, or make `/lib64` a link to `lib`, as Buildroot does |
+| Serial console | `ttyS0` | `ttyS0` (mini UART on GPIO 14 and 15, with `enable_uart=1`) by default; `ttyAMA0` (PL011) when Bluetooth is moved off it (`dtoverlay=disable-bt` or `miniuart-bt`). The `getty` line must use the real name: `serial0` is a udev link that exists only on Raspberry Pi OS |
+| Boot partition | `MLO`, `u-boot.img`, kernel, DTB | Firmware (`start4.elf`, `fixup4.dat`), `config.txt`, `cmdline.txt`, `kernel8.img`, DTBs and `overlays/` |
+| Kernel command line | U-Boot (`extlinux.conf`) | `cmdline.txt`, one line, unless U-Boot is used |
+| Root device | `mmcblk0p2` | Depends on the kernel and its device tree; use `root=PARTUUID=...` |
+| Firmware files in the root filesystem | None for a basic system | Wi-Fi and Bluetooth: `/lib/firmware/brcm/` (`brcmfmac43455-sdio.*`) |
+| Debian architecture | `armhf` | `arm64` |
+
+The BusyBox build, `/dev`, `init`, configuration, images and updates are the same, with `CROSS_COMPILE=aarch64-none-linux-gnu-`. Running 32-bit `armhf` programs on a 64-bit kernel works with `CONFIG_COMPAT`, if the root filesystem has the 32-bit loader and libraries as well. That's possible, but rarely worth it on a new system.
 
 ## 21. Troubleshooting by symptom
 

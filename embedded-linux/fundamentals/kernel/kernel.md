@@ -335,15 +335,129 @@ It's the fastest answer to "is this driver built in?", and a way to recover the 
 
 ## 6. Building
 
-*Planned: host packages, out-of-tree builds with O=, the make targets, parallel builds, rebuilding one directory.*
+**Host packages** (Debian and Ubuntu names). The kernel builds its own `dtc` and configuration tools, but needs these on the build machine:
+
+```sh
+$ sudo apt install build-essential bc bison flex libssl-dev libelf-dev \
+      libncurses-dev xz-utils u-boot-tools
+```
+
+`libssl-dev` is for module signing and certificate tools, `libelf-dev` for `objtool` and BTF, `libncurses-dev` for `menuconfig`, `xz-utils` for the LZMA compressor used by `omap2plus_defconfig`'s `zImage`, `u-boot-tools` only for `make uImage`.
+
+**The build.** With `ARCH` and `CROSS_COMPILE` exported (section 2):
+
+```sh
+$ cd ~/bbb/linux
+$ make O=~/bbb/build omap2plus_defconfig          # or merge_config.sh, section 5
+$ make O=~/bbb/build -j"$(nproc)" zImage modules dtbs
+```
+
+- **`O=` keeps every generated file in the build directory**, so one source tree serves several boards or configurations, and `rm -rf ~/bbb/build` is a full clean. The source tree must then stay clean: once a `.config` exists in the source directory itself, an `O=` build stops and asks for `make mrproper`. Pick one style per tree.
+- **`-j"$(nproc)"`** runs one job per CPU. A full `omap2plus_defconfig` build compiles the kernel plus about 860 modules: expect tens of minutes on a laptop, less on a workstation, and a few GB in the build directory (several times more with debug information).
+- **Only `zImage`, `modules` and `dtbs` are needed** for this board. Plain `make` builds the default targets of the architecture (on Arm: `zImage`, `modules` and `dtbs`, marked with `*` in `make help`).
+
+| Target | Builds | Notes |
+|---|---|---|
+| `zImage` | `arch/arm/boot/zImage` | Self-decompressing kernel, booted with `bootz` |
+| `Image` | `arch/arm/boot/Image` | Uncompressed, rarely used on 32-bit Arm |
+| `uImage` | `arch/arm/boot/uImage` | `zImage` behind a legacy U-Boot header. Needs `LOADADDR=0x80008000` on a multi-platform kernel; `bootz` makes it unnecessary (bootloader note) |
+| `modules` | Every `=m` option as a `.ko` file | |
+| `dtbs` | Every DTB enabled by the configuration | `make ti/omap/am335x-boneblack.dtb` builds one |
+| `modules_install`, `dtbs_install`, `headers_install` | Copies into a staging directory | Section 9 |
+| `kernelrelease`, `kernelversion` | Prints the version strings | Section 8 |
+| `clean`, `mrproper` | Removes outputs; `mrproper` also removes `.config` | |
+
+The Arm-specific part of `make help` (**Real output**):
+
+```
+Architecture-specific targets (arm):
+* zImage        - Compressed kernel image (arch/arm/boot/zImage)
+  Image         - Uncompressed kernel image (arch/arm/boot/Image)
+* xipImage      - XIP kernel image, if configured (arch/arm/boot/xipImage)
+  uImage        - U-Boot wrapped zImage
+  bootpImage    - Combined zImage and initial RAM disk
+                  (supply initrd image via make variable INITRD=<path>)
+  install       - Install uncompressed kernel
+  zinstall      - Install compressed kernel
+  uinstall      - Install U-Boot wrapped compressed kernel
+```
+
+**Reading the build output.** Each line is a step and a file: `CC` compiles a built-in object, `CC [M]` a module object, `LD [M]` links a module, `HOSTCC` builds a tool for the build machine, `DTC` compiles a device tree. `make V=1` prints the full commands; `make -s` prints only warnings and errors. A failure stops the build at the end of the running jobs, so the error is often a screen above the last line: search for `error:`.
+
+**Rebuilding part of the tree.** `make` is incremental: after editing a file, the same command recompiles only what depends on it. To build one directory or one object while working on a driver:
+
+```sh
+$ make O=~/bbb/build drivers/usb/gadget/legacy/          # one directory
+$ make O=~/bbb/build drivers/usb/gadget/legacy/ether.o   # one object
+```
+
+Neither relinks `vmlinux` or the `zImage`; run the full command before installing.
 
 ## 7. What the build produces
 
-*Planned: vmlinux, Image, zImage and uImage, System.map, DTBs, modules and their index files, kernel compression.*
+| File (in the build directory) | What it is | Goes to the board? |
+|---|---|---|
+| `vmlinux` | The kernel as an ELF file, with symbols (and debug information if enabled) | No. Keep it for debugging (section 19) |
+| `arch/arm/boot/Image` | `vmlinux` stripped to raw binary with `objcopy` | Not on this board |
+| `arch/arm/boot/zImage` | `Image` compressed, behind a small decompressor | Yes |
+| `System.map` | Every kernel symbol and its address | No. Used to decode addresses |
+| `arch/arm/boot/dts/ti/omap/*.dtb` | The device trees | One of them |
+| `**/*.ko` | Modules | Through `modules_install` |
+| `modules.order`, `modules.builtin`, `Module.symvers` | The module list in build order, the list of built-in modules, the exported symbols with their CRCs | `modules.order` and `modules.builtin` through `modules_install`; `Module.symvers` stays on the build machine for out-of-tree modules (section 15) |
+| `.config`, `include/generated/` | The configuration and the headers generated from it | No |
+
+**How a `zImage` is made.** `vmlinux` is linked for the kernel's virtual address (`0xC0008000` here, from `CONFIG_PAGE_OFFSET=0xC0000000`), `objcopy` turns it into `Image`, the compressor packs `Image`, and the decompressor in `arch/arm/boot/compressed/` is linked in front of it. At boot, the decompressor works out where it runs, unpacks the kernel just above the start of RAM, and jumps to it. The `zImage` is position-independent, which is why U-Boot can load it at `0x82000000` (bootloader note). Its header has the magic `0x016f2818` at offset `0x24`, which `bootz` checks.
+
+**Compression.** `omap2plus_defconfig` chooses `CONFIG_KERNEL_LZMA=y`. The choice trades size for decompression time:
+
+| Option | Size | Decompression | Notes |
+|---|---|---|---|
+| `KERNEL_GZIP` | Medium | Fast | The safe default on most architectures |
+| `KERNEL_LZO`, `KERNEL_LZ4` | Larger | Fastest | When the storage is fast and boot time matters |
+| `KERNEL_LZMA`, `KERNEL_XZ` | Smallest | Slowest | When the storage is small or slow |
+
+On an SD card, the time to read a larger image and the time to decompress a smaller one are of the same order: measure on the board before changing it (section 21).
+
+**Appended DTB.** `omap2plus_defconfig` enables `CONFIG_ARM_APPENDED_DTB`: the decompressor uses a DTB concatenated after the `zImage` (`cat zImage am335x-boneblack.dtb > zImage-dtb`) when the bootloader passes none. It's for old bootloaders without device tree support; with U-Boot, pass the DTB separately.
 
 ## 8. Version strings and module vermagic
 
-*Planned: kernelversion and kernelrelease, LOCALVERSION and the Git suffix, vermagic and why a module refuses to load.*
+The kernel has two version strings:
+
+| Command | Prints | Built from |
+|---|---|---|
+| `make -s kernelversion` | `7.1.0-rc1` | `VERSION`, `PATCHLEVEL`, `SUBLEVEL`, `EXTRAVERSION` at the top of the `Makefile` |
+| `make -s O=~/bbb/build kernelrelease` | for example `7.1.0-rc1-g66edb901bf87` | the version, plus `localversion*` files, `CONFIG_LOCALVERSION`, and a suffix from Git (`scripts/setlocalversion`) |
+
+The **release** is the one that matters: `uname -r` prints it on the board, it names the module directory (`/lib/modules/7.1.0-rc1-g66edb901bf87/`), and it's part of every module's "vermagic".
+
+**The Git suffix.** With `CONFIG_LOCALVERSION_AUTO=y` (the default in `omap2plus_defconfig`), `scripts/setlocalversion` adds the state of the Git tree, from source:
+
+| The source tree | Suffix |
+|---|---|
+| Exactly at a release tag (`v7.1-rc1`) | none |
+| Commits after a tag | `-<count>-g<hash>`, for example `-00123-g66edb901bf87` |
+| A Git tree where the tag can't be found (shallow clone without tags) | `-g<hash>` only |
+| Uncommitted changes to tracked files | `-dirty` appended |
+| Not a Git tree (a tarball, an exported copy) | none |
+
+The tree of this note was a shallow clone, hence `7.1.0-rc1-g66edb901bf87` (**Real output** of `KERNELVERSION=7.1.0-rc1 scripts/setlocalversion`: `-g66edb901bf87`). The consequence: **the same source built from a tarball and from a Git clone gives two different releases**, two module directories, and modules that don't load on the other kernel. For products, set the string yourself and make it independent of the tree's state: `CONFIG_LOCALVERSION_AUTO=n` and `CONFIG_LOCALVERSION="-bbb1"`.
+
+**Vermagic.** Every module records the release and the configuration options that change the module ABI. Read it with `modinfo`:
+
+```
+$ modinfo -F vermagic g_ether.ko
+7.1.0-rc1-g66edb901bf87 SMP mod_unload modversions ARMv7 p2v8
+```
+
+(**Expected**: the format is from `include/linux/vermagic.h` and `arch/arm/include/asm/module.h`; `SMP`, `mod_unload` and `modversions` follow `CONFIG_SMP`, `CONFIG_MODULE_UNLOAD` and `CONFIG_MODVERSIONS`, all set in `omap2plus_defconfig`; `ARMv7` and `p2v8` come from the CPU architecture and the physical-to-virtual patching.) When the module's vermagic doesn't match the running kernel's, loading fails. From source (`kernel/module/main.c`, `kernel/module/version.c`), the kernel log says one of:
+
+```
+g_ether: version magic '7.1.0-rc1 SMP mod_unload modversions ARMv7 p2v8' should be '7.1.0-rc1-g66edb901bf87 SMP mod_unload modversions ARMv7 p2v8'
+g_ether: disagrees about version of symbol <symbol>
+```
+
+and `modprobe` or `insmod` reports `Invalid module format`. The first is a release or configuration mismatch; the second (with `CONFIG_MODVERSIONS`) means the module was built against a kernel whose exported function had a different signature. Both mean the same thing in practice: **build modules from the same tree, configuration and release as the kernel they run on**, and install them together (section 9).
 
 ## 9. Installing the kernel, the DTB and the modules
 

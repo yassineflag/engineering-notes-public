@@ -936,15 +936,141 @@ The kernel side, from the bootloader note: `root=/dev/nfs nfsroot=192.168.0.10:/
 
 ## 12. Init systems: BusyBox init, SysV init, systemd and others
 
-*Planned: BusyBox init, SysV init, systemd, OpenRC, runit and s6 compared; choosing; a systemd unit for an application.*
+| | BusyBox init | SysV init | systemd | OpenRC | runit, s6 |
+|---|---|---|---|---|---|
+| Configuration | `inittab` plus shell scripts | `inittab` with runlevels, `/etc/rcN.d/` links to scripts | Unit files | Shell scripts with dependency headers | One directory per service with a `run` script |
+| Order | Name order of the scripts | Name order (`S10`, `S20`...) per runlevel | Dependencies, in parallel | Dependencies | Parallel; services wait on each other explicitly |
+| Restarts crashed services | Only `inittab` lines | Only `inittab` lines | Yes (`Restart=`) | With its supervisor | Yes, the core of the design |
+| Logs | `syslogd` | `syslogd` | journald | `syslogd` | Per-service loggers |
+| Hardware watchdog | A separate `watchdog` daemon | A separate daemon | Built in (`RuntimeWatchdogSec=`) | A separate daemon | A separate daemon |
+| Also brings | Nothing | Nothing | udev, network (networkd), time sync, login sessions, timers, cgroups for every service | Nothing | Nothing |
+| Size and needs | Inside BusyBox | Small | Several MiB, glibc, many kernel options | Small | Very small |
+| Found in | Buildroot's default, rescue images | Older distributions, Yocto's former default | Debian, Yocto option, Buildroot option | Alpine, Gentoo | Void Linux (runit), some embedded products (s6) |
+
+**How to choose:**
+
+- **A few services, small storage, fast boot**: BusyBox init, with the product's application on a `respawn` line so it's restarted when it crashes (section 7).
+- **Many services with dependencies, network management, hardware watchdog, per-service resource limits, a team used to desktop Linux**: systemd. It costs storage and some boot time, and saves writing everything that systemd already does.
+- **Supervision without systemd**: runit or s6, or BusyBox's own `runsv` and `runsvdir` applets, which implement runit.
+
+**A systemd unit** for the application of a product, for comparison with an `inittab` line. In `/etc/systemd/system/myapp.service`:
+
+```ini
+[Unit]
+Description=My application
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+ExecStart=/usr/bin/myapp
+Restart=on-failure
+RestartSec=2
+User=myapp
+WatchdogSec=10
+
+[Install]
+WantedBy=multi-user.target
+```
+
+`WatchdogSec=` restarts the service if it stops calling `sd_notify("WATCHDOG=1")` for 10 seconds: it only works when the application does that. On a serial console, systemd starts a login on the `console=` device by itself (`serial-getty@ttyS0.service`), so there's no `inittab` to write. The kernel options systemd requires (cgroups, `CONFIG_FHANDLE`, `CONFIG_DEVTMPFS` and others) are listed in its `README`.
 
 ## 13. Distributions and build systems
 
-*Planned: Debian with mmdebstrap, Buildroot and Yocto, and how each piece of this note maps to their options.*
+**A Debian root filesystem** gives `apt` and every Debian package, for a few hundred MiB. Debian's `armhf` port runs on the Cortex-A8. BeagleBoard.org publishes ready Debian images for the board; to build one yourself with your own kernel, use `mmdebstrap`, which runs the target's package scripts through QEMU user-mode emulation:
+
+```sh
+$ sudo apt install mmdebstrap qemu-user-static binfmt-support arch-test
+$ sudo mmdebstrap --architectures=armhf --variant=minbase \
+      --include=systemd-sysv,udev,kmod,iproute2,openssh-server \
+      trixie ~/bbb/debian-rootfs http://deb.debian.org/debian
+$ sudo chroot ~/bbb/debian-rootfs passwd root
+$ echo bbb | sudo tee ~/bbb/debian-rootfs/etc/hostname
+```
+
+Then install the kernel modules into it (section 11) and write it to the card like the BusyBox tree. `chroot` into an `armhf` tree works on an x86 machine because `binfmt_misc` hands Arm binaries to QEMU. It's also a quick way to try a program before the board is at hand. The kernel stays the one from the kernel note; Debian's own kernel packages aren't installed.
+
+**Buildroot** builds a toolchain, BusyBox, packages, the root filesystem and the images in one `make`, with `make beaglebone_defconfig` as a starting point for this board. **Yocto** builds a distribution with recipes; the reference BSP layer has a `beaglebone-yocto` machine. Both are covered in their own notes ([Buildroot](../../linux-build-systems/buildroot/), [Yocto](../../linux-build-systems/yocto/)). What they generate is what this note builds by hand:
+
+| Piece | By hand | Buildroot | Yocto |
+|---|---|---|---|
+| BusyBox configuration | Section 4 | `BR2_PACKAGE_BUSYBOX_CONFIG` | `busybox` recipe: `defconfig` and `.cfg` fragments in a `.bbappend` |
+| C library | Section 5 | Toolchain menu: glibc, musl or uClibc-ng | `TCLIBC` |
+| `/dev` management | Section 6 | `BR2_ROOTFS_DEVICE_CREATION_*` (devtmpfs, mdev, eudev) | `VIRTUAL-RUNTIME_dev_manager` |
+| Init system | Section 7 | `BR2_INIT_BUSYBOX`, `_SYSV`, `_OPENRC`, `_SYSTEMD` | `INIT_MANAGER` |
+| Console login | Section 7 | `BR2_TARGET_GENERIC_GETTY_PORT="ttyS0"` | `SERIAL_CONSOLES = "115200;ttyS0"` |
+| Root password | Section 8 | `BR2_TARGET_GENERIC_ROOT_PASSWD` | `extrausers` class, `EXTRA_USERS_PARAMS` |
+| Hostname | Section 9 | `BR2_TARGET_GENERIC_HOSTNAME` | `hostname:pn-base-files` |
+| Your own files | Section 9 | `BR2_ROOTFS_OVERLAY`, `BR2_ROOTFS_POST_BUILD_SCRIPT` | A recipe, or `ROOTFS_POSTPROCESS_COMMAND` |
+| Image format | Section 10 | `BR2_TARGET_ROOTFS_EXT2_4`, `BR2_TARGET_ROOTFS_SQUASHFS` | `IMAGE_FSTYPES` |
+| Whole-card image | Section 11 | `genimage`, from `BR2_ROOTFS_POST_IMAGE_SCRIPT` | `wic`, with a `.wks` file |
+
+**When to build by hand:** to learn, for a rescue or factory-test initramfs with a handful of tools, and to debug what a build system produced. For a product, a build system's reproducibility, license reports and CVE tracking (section 17) are worth its learning curve.
 
 ## 14. Adding software
 
-*Planned: Cross-compiling programs and libraries into the tree: prefix and DESTDIR, staging, pkg-config, libtool, stripping; Dropbear as an example.*
+**Your own program** is one compiler call and one copy:
+
+```sh
+$ ${CROSS_COMPILE}gcc -O2 -Wall -o myapp myapp.c
+$ install -D -m 0755 myapp $ROOTFS/usr/bin/myapp
+$ ${CROSS_COMPILE}strip $ROOTFS/usr/bin/myapp
+```
+
+**A package with a build system** follows one rule: **`--prefix` is where the files will be on the board, `DESTDIR` is where they go now.**
+
+```sh
+$ ./configure --host=arm-none-linux-gnueabihf --prefix=/usr --sysconfdir=/etc
+$ make -j$(nproc)
+$ make DESTDIR=$ROOTFS install
+```
+
+`--prefix=$ROOTFS/usr` seems to work, but writes the build machine's path into the program wherever it records its own location (configuration file paths, plugin directories), and those paths don't exist on the board. CMake's equivalent is `-DCMAKE_INSTALL_PREFIX=/usr` at configure time and `DESTDIR=$ROOTFS` at install time; Meson's is `--prefix=/usr` and `meson install --destdir $ROOTFS`. The [toolchain note](../cross-compilation-toolchain/cross-compilation-toolchain.md) covers each build system.
+
+**Libraries need two trees.** A program that uses a library needs its headers, `.so` link and pkg-config file at build time, and only the runtime `.so.N` on the board:
+
+| | Staging tree (`~/bbb/staging`) | Root filesystem (`$ROOTFS`) |
+|---|---|---|
+| Contains | Headers, `.so` links, `.a` files, `.pc` files, unstripped libraries | Runtime libraries (`libfoo.so.1`), stripped |
+| Used by | The compiler and linker on the build machine; GDB | The board |
+| Filled by | `make DESTDIR=~/bbb/staging install` for each library | Copying the runtime files from the staging tree |
+
+Building a program against the staging tree:
+
+```sh
+$ export PKG_CONFIG_SYSROOT_DIR=~/bbb/staging
+$ export PKG_CONFIG_LIBDIR=~/bbb/staging/usr/lib/pkgconfig:~/bbb/staging/usr/share/pkgconfig
+$ ./configure --host=arm-none-linux-gnueabihf --prefix=/usr \
+      CPPFLAGS=-I$HOME/bbb/staging/usr/include LDFLAGS=-L$HOME/bbb/staging/usr/lib
+$ make -j$(nproc) && make DESTDIR=$ROOTFS install
+$ cp -a ~/bbb/staging/usr/lib/libfoo.so.* $ROOTFS/usr/lib/
+$ ${CROSS_COMPILE}strip --strip-unneeded $ROOTFS/usr/lib/libfoo.so.*.*
+```
+
+- `PKG_CONFIG_LIBDIR` replaces pkg-config's default search path, so the build machine's own `.pc` files are never found. `PKG_CONFIG_SYSROOT_DIR` prefixes the paths in the `.pc` files with the staging tree.
+- Here `cp -a` is right: it keeps the `libfoo.so.1 -> libfoo.so.1.2.3` link the loader looks up.
+- **Delete libtool's `.la` files** in the staging tree. They hold absolute paths (`/usr/lib`) that send a later link to the build machine's own libraries.
+- Run `needed-libs.sh` (section 5) on the new programs to check that nothing is missing from `$ROOTFS`.
+- Drop what the board doesn't need: `usr/include`, `usr/share/man`, `usr/share/doc`, `usr/share/info`, `*.a`, `usr/lib/pkgconfig`.
+
+**Example: an SSH server, Dropbear.** OpenSSH is the full server; Dropbear is a small one, often used on embedded systems. Built as a single binary with links (**untested**):
+
+```sh
+$ cd ~/bbb/src/dropbear-<version>
+$ ./configure --host=arm-none-linux-gnueabihf --prefix=/usr --disable-zlib
+$ make PROGRAMS="dropbear dbclient dropbearkey scp" MULTI=1 -j$(nproc)
+$ make PROGRAMS="dropbear dbclient dropbearkey scp" MULTI=1 DESTDIR=$ROOTFS install
+$ mkdir -p $ROOTFS/etc/dropbear
+```
+
+And on a `respawn` line in `/etc/inittab`, in the foreground (`-F`), creating host keys on first use (`-R`):
+
+```
+::respawn:/usr/sbin/dropbear -F -R
+```
+
+What it needs from the rest of the system: `/dev/pts` mounted (section 6), the user's shell in `/etc/shells` (section 8), and for password logins, a `crypt()`. The toolchain's glibc no longer has `libcrypt` (section 5). Depending on the version, `configure` then turns password logins off or the build fails. Either build `libxcrypt` into the staging tree first, or use key logins only, which is better anyway: put the public key in `/root/.ssh/authorized_keys`, mode `0600`, in a directory of mode `0700` owned by root. Dropbear refuses password logins for accounts with an empty password, so the development `root` of section 8 can only log in with a key.
+
+**Where packages come from otherwise:** Buildroot and Yocto have recipes for thousands of packages with these steps already solved (section 13). A recipe from either one shows the configure options that work for cross builds of a given package, even when you build it by hand.
 
 ## 15. Read-only root and persistent data
 

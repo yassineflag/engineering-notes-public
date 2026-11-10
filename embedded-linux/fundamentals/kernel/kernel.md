@@ -165,11 +165,173 @@ The AM335x has been supported in mainline for over a decade, so a mainline or LT
 
 ## 4. The source tree and Kbuild
 
-*Planned: the directories a board touches, Kconfig and Makefile pairs, tristate, depends on and select.*
+A kernel tree is large (about 1.8 GB of files without its Git history), but a board's work touches a few places:
+
+| Path | What's there | For the BeagleBone Black |
+|---|---|---|
+| `arch/arm/` | Everything specific to 32-bit Arm | |
+| `arch/arm/configs/` | Default configurations | `omap2plus_defconfig` |
+| `arch/arm/boot/dts/ti/omap/` | Device tree sources for TI's 32-bit SoCs (149 `.dts` files) | `am335x-boneblack.dts` and the `.dtsi` files it includes |
+| `arch/arm/mach-omap2/` | SoC support code: power and clock domains, early setup | Generic for all OMAP2+ chips, matched by `ti,am33xx` (section 12) |
+| `arch/arm/boot/compressed/` | The `zImage` decompressor | |
+| `drivers/` | Device drivers, by subsystem | `drivers/net/ethernet/ti/` (CPSW Ethernet), `drivers/mmc/host/sdhci-omap.c`, `drivers/tty/serial/8250/8250_omap.c` |
+| `init/` | `start_kernel()`, mounting the root, starting `init` | Section 13 |
+| `include/uapi/` | The headers userspace sees (system calls, ioctls) | Installed into toolchains with `make headers_install` |
+| `scripts/` | Build tools: `kconfig/`, `dtc/`, `config`, `diffconfig`, `decode_stacktrace.sh`, `faddr2line` | Sections 5 and 19 |
+| `Documentation/` | The kernel's documentation (also at https://docs.kernel.org) | `admin-guide/kernel-parameters.txt`, `arch/arm/booting.rst` |
+
+Two files in every directory drive the build. A `Kconfig` file declares options; a `Makefile` says which objects each option builds. The USB Ethernet gadget, used as the example of section 5, from source:
+
+```
+# drivers/usb/gadget/legacy/Kconfig
+config USB_ETH
+	tristate "Ethernet Gadget (with CDC Ethernet support)"
+	depends on NET
+	select USB_LIBCOMPOSITE
+	select USB_U_ETHER
+	...
+
+# drivers/usb/gadget/legacy/Makefile
+g_ether-y			:= ether.o
+obj-$(CONFIG_USB_ETH)		+= g_ether.o
+```
+
+- `tristate` means the option can be `y` (built into the kernel image), `m` (built as a loadable module, here `g_ether.ko`) or `n`. A `bool` option has only `y` and `n`.
+- `obj-$(CONFIG_USB_ETH)` becomes `obj-y`, `obj-m`, or `obj-` (ignored), depending on the value. This one line is the whole mechanism that decides between built-in and module.
+- `depends on` hides the option until its dependencies are met; `select` forces other options on without checking their own dependencies. A `select` is why enabling one driver can turn on a library you never chose.
+- Device trees use the same mechanism: `dtb-$(CONFIG_SOC_AM33XX) += am335x-boneblack.dtb` in `arch/arm/boot/dts/ti/omap/Makefile` builds the BeagleBone Black's DTB whenever AM335x support is on.
+
+This build system is called **Kbuild**. Out-of-tree modules use it too (section 15).
 
 ## 5. Configuring: defconfig, menuconfig and fragments
 
-*Planned: defconfig and savedefconfig, menuconfig, scripts/config and its traps, diffconfig, config fragments with merge_config.sh, /proc/config.gz.*
+The configuration is one file, `.config`, in the build directory: about 8,300 lines of `CONFIG_FOO=y`, `=m`, `="string"` or `# CONFIG_FOO is not set`. Nobody writes it by hand. It's generated from a **defconfig**, then changed with tools.
+
+**Start from the defconfig.** **Real output**, shortened:
+
+```
+$ cd ~/bbb/linux
+$ make O=~/bbb/build omap2plus_defconfig
+  HOSTCC  scripts/basic/fixdep
+  ...
+  HOSTLD  scripts/kconfig/conf
+#
+# configuration written to .config
+#
+```
+
+`make` first builds the configuration tool for the build machine (`HOSTCC`: compiled with the build machine's own compiler), then expands the 724-line `omap2plus_defconfig` into a full `.config`, in a few seconds. The result has 1,431 options set to `y` and 737 set to `m`.
+
+**A defconfig is a minimal list.** It holds only the options that differ from their defaults; every other value comes from the `Kconfig` files. `make savedefconfig` produces one from a `.config` (it writes `defconfig` in the build directory). On this tree, saving the configuration right after loading `omap2plus_defconfig` gives a 697-line file: the upstream defconfig carries 29 lines that `savedefconfig` drops, because they're already the default, are forced by a `select`, or name options that no longer exist (`CONFIG_LEDS_LP5523` is one). A defconfig is minimal by convention, not by guarantee.
+
+**Changing options.** Four tools, for different jobs:
+
+| Tool | Use it for |
+|---|---|
+| `make menuconfig` (or `nconfig`, `xconfig`) | Exploring. `/` searches for a symbol and shows its location, its value, what it `depends on` and what `select`s it. Needs `libncurses-dev` on the build machine |
+| `scripts/config --file .config -e FOO -m BAR -d BAZ` | Scripted changes, without a menu. `--set-str LOCALVERSION -bbb` for strings, `-s FOO` to print a value |
+| A config fragment and `scripts/kconfig/merge_config.sh` | Keeping your changes as a short file in your own repository (below) |
+| `make olddefconfig` | After any of the above: resolves dependencies and fills new options with their defaults, without asking |
+
+`scripts/config` edits the text and checks nothing. Two real examples of what that means:
+
+- **The parent limits the child.** In `omap2plus_defconfig`, `USB_GADGET` is `m`, and `USB_ETH` lives inside it, so it can't be built in. **Real output**:
+
+  ```
+  $ scripts/config --file .config -e USB_ETH
+  $ grep '^CONFIG_USB_ETH=' .config
+  CONFIG_USB_ETH=y
+  $ make -s olddefconfig
+  $ grep -E '^CONFIG_(USB_ETH|USB_GADGET)=' .config
+  CONFIG_USB_GADGET=m
+  CONFIG_USB_ETH=m
+  ```
+
+  `olddefconfig` turned `y` into `m` without a word.
+
+- **Choices need the choice member.** `omap2plus_defconfig` enables debug information with `CONFIG_DEBUG_INFO_DWARF4=y`, one entry in a `choice` of DWARF versions. `scripts/config -d DEBUG_INFO` followed by `olddefconfig` changes nothing: `DEBUG_INFO` is selected by the chosen entry. Switching the choice does it: `scripts/config -d DEBUG_INFO_DWARF4 -e DEBUG_INFO_NONE`. Debug information makes the build directory several times larger; it's needed to decode crashes with line numbers (section 19).
+
+**Always check the result** with `scripts/diffconfig`, which compares two `.config` files. Comparing the configuration of the earlier BeagleBone build against a fresh `omap2plus_defconfig` shows what its owner changed. **Real output**:
+
+```
+$ scripts/diffconfig defconfig-build/.config previous-build/.config
+ USB_ETH n -> m
++USB_ETH_EEM y
++USB_ETH_RNDIS y
+```
+
+One change: the USB Ethernet gadget, as a module, with RNDIS (so that Windows sees the board as a network adapter over USB) and EEM. The two `+` lines are options that only exist once `USB_ETH` is enabled.
+
+**Keep your changes as a fragment.** A fragment is a `.config`-style file with only the lines you care about. `merge_config.sh` applies it on top of a base defconfig. The fragment used for the tests below:
+
+```
+# bbb.config - changes on top of omap2plus_defconfig
+CONFIG_LOCALVERSION="-bbb"
+CONFIG_USB_ETH=m
+CONFIG_USB_ETH_RNDIS=y
+CONFIG_DEBUG_INFO_NONE=y
+CONFIG_PSTORE=y
+CONFIG_PSTORE_RAM=y
+CONFIG_DYNAMIC_DEBUG=y
+CONFIG_NO_SUCH_OPTION=y
+```
+
+The last line is a deliberate typo. **Real output**:
+
+```
+$ mkdir -p ~/bbb/build
+$ scripts/kconfig/merge_config.sh -m -O ~/bbb/build arch/arm/configs/omap2plus_defconfig bbb.config
+Using arch/arm/configs/omap2plus_defconfig as base
+Merging bbb.config
+#
+# merged configuration written to ~/bbb/build/.config (needs make)
+#
+$ make O=~/bbb/build olddefconfig
+$ scripts/diffconfig defconfig-build/.config ~/bbb/build/.config
+ ...
+ DEBUG_INFO_DWARF4 y -> n
+ DEBUG_INFO_NONE n -> y
+ DYNAMIC_DEBUG n -> y
+ DYNAMIC_DEBUG_CORE n -> y
+ LOCALVERSION "" -> "-bbb"
+ PSTORE n -> y
+ USB_ETH n -> m
++PSTORE_RAM y
+ ...
++USB_ETH_RNDIS y
+```
+
+(The `...` lines are dependent options that appeared or disappeared, such as the `DEBUG_INFO_*` sub-options and `PSTORE_COMPRESS`.) Three things to know about the script:
+
+- **The `-O` directory must exist.** When it doesn't, the script prints `output directory ... does not exist` and writes nothing, and a following `make olddefconfig` builds a default `.config` for the generic Arm platform, not for the BeagleBone. Nothing warns you; `diffconfig` shows hundreds of differences.
+- **With `-m` ("merge only"), the typo disappears silently** in `olddefconfig`. Without `-m`, the script runs `make alldefconfig` itself and checks each requested value. **Real output**, shortened:
+
+  ```
+  $ scripts/kconfig/merge_config.sh -O ~/bbb/build arch/arm/configs/omap2plus_defconfig bbb.config
+  ...
+  WARNING: Value requested for CONFIG_LEDS_LP5523 not in final .config
+  Requested value: CONFIG_LEDS_LP5523=m
+  Actual value:
+  WARNING: CONFIG_DEBUG_INFO_DWARF4 differs:
+  Requested value: CONFIG_DEBUG_INFO_DWARF4=y
+  Actual value:    # CONFIG_DEBUG_INFO_DWARF4 is not set
+  WARNING: Value requested for CONFIG_DEBUG_INFO_SPLIT not in final .config
+  ...
+  WARNING: Value requested for CONFIG_NO_SUCH_OPTION not in final .config
+  Requested value: CONFIG_NO_SUCH_OPTION=y
+  Actual value:
+  ```
+
+  The typo is caught, together with warnings about stale lines of the upstream defconfig and about options the fragment overrides on purpose. Run without `-m` whenever you change the fragment, and read the warnings that name your own options.
+- **Later files win.** Several fragments can follow the base (`base.config board.config debug.config`), which is how Buildroot (`BR2_LINUX_KERNEL_CONFIG_FRAGMENT_FILES`) and Yocto (`.cfg` files in `SRC_URI`) apply theirs.
+
+**Read the configuration of a running kernel.** `omap2plus_defconfig` sets `CONFIG_IKCONFIG_PROC=y`, so the running kernel carries its own configuration:
+
+```sh
+# zcat /proc/config.gz | grep USB_ETH
+```
+
+It's the fastest answer to "is this driver built in?", and a way to recover the configuration of a kernel whose sources are lost. `scripts/extract-ikconfig` does the same from a `zImage` or `vmlinux` file on the build machine.
 
 ## 6. Building
 

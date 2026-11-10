@@ -1074,19 +1074,166 @@ What it needs from the rest of the system: `/dev/pts` mounted (section 6), the u
 
 ## 15. Read-only root and persistent data
 
-*Planned: Why a read-only root, what writes to the root, a data partition, an overlay on /etc, a whole-root overlay from an initramfs.*
+A root filesystem mounted read-write gets written to all the time, by logs, temporary files and state. A product usually mounts it **read-only**:
+
+- **Power cuts.** ext4's journal protects the filesystem's structure, not the content of files being written. A board unplugged at the wrong moment can come back with a truncated configuration file. A read-only root can't be damaged that way.
+- **Flash wear.** SD cards and eMMC wear out with writes. A read-only root writes nothing.
+- **A known state.** Every board runs exactly the image that was tested. That's the base for image updates (section 16) and integrity checking (section 17).
+
+**What writes to the root filesystem**, and where it goes instead:
+
+| Path | Written by | Read-only solution |
+|---|---|---|
+| `/tmp`, `/run`, `/var/run` | Everything | tmpfs (already, section 9) |
+| `/var/log` | `syslogd` | `syslogd -C` ring buffer, a tmpfs, or `/data/log` to keep logs |
+| `/var/lib`, `/var/cache`, `/var/spool` | Package-specific state | A link to `/data`, or a tmpfs when it may be lost |
+| `/etc/resolv.conf` | The `udhcpc` script | A link to `/run/resolv.conf`, and the script writes there |
+| `/etc/dropbear/` host keys | `dropbear -R` | Keys in `/data`; Dropbear's `-r` option names the key file |
+| `/etc/shadow` | `passwd` | Fixed in the image, or an overlay on `/etc` |
+| `/etc/machine-id` | systemd at first boot | systemd handles a read-only root itself; see its documentation |
+| Application settings | The application | `/data` |
+
+**A data partition.** Add a third partition to the card (ext4), mounted on `/data`, and change the command line from `rw` to `ro`:
+
+```
+# /etc/fstab, added line
+/dev/mmcblk0p3   /data   ext4   defaults,noatime   0   2
+```
+
+For maintenance, `mount -o remount,rw /` makes the root writable until the next boot. BusyBox has no `e2fsck`; for the `pass` field `2` to mean anything, add e2fsprogs and check `/data` in `rcS` before `mount -a`. Applications should write a file safely: write a temporary file, `fsync` it, then `rename` it over the old one. The rename is atomic, so after a power cut the file is either the old version or the new one.
+
+**An overlay on `/etc`.** overlayfs (`CONFIG_OVERLAY_FS`) shows a writable upper directory on top of a read-only lower one. Changes go to the upper directory, everything else is read from below. Early in `rcS`, after `/data` is mounted:
+
+```sh
+mkdir -p /data/etc.upper /data/etc.work
+mount -t overlay overlay -o lowerdir=/etc,upperdir=/data/etc.upper,workdir=/data/etc.work /etc
+```
+
+The upper and work directories must be on the same filesystem. A change made on one board survives image updates, which is wanted for a network setting and unwanted for a file the new image changed. Decide which files may be changed, and reset the upper directory when the image changes.
+
+**An overlay on the whole root**, from an initramfs that mounts it before `init` runs (**untested** sketch):
+
+```sh
+#!/bin/sh
+# /init of a small initramfs: read-only root + writable overlay, then the real init
+mount -t proc proc /proc
+mount -t sysfs sysfs /sys
+mount -t devtmpfs devtmpfs /dev
+while [ ! -b /dev/mmcblk0p2 ]; do sleep 1; done          # what rootwait does
+mkdir -p /ro /rw /newroot
+mount -o ro /dev/mmcblk0p2 /ro
+mount /dev/mmcblk0p3 /rw              # or: mount -t tmpfs tmpfs /rw, to discard changes at reboot
+mkdir -p /rw/upper /rw/work
+mount -t overlay overlay -o lowerdir=/ro,upperdir=/rw/upper,workdir=/rw/work /newroot
+mkdir -p /newroot/ro /newroot/rw
+mount --move /ro /newroot/ro
+mount --move /rw /newroot/rw
+mount --move /dev /newroot/dev
+umount /proc /sys
+exec switch_root /newroot /sbin/init
+```
+
+`switch_root` deletes the initramfs's files to free the RAM, makes `/newroot` the root and executes `init` there as PID 1. The tmpfs variant is popular for kiosks and appliances: every boot starts from the image, whatever happened before.
 
 ## 16. Updates
 
-*Planned: Package updates against image updates, A/B slots and rollback, SWUpdate, RAUC, Mender, OSTree, keeping kernel and modules together.*
+| Strategy | How | For | Against |
+|---|---|---|---|
+| Packages (`apt`, `opkg`) | Replace packages one by one | Small downloads | Every board ends up in a slightly different state; a power cut mid-update can leave a broken system |
+| Image, A/B ("symmetric") | Two root filesystem slots: write the inactive one, switch, fall back if the new one doesn't boot | Atomic, with automatic rollback | Twice the space |
+| Image, recovery ("asymmetric") | A small recovery system writes the main one | Less space | No service and no fallback during the update |
+| File-based (OSTree) | A versioned tree of files, deployed with hard links | Small downloads, several versions kept | More complex; constraints on the layout |
+| Containers for the application | A fixed base system, applications updated as container images | Applications updated independently | A container runtime, storage, and still a base system to update |
+
+**A/B on this board.** The card gets partition 1 (FAT: `MLO`, `u-boot.img`, the U-Boot environment), partitions 2 and 3 (root filesystems A and B), and partition 4 (`/data`, section 15). Each root filesystem holds its own kernel and DTB in `/boot`, so a slot always has a kernel and modules from the same build (kernel note, section 8). The bootloader chooses the slot and counts failed boots (bootloader note, boot counter and A/B):
+
+1. The update tool writes the new image to the inactive slot and checks it.
+2. It tells the bootloader to try that slot (`fw_setenv`), with a limited number of attempts.
+3. The board reboots into the new slot. If the system comes up healthy, a service confirms the slot and resets the counter.
+4. If it doesn't (panic, `init` failing, the watchdog firing), the counter runs out and the bootloader goes back to the old slot.
+
+"Healthy" is defined by the product: the application started, the network came up, the server answered. Confirming too early defeats the rollback.
+
+**Tools.** Writing the slot safely, verifying signatures, talking to the bootloader and handling power cuts at every step is what these tools do. Don't rewrite them in scripts:
+
+| Tool | Model | Notes |
+|---|---|---|
+| SWUpdate | Images or files, described by `sw-description` | Very flexible; signed and encrypted updates; Buildroot and Yocto support it |
+| RAUC | Signed bundles (X.509), A/B slots described in `system.conf` | Integrates with U-Boot and systemd; delta downloads with adaptive updates |
+| Mender | Client plus a server, A/B | Open-source client and server, with a hosted service |
+| OSTree | File-based, content-addressed | Used by Fedora's immutable editions and some embedded distributions |
+
+**Update images are signed**, and the board verifies the signature before writing anything. An unsigned update is a way for anyone on the network to replace the system.
 
 ## 17. Security
 
-*Planned: Logins and passwords, SSH host keys, services, users and capabilities, mount options, dm-verity, licenses and CVEs.*
+| Area | Development system | Product |
+|---|---|---|
+| Root password | Empty | Locked (`*` or `!` in `/etc/shadow`), or a strong hash; never the same hash on every board if it's ever used |
+| Serial console | `respawn` shell, no login | A login, or no `getty` at all; a console that can be enabled only by a signed debug image |
+| SSH | Anything | Keys only, no passwords, no root login with a password |
+| SSH host keys | Anything | **Generated on each board at first boot**, never stored in the image: otherwise every board has the same key, and one leaked image lets anyone impersonate them all |
+| Per-device secrets | | Never in the image: provisioned per board, ideally in a secure element or the SoC's key storage |
+| Services | Whatever BusyBox `defconfig` has | Only what the product uses: no `telnetd`, `httpd`, `ftpd`, `tftpd` in the BusyBox configuration |
+| Users | Everything as root | The application as its own user. Grant only the capabilities it needs (`CAP_NET_BIND_SERVICE`...), or start it from systemd with `User=` and `AmbientCapabilities=` |
+| Mount options | Defaults | `nosuid,nodev` on `/tmp`, `/run`, `/data`; `noexec` where no programs should run |
+| Root filesystem | Read-write | Read-only (section 15), checked by dm-verity |
+| Debug tools | `gdbserver`, `strace` | Removed |
+
+**dm-verity** checks every block of a read-only root filesystem as it's read, against a hash tree whose top hash ("root hash") is trusted. A modified block produces an I/O error instead of modified data. With the tools of cryptsetup (**untested**):
+
+```sh
+$ veritysetup format rootfs.squashfs rootfs.hashtree
+...
+Root hash:      <64 hexadecimal digits>
+```
+
+The hash tree goes on its own partition (here partition 3) next to the image. Without an initramfs, the kernel sets up the mapping from its command line (`CONFIG_DM_INIT`, `CONFIG_DM_VERITY` built in; `Documentation/admin-guide/device-mapper/dm-init.rst`):
+
+```
+dm-mod.create="vroot,,,ro,0 <sectors> verity 1 /dev/mmcblk0p2 /dev/mmcblk0p3 4096 4096 <blocks> 1 sha256 <root hash> <salt>" root=/dev/dm-0 rootfstype=squashfs ro
+```
+
+`<sectors>` is the image size in 512-byte sectors, `<blocks>` in 4096-byte blocks, and the `1` before `sha256` skips the superblock `veritysetup` wrote at the start of the hash device. The root hash and salt come from the `format` output. dm-verity is only as trustworthy as the command line that carries the root hash, so the command line must itself be verified: in a signed FIT image with the kernel, checked by a verified bootloader (bootloader note, verified boot and its limits on this board).
+
+**Licenses.** A root filesystem is a collection of other people's software under their licenses. BusyBox, the kernel and many tools are GPLv2: shipping them means providing their source, your configurations and your modifications. glibc is LGPL: programs linking to it dynamically are fine, static linking brings obligations. Keep the list of what's in the image and under which license. Buildroot (`make legal-info`) and Yocto (license manifests, SPDX) produce it.
+
+**Vulnerabilities.** Every component gets CVEs over time; BusyBox has regular ones in `ash`, `httpd` and other applets. Keep the exact versions of what's in the image, watch their advisories, and plan the update path (section 16) before the first vulnerability, not after. Buildroot (`make pkg-stats`) and Yocto (`cve-check`) list the known CVEs for the packages they build.
 
 ## 18. Size
 
-*Planned: Where the space goes, keeping only the needed modules, BusyBox, the C library, compression, measuring.*
+**Where the space goes** (**Typical**, for this kind of system):
+
+| Item | Size | Reduce by |
+|---|---|---|
+| Kernel modules: all of `omap2plus_defconfig` | By far the largest part | Install only the modules this board loads (below), or a board-specific kernel configuration (kernel note, section 21) |
+| glibc | About 2 MiB | Copy only the libraries used (section 5); musl for under 1 MiB |
+| BusyBox, `defconfig` | About 1 MiB | Turn off unused applets; a few hundred KiB for a small set |
+| Your programs and libraries | Varies | `-Os`, `strip`, `-ffunction-sections -fdata-sections -Wl,--gc-sections`, LTO |
+| Headers, static libraries, man pages, documentation | Often several MiB after adding packages | Don't copy them (section 14) |
+| Debug symbols | Several times the code | `strip --strip-unneeded`; keep unstripped copies on the build machine |
+
+**Only the modules the board uses.** On a booted development board, `lsmod` lists the loaded modules. On the build machine, kmod's `modprobe` resolves their dependencies against the staging tree, so only those files are copied, then `depmod` rebuilds the indexes:
+
+```sh
+$ for m in $(cat lsmod-from-board.txt); do
+      modprobe -d ~/bbb/staging-modules -S $KREL --show-depends $m
+  done | awk '/^insmod/ {print $2}' | sort -u > modules.list
+$ # copy the files in modules.list, plus modules.order and modules.builtin*, into $ROOTFS/lib/modules/$KREL/
+$ depmod -b $ROOTFS $KREL
+```
+
+`~/bbb/staging-modules` is a full `modules_install` kept on the build machine (section 11, with `INSTALL_MOD_PATH=~/bbb/staging-modules`); `modprobe -d` expects `lib/modules/<release>/` under it. Devices plugged in later (USB) need their modules too: add them to the list.
+
+**Measuring:**
+
+```sh
+$ du -sh $ROOTFS/*                                  # per top-level directory
+$ du -a $ROOTFS | sort -n | tail -20                # the 20 largest files and directories
+$ ls -l ~/bbb/images/                               # the images themselves
+```
+
+**Compression** is a property of the filesystem: squashfs and EROFS are compressed, ext4 isn't. A read-only squashfs root is often a third to half the size of the same tree in ext4, at some CPU cost when reading. On the board, `free` and `df` give the real numbers, including tmpfs contents, which live in RAM.
 
 ## 19. When init doesn't start or a program doesn't run
 

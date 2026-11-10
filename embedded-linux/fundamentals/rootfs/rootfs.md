@@ -199,11 +199,161 @@ The tree belongs to your user on the build machine. Who owns the files on the bo
 
 ## 4. BusyBox: the basic commands in one binary
 
-*Planned: What BusyBox is, downloading and configuring it, the tc build failure, building and installing, static or dynamic.*
+BusyBox puts about 400 small commands ("applets") into one executable: a shell (`ash`), the file and text tools (`ls`, `cp`, `grep`, `sed`, `vi`), the system tools (`mount`, `init`, `getty`, `login`, `mdev`, `modprobe`), and network tools (`ip`, `udhcpc`, `ntpd`, `syslogd`). Each command is a link to `busybox`, which looks at the name it was started under (`argv[0]`) to know which applet to run. It is configured with the same Kconfig menus as the kernel. Its applets have fewer options than GNU coreutils and util-linux, which is the price of a binary of about 1 MiB. BusyBox is GPLv2: shipping it in a product means offering its source and your configuration.
+
+**Getting the source:**
+
+```sh
+$ cd ~/bbb
+$ wget https://busybox.net/downloads/busybox-1.37.0.tar.bz2
+$ wget https://busybox.net/downloads/busybox-1.37.0.tar.bz2.sha256
+$ sha256sum -c busybox-1.37.0.tar.bz2.sha256
+$ tar xf busybox-1.37.0.tar.bz2
+```
+
+**Configuring**, in a separate build directory like the kernel's `O=`:
+
+```sh
+$ cd ~/bbb/busybox-1.37.0
+$ BB=~/bbb/busybox-build
+$ mkdir -p $BB
+$ make O=$BB defconfig            # nearly every applet
+$ make O=$BB menuconfig           # adjust
+```
+
+The options worth looking at:
+
+| Option | Menu | Here |
+|---|---|---|
+| `CONFIG_CROSS_COMPILER_PREFIX` | Settings | Empty: the prefix is given with `CROSS_COMPILE=` on the command line. Setting it here instead saves typing |
+| `CONFIG_STATIC` | Settings, "Build static binary" | Off: dynamic, with the libraries of section 5. See the table below |
+| `CONFIG_INSTALL_APPLET_SYMLINKS` | Settings, "Applets links" | Default: symbolic links |
+| `CONFIG_FEATURE_SUID` | Settings | Default: on. Matters only with users other than root (section 8) |
+| `CONFIG_TC` | Networking Utilities | **Off**, see below |
+| `CONFIG_INIT`, `CONFIG_GETTY`, `CONFIG_LOGIN`, `CONFIG_MDEV`, `CONFIG_SYSLOGD`, `CONFIG_KLOGD`, `CONFIG_UDHCPC`, `CONFIG_IFUP`, `CONFIG_NTPD` | Various | On in `defconfig`; the system of sections 6 to 9 uses them |
+| `CONFIG_TELNETD`, `CONFIG_HTTPD`, `CONFIG_FTPD`, `CONFIG_TFTPD` | Networking Utilities | On in `defconfig`, never started unless a script does. Turn them off for a product (section 17) |
+
+**A known build failure: `tc`.** BusyBox 1.37.0's `tc` applet uses the CBQ traffic-control definitions, which recent kernel UAPI headers (Linux 6.8 and later) no longer provide. A toolchain as recent as 15.2.Rel1 ships such headers, so the build stops in `networking/tc.c` with `TCA_CBQ_...` undeclared. Turn `tc` off:
+
+```sh
+$ sed -i 's/^CONFIG_TC=y/# CONFIG_TC is not set/' $BB/.config
+$ make O=$BB oldconfig
+```
+
+For traffic control on the board, use the full `iproute2` instead (section 14).
+
+**Building and installing into the staging tree:**
+
+```sh
+$ make O=$BB CROSS_COMPILE=$CROSS_COMPILE -j$(nproc)
+$ make O=$BB CROSS_COMPILE=$CROSS_COMPILE CONFIG_PREFIX=$ROOTFS install
+```
+
+`install` copies `busybox` to `$ROOTFS/bin/` and creates one link per applet in `bin`, `sbin`, `usr/bin` and `usr/sbin`, plus `linuxrc` at the top (only used by the old initrd mechanism; it can be deleted). The list is in `$BB/busybox.links`. `CONFIG_PREFIX` is mandatory in practice: without it, BusyBox installs into `$BB/_install`.
+
+**Checking the result** on the build machine (the binary can't run there):
+
+```sh
+$ file $ROOTFS/bin/busybox
+$ ${CROSS_COMPILE}readelf -d $ROOTFS/bin/busybox | grep NEEDED
+$ ${CROSS_COMPILE}readelf -l $ROOTFS/bin/busybox | grep interpreter
+$ ls -l $ROOTFS/sbin/init
+```
+
+**Expected** (the library list depends on the configuration: BusyBox's link script drops libraries the binary doesn't use):
+
+```
+.../bin/busybox: ELF 32-bit LSB ..., ARM, EABI5 version 1 (SYSV), dynamically linked, interpreter /lib/ld-linux-armhf.so.3, for GNU/Linux ..., stripped
+ 0x00000001 (NEEDED)                     Shared library: [libm.so.6]
+ 0x00000001 (NEEDED)                     Shared library: [libresolv.so.2]
+ 0x00000001 (NEEDED)                     Shared library: [libc.so.6]
+      [Requesting program interpreter: /lib/ld-linux-armhf.so.3]
+lrwxrwxrwx 1 me me ... .../sbin/init -> ../bin/busybox
+```
+
+`ARM, EABI5` and the `armhf` loader confirm a 32-bit hard-float binary for the BeagleBone Black. These three files are exactly what section 5 copies.
+
+**Static or dynamic:**
+
+| | Static (`CONFIG_STATIC=y`) | Dynamic (default) |
+|---|---|---|
+| Libraries on the board | None | Loader, `libc.so.6`, `libm.so.6`, `libresolv.so.2` |
+| Size of `busybox` | Larger | Smaller |
+| Size of the whole system | Smaller when BusyBox is the only program | Smaller as soon as other programs share the C library |
+| With glibc | Links, with warnings such as `Using 'getaddrinfo' in statically linked applications requires at runtime the shared libraries from the glibc version used for linking`. Name and user lookups then depend on libraries that aren't there | Nothing special |
+| Use | Initramfs, rescue systems; best with musl (section 5) | A normal root filesystem |
+
+**Replacing an applet with the full tool.** A package installed later in the same path replaces the link with its own binary (section 14). Install BusyBox first, the full tools after it, and don't run BusyBox's `install` again afterwards, or it puts its links back.
 
 ## 5. The C library and other shared libraries
 
-*Planned: How dynamic linking finds libraries, finding and copying the right ones, glibc details, choosing a C library.*
+**What happens when a dynamic program starts.** The kernel reads the program's `PT_INTERP` header (the "program interpreter" of `readelf -l`), loads that file, here `/lib/ld-linux-armhf.so.3`, and hands control to it. The loader reads the program's `NEEDED` entries and looks for each library in: the program's `RUNPATH`, `LD_LIBRARY_PATH`, the cache `/etc/ld.so.cache`, then the default directories `/lib` and `/usr/lib`. It maps them, resolves symbols and only then calls `main()`. On a hand-built root filesystem there's no `ld.so.cache` and none is needed, as long as the libraries are in `/lib` or `/usr/lib`. `ldconfig` is only needed to build the cache for libraries placed in other directories listed in `/etc/ld.so.conf`.
+
+Two consequences:
+
+- **The loader's path is written into every program.** If it's missing, `exec` fails with `ENOENT` (error -2), and a shell says `not found` about a file that is visibly there. This is the most common first-boot failure of a hand-built root filesystem (section 19).
+- **The libraries must come from the toolchain that built the programs**, the same glibc version or newer. A program linked against a newer glibc fails with ``version `GLIBC_2.xx' not found`` ([toolchain note](../cross-compilation-toolchain/cross-compilation-toolchain.md)).
+
+**Finding what a program needs.** There's no `ldd` for a cross target: `ldd` runs the program. `readelf` gives the same information, one level at a time. This small script (written for this note, untested) follows the dependencies recursively in the sysroot:
+
+```sh
+#!/bin/sh
+# needed-libs.sh FILE...: shared libraries the files need, recursively,
+# looked up in the toolchain sysroot. Prints "name path" per library.
+: "${CROSS_COMPILE:?}" "${SYSROOT:?}"
+todo="$*"; seen=""
+while [ -n "$todo" ]; do
+    set -- $todo; f=$1; shift; todo="$*"
+    for lib in $(${CROSS_COMPILE}readelf -d "$f" 2>/dev/null |
+                 sed -n 's/.*Shared library: \[\(.*\)\]/\1/p'); do
+        case " $seen " in *" $lib "*) continue ;; esac
+        seen="$seen $lib"
+        path=$(find "$SYSROOT/lib" "$SYSROOT/usr/lib" -maxdepth 1 -name "$lib" 2>/dev/null | head -n 1)
+        echo "$lib ${path:-NOT-FOUND}"
+        [ -n "$path" ] && todo="$todo $path"
+    done
+done
+```
+
+Run it on everything in the tree that is an ELF file (`find $ROOTFS -type f -exec file {} + | grep ELF`). Add the loader named by `readelf -l ... | grep interpreter`, which the script doesn't print.
+
+**Copying them:**
+
+```sh
+$ cd $SYSROOT/lib
+$ cp -L ld-linux-armhf.so.3 libc.so.6 libm.so.6 libresolv.so.2 $ROOTFS/lib/
+$ ${CROSS_COMPILE}strip --strip-unneeded $ROOTFS/lib/*.so*
+```
+
+- **`cp -L`** follows symbolic links, so a link in the sysroot becomes a real file under the name the programs ask for. The program asks for the **soname** (`libc.so.6`); the development link without a number (`libc.so`) is only used when linking and has no place on the board.
+- **Strip with the cross `strip`**: the build machine's `strip` may not understand Arm objects. Keep the unstripped sysroot for debugging with GDB (section 19).
+- **For a development system, copying the whole `$SYSROOT/lib`** (all `*.so*` files) avoids chasing libraries one at a time, for a few more MiB. For a product, copy only what the script lists.
+
+**glibc details that matter on a small system:**
+
+- Since glibc 2.34, `libpthread`, `libdl`, `libutil` and `libanl` are part of `libc.so.6`, along with the `files` and `dns` name-service modules. No `libnss_*` files are needed for `/etc/passwd`, `/etc/group` and `/etc/hosts` lookups.
+- A three-line `/etc/nsswitch.conf` states the lookup order instead of relying on glibc's built-in defaults:
+
+  ```
+  passwd: files
+  group:  files
+  shadow: files
+  hosts:  files dns
+  ```
+
+- glibc 2.39 dropped `libcrypt`, and Arm's toolchain releases since 14.2.Rel1 no longer ship it. BusyBox doesn't need it (it has its own `crypt()`), but other programs that check passwords do: build `libxcrypt` for them (section 14).
+- Locales (`/usr/lib/locale`) and character-set converters (`gconv`) aren't needed for BusyBox. Without them, programs run in the `C` locale.
+- Time zones: copy one file from a zoneinfo database to `/etc/localtime`, or set `TZ` (section 9).
+
+**Which C library.** The C library is chosen with the toolchain; a program built for one doesn't run on another ([toolchain note](../cross-compilation-toolchain/cross-compilation-toolchain.md)).
+
+| | glibc | musl | uClibc-ng |
+|---|---|---|---|
+| Size on the board | About 2 MiB | Under 1 MiB, loader and libc in one file | About 1 MiB, configurable |
+| Static linking | Discouraged (name lookups, locales) | Clean | Works |
+| Compatibility with desktop software | Complete | Very good; some glibc extensions missing | Lower |
+| Needed by | systemd, most vendor binaries | Alpine, small static tools | Systems without an MMU |
+| Toolchains | Arm GNU Toolchain, distributions, Bootlin, Buildroot, Yocto | Bootlin, Buildroot, Yocto, musl-cross-make | Bootlin, Buildroot |
 
 ## 6. /dev: devtmpfs, mdev and udev
 

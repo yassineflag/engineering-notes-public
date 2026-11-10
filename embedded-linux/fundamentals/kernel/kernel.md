@@ -715,19 +715,155 @@ The payload after the 64-byte header is a gzip-compressed cpio archive of 849 en
 
 ## 14. Modules on the target
 
-*Planned: modprobe and insmod, modules.dep, autoloading by modalias, parameters, built-in versus module.*
+A module is a `.ko` file: an ELF object that the kernel links into itself at run time. `omap2plus_defconfig` builds about 860 of them, because one configuration serves many boards; a given BeagleBone Black uses a few dozen.
+
+**Loading and unloading:**
+
+| Command | Does |
+|---|---|
+| `modprobe g_ether` | Loads a module by name from `/lib/modules/$(uname -r)/`, after the modules it depends on (from `modules.dep`), with the options from `/etc/modprobe.d/*.conf`. Succeeds silently for a module that is built in (`modules.builtin`) |
+| `insmod /path/to/hello.ko` | Loads exactly one file. No dependencies, no options files; a missing dependency fails with `Unknown symbol` in `dmesg` |
+| `modprobe -r g_ether`, `rmmod g_ether` | Unloads (needs `CONFIG_MODULE_UNLOAD`, on here). `modprobe -r` also removes dependencies nobody uses any more |
+| `lsmod`, `cat /proc/modules` | Loaded modules and who uses them |
+| `modinfo g_ether` | File, license, description, `alias` lines, `depends`, `vermagic`, `parm` (parameters) |
+| `depmod -a` | Regenerates the index files after modules were added by hand |
+
+`modules_install` already ran `depmod` on the build machine (section 9), so a freshly installed system needs no `depmod` on the board. BusyBox has its own small `modprobe`, which reads the same `modules.dep`; the kmod tools add the binary indexes (`modules.dep.bin`, `modules.alias.bin`).
+
+**Automatic loading.** When the kernel creates a device whose driver isn't loaded, it sends an event to userspace with a `MODALIAS` string built from the device's identity: for a device tree node, its `compatible` (`of:N...T...Cti,am3352-uart`); for USB, vendor and product IDs. `udev` (or BusyBox `mdev` with the right configuration) runs `modprobe <modalias>`, and `modprobe` finds the module through `modules.alias`, generated from the `alias` lines that `modinfo` shows. At boot, `udev` replays the events of devices that appeared before it started ("coldplug"). Without a hotplug daemon, nothing loads on its own: the init scripts must `modprobe` what the board needs.
+
+**Parameters.** `modinfo -p` lists them. Set them:
+
+- when loading: `modprobe g_ether host_addr=02:00:00:00:00:01`;
+- permanently: `options g_ether host_addr=02:00:00:00:00:01` in `/etc/modprobe.d/g_ether.conf`;
+- on the kernel command line: `g_ether.host_addr=02:00:00:00:00:01`, which also works when the driver is built in;
+- at run time, for parameters that allow it: `/sys/module/<module>/parameters/`.
+
+**Built in or module?**
+
+| Build it in (`y`) | Build it as a module (`m`) |
+|---|---|
+| The console's UART driver, the storage and filesystem holding the root, anything needed before the root is mounted (unless an initramfs loads it) | Hardware that is optional or detected at run time: USB devices, capes, Wi-Fi |
+| Drivers that must be ready early (PMIC, clocks, pin control) | Drivers you're developing: reload without rebooting |
+| Small systems where every device is always present, to skip module handling entirely | Drivers that need firmware files from the root filesystem (`/lib/firmware`) at probe time |
+
+`CONFIG_MODULES=n` removes module support altogether: a smaller, simpler kernel for a fixed product, and one way to rule out loading foreign code.
 
 ## 15. Out-of-tree modules
 
-*Planned: a minimal Kbuild module, building against the kernel's build directory, Module.symvers, installing into updates/.*
+A module whose source lives outside the kernel tree (your own driver, a vendor driver) is built with the kernel's build system, against a configured and built kernel. The smallest one:
+
+```c
+// hello.c
+#include <linux/module.h>
+#include <linux/init.h>
+
+static int __init hello_init(void)
+{
+	pr_info("hello: loaded\n");
+	return 0;
+}
+
+static void __exit hello_exit(void)
+{
+	pr_info("hello: unloaded\n");
+}
+
+module_init(hello_init);
+module_exit(hello_exit);
+MODULE_LICENSE("GPL");
+MODULE_DESCRIPTION("Minimal out-of-tree module");
+```
+
+```make
+# Makefile
+obj-m := hello.o
+
+KDIR ?= $(HOME)/bbb/build
+
+all:
+	$(MAKE) -C $(KDIR) M=$(CURDIR) modules
+
+install:
+	$(MAKE) -C $(KDIR) M=$(CURDIR) INSTALL_MOD_PATH=$(HOME)/bbb/staging modules_install
+
+clean:
+	$(MAKE) -C $(KDIR) M=$(CURDIR) clean
+```
+
+```sh
+$ export ARCH=arm CROSS_COMPILE=arm-none-linux-gnueabihf-
+$ make
+$ modinfo -F vermagic hello.ko      # must match the kernel on the board (section 8)
+```
+
+- **`-C $(KDIR)`** points at the kernel's **build directory** (the `O=` directory, which contains a small `Makefile` that forwards to the source), and `M=` at the module's directory. The kernel's Makefiles do the work: same compiler flags, same configuration, same vermagic.
+- **The kernel must be built in that directory**, or at least prepared. `make O=$B modules_prepare` is enough to compile, but without the `Module.symvers` of a full build `modpost` can't check the symbols the module uses and warns about every one of them; the module may then fail to load with `Unknown symbol` or `disagrees about version of symbol`. Build against the tree that produced the running kernel.
+- **`modules_install` puts it in `/lib/modules/<release>/updates/`** (`INSTALL_MOD_DIR ?= updates` in `scripts/Makefile.modinst`) and runs `depmod`. Modules in `updates/` take priority over in-tree modules of the same name, which is how a vendor driver replaces the kernel's own. Set `INSTALL_MOD_DIR=extra` to keep them apart.
+- **Loading it taints the kernel**: `hello: loading out-of-tree module taints kernel.` (`kernel/module/main.c`), and later oopses show the taint flag `O`. It changes nothing functionally, but kernel developers will ask whether the problem happens without it.
+- A module that uses symbols exported by another out-of-tree module needs that module's `Module.symvers`: `KBUILD_EXTRA_SYMBOLS=/path/to/other/Module.symvers`.
+
+Buildroot (`kernel-module` package infrastructure) and Yocto (the `module` class) wrap exactly this command. Writing the driver itself is in [Linux kernel and device driver development](../../../linux-kernel-device-driver-development/).
 
 ## 16. Keeping your changes: patches, fragments and a board DTS
 
-*Planned: patches with Git, keeping configuration and device tree changes in your own repository, moving to a new release.*
+Everything you change in the kernel should live in your own repository as a small set of files you can apply to a new release:
+
+| Change | Keep it as | Applied by |
+|---|---|---|
+| Configuration | A fragment (`bbb.config`, section 5), or a full defconfig from `savedefconfig` | `merge_config.sh`; Buildroot and Yocto fragment variables |
+| Board device tree | Your `.dts` (section 12), plus its `Makefile` line as a patch | A patch, or a copy into `arch/arm/boot/dts/ti/omap/` before building |
+| Source code fixes, drivers | Git commits on a branch, exported with `git format-patch` | `git am`; Buildroot `BR2_LINUX_KERNEL_PATCH` or a global patch directory; Yocto `.patch` files in `SRC_URI` |
+| Out-of-tree modules | Their own repository (section 15) | The build system's module support |
+
+**A branch on top of a release tag** keeps the patches visible:
+
+```sh
+$ git switch -c bbb-7.1 v7.1                # your branch starts at the release
+$ ... edit, build, test ...
+$ git commit -s -m "ARM: dts: am335x: add myproduct board"
+$ git format-patch v7.1..bbb-7.1 -o patches/
+```
+
+**Moving to a new release:**
+
+```sh
+$ git rebase --onto v7.2 v7.1 bbb-7.2       # replay your commits on the new release (after branching bbb-7.2 from bbb-7.1)
+$ scripts/kconfig/merge_config.sh -O $B arch/arm/configs/omap2plus_defconfig bbb.config
+$ make O=$B listnewconfig                    # options new in this release, with their default values
+```
+
+Run `merge_config.sh` without `-m` and read the warnings that name your options: an option renamed or removed in the new release disappears silently otherwise (section 5). Compare the old and new `.config` with `scripts/diffconfig`, then build and boot.
+
+**The cheapest patch is the one that's upstream.** A fix or a device tree for a board sold to others can go to mainline: `scripts/checkpatch.pl` checks the style, `scripts/get_maintainer.pl` names the maintainers and mailing lists to send it to (`Documentation/process/submitting-patches.rst`). Every patch that gets merged is one less to rebase at each release.
 
 ## 17. Iterating fast
 
-*Planned: incremental builds, building one module, TFTP and NFS boot, copying modules to the board.*
+The slow part of kernel work is not compiling, it's getting the result onto the board. Ways to shorten the loop, from the biggest gain to the smallest:
+
+**Boot over the network.** With U-Boot loading the kernel and DTB over TFTP and the root filesystem on NFS (bootloader note, network boot), installing is copying files on the build machine:
+
+```sh
+$ cp $B/arch/arm/boot/zImage $B/arch/arm/boot/dts/ti/omap/am335x-boneblack.dtb /srv/tftp/
+$ sudo make ARCH=arm CROSS_COMPILE=arm-none-linux-gnueabihf- O=$B \
+      INSTALL_MOD_PATH=/srv/nfs/bbb modules_install
+```
+
+and pressing the reset button. No SD card goes back and forth. The kernel needs `CONFIG_ROOT_NFS=y` and `CONFIG_IP_PNP=y`, both in `omap2plus_defconfig`, and the Ethernet driver built in. With no Ethernet cable, the USB Ethernet gadget (`g_ether`, the configuration change of section 5) gives the board a network interface over the USB client port once Linux runs, enough for `scp` and `ssh`, though not for the bootloader's TFTP.
+
+**Reload a module instead of rebooting.** When the code under work is a module:
+
+```sh
+$ make O=$B drivers/usb/gadget/legacy/       # or `make` in an out-of-tree module
+$ scp $B/drivers/usb/gadget/legacy/g_ether.ko root@board:/tmp/
+# rmmod g_ether; insmod /tmp/g_ether.ko; dmesg | tail
+```
+
+`insmod` with a path loads the new file even if an older one is installed. Copy it into `/lib/modules/` once it works.
+
+**Keep the build directory.** Incremental builds only recompile what changed, so never `mrproper` between builds, and keep one `O=` directory per configuration. `ccache` helps after a `make clean` or when switching branches: `make CC="ccache ${CROSS_COMPILE}gcc" ...`, the same `CC=` on every call.
+
+**Build only what you need.** `make zImage` when only built-in code changed, `make dtbs` (or one `.dtb`) for a device tree change, one directory for a driver (section 6).
 
 ## 18. When the console stays silent
 

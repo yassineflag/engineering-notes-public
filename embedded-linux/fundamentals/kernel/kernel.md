@@ -461,23 +461,257 @@ and `modprobe` or `insmod` reports `Invalid module format`. The first is a relea
 
 ## 9. Installing the kernel, the DTB and the modules
 
-*Planned: the boot partition, modules_install with INSTALL_MOD_PATH, stripping, dtbs_install, headers_install.*
+The SD card layout is the one of the bootloader note: partition 1 is FAT (with `MLO`, `u-boot.img` and the boot files), partition 2 is the ext4 root filesystem. The kernel and DTB go on partition 1 next to `extlinux/extlinux.conf`, the modules go on partition 2.
+
+```sh
+$ B=~/bbb/build
+$ sudo mount /dev/sdX1 /mnt/boot
+$ sudo mount /dev/sdX2 /mnt/rootfs
+
+# kernel and device tree, keeping the previous ones as a fallback
+$ sudo cp /mnt/boot/zImage /mnt/boot/zImage.old
+$ sudo cp /mnt/boot/am335x-boneblack.dtb /mnt/boot/am335x-boneblack.dtb.old
+$ sudo cp $B/arch/arm/boot/zImage /mnt/boot/
+$ sudo cp $B/arch/arm/boot/dts/ti/omap/am335x-boneblack.dtb /mnt/boot/
+
+# modules: install into a staging directory as a normal user, then copy
+$ make O=$B INSTALL_MOD_PATH=$HOME/bbb/staging INSTALL_MOD_STRIP=1 modules_install
+$ sudo cp -a $HOME/bbb/staging/lib/modules /mnt/rootfs/lib/
+
+$ sudo umount /mnt/boot /mnt/rootfs
+```
+
+- **`modules_install` copies every `.ko` into `<INSTALL_MOD_PATH>/lib/modules/<release>/kernel/`**, keeping the source tree's layout, copies `modules.order` and `modules.builtin`, then runs the build machine's `depmod` to generate `modules.dep`, `modules.alias` and the other index files (section 14). Without `INSTALL_MOD_PATH` it installs into the build machine's own `/lib/modules`, which is never what you want for a cross build.
+- **Don't run `sudo make` without the variables.** `sudo` resets the environment, so the exported `ARCH` and `CROSS_COMPILE` disappear and `make` sees an x86 build. Either install as a normal user into a staging directory as above, or put the variables on the command line: `sudo make ARCH=arm CROSS_COMPILE=arm-none-linux-gnueabihf- O=$B ...`.
+- **`INSTALL_MOD_STRIP=1`** strips debug symbols from the installed copies. With debug information enabled, it divides the size of `/lib/modules` several times over. The unstripped `.ko` files stay in the build directory for debugging.
+- **Install the modules every time you install a kernel**, even when you only changed one driver: a new release string (section 8) means a new module directory, and the old one doesn't load.
+- The `build` symbolic link in `/lib/modules/<release>/` points to the build directory on the build machine. On the board it dangles; it's harmless, and it's what lets a native build of out-of-tree modules find the kernel (section 15).
+
+The `extlinux.conf` from the bootloader note boots these files, with the previous kernel as a second menu entry:
+
+```
+label current
+    kernel /zImage
+    fdt /am335x-boneblack.dtb
+    append console=ttyS0,115200n8 root=/dev/mmcblk0p2 rw rootfstype=ext4 rootwait
+
+label previous
+    kernel /zImage.old
+    fdt /am335x-boneblack.dtb.old
+    append console=ttyS0,115200n8 root=/dev/mmcblk0p2 rw rootfstype=ext4 rootwait
+```
+
+**Other install targets:**
+
+| Command | Installs | Use |
+|---|---|---|
+| `make dtbs_install INSTALL_DTBS_PATH=/mnt/rootfs/boot/dtbs/<release>` | Every DTB built, in their `ti/omap/` subdirectories | Distribution-style layouts. Name the DTB with its subdirectory in `extlinux.conf` (`fdt /boot/dtbs/<release>/ti/omap/am335x-boneblack.dtb`); `fdtdir` doesn't look into subdirectories (bootloader note) |
+| `make headers_install INSTALL_HDR_PATH=<sysroot>/usr` | The UAPI headers (`linux/*.h`, `asm/*.h`) | Building a toolchain or a sysroot. The rule from the [toolchain note](../cross-compilation-toolchain/cross-compilation-toolchain.md): the headers must be no newer than the oldest kernel the programs run on |
+| `make zinstall INSTALL_PATH=...` | `zImage`, `System.map` and `.config` with the release in their names | Runs `installkernel` if found; rarely useful for a board |
 
 ## 10. The kernel command line
 
-*Planned: bootargs and /chosen, CONFIG_CMDLINE and the omap2plus ttyO2 trap, the parameters that matter, unknown parameters passed to init.*
+The command line is a string of space-separated parameters that configures the kernel at boot, and part of it is passed on to `init`. On a device tree system it travels in the DTB.
+
+**Where it comes from**, from source (`drivers/of/fdt.c`, `arch/arm/Kconfig`):
+
+| Source | When it's used |
+|---|---|
+| U-Boot's `bootargs` variable | U-Boot writes it into `/chosen/bootargs` of the DTB it passes, replacing what the DTB had (bootloader note) |
+| `/chosen/bootargs` in the `.dts` | When the bootloader doesn't set it |
+| `CONFIG_CMDLINE` | With the default `CONFIG_CMDLINE_FROM_BOOTLOADER`: only when the two above give an empty string. `CONFIG_CMDLINE_EXTEND` appends it, `CONFIG_CMDLINE_FORCE` replaces whatever the bootloader passed |
+
+**The trap in `omap2plus_defconfig`.** Its `CONFIG_CMDLINE` is `root=/dev/mmcblk0p2 rootwait console=ttyO2,115200`. It was written for another OMAP board: on a BeagleBone Black, UART2 isn't the console. If U-Boot boots the kernel without setting `bootargs` (a hand-typed `bootz` after `env default -a`, for example), the kernel uses this string, sends its console to UART2, and J1 stays silent after `Starting kernel ...`. The device tree's `stdout-path` doesn't help: a `console=` on the command line takes priority over it. Always set `bootargs` (or `append` in `extlinux.conf`), or set your own `CONFIG_CMDLINE` in a fragment.
+
+**The parameters that matter on this board** (all in `Documentation/admin-guide/kernel-parameters.txt`):
+
+| Parameter | Effect |
+|---|---|
+| `console=ttyS0,115200n8` | Kernel messages and `/dev/console` on UART0, the J1 header. Several `console=` are allowed; the last one becomes `/dev/console`. Use `ttyS0`, not the old `ttyO0` (bootloader note) |
+| `earlycon=uart8250,mmio32,0x44e09000,115200n8` | Messages from the first milliseconds, before the real console driver (section 18) |
+| `root=/dev/mmcblk0p2` or `root=PARTUUID=<uuid>` | The root filesystem. `mmcblk0` is the SD card, `mmcblk1` the eMMC (section 12); the partition UUID doesn't depend on the numbering |
+| `rootfstype=ext4` | Skips trying every filesystem type |
+| `rootwait`, `rootwait=<seconds>` | Waits for the root device to appear instead of failing at once. Needed for SD cards and USB, which are detected asynchronously |
+| `ro` / `rw` | Mounts the root read-only (the default; `init` scripts remount it after `fsck`) or read-write |
+| `init=/sbin/init` | The first program (section 13). `init=/bin/sh` gives a shell with no init scripts, for repairs |
+| `rdinit=/init` | The first program in an initramfs |
+| `loglevel=<n>`, `quiet`, `ignore_loglevel` | Which messages reach the console. `quiet` is `loglevel=4`; `ignore_loglevel` prints everything, for debugging |
+| `panic=10` | Reboots 10 seconds after a panic instead of hanging. Pairs with the boot counter of the bootloader note |
+| `ip=...`, `nfsroot=...`, `root=/dev/nfs` | NFS root (bootloader note, network boot) |
+| `<module>.<parameter>=<value>` | A module parameter, for built-in drivers and modules loaded later (section 14) |
+| `initcall_debug` | Logs every initcall and its duration (section 21) |
+
+**What the kernel doesn't recognize goes to `init`.** From source (`init/main.c`): parameters without `=` that the kernel doesn't know become arguments of `init`, those with `=` become its environment variables, and the kernel logs `Unknown kernel command line parameters "...", will be passed to user space.` (`single` for a single-user boot works this way.) A misspelled kernel parameter ends up there too, so read that line when an option seems ignored.
+
+On the board, the line the kernel actually used is in `/proc/cmdline`.
 
 ## 11. The boot, stage by stage, and its log
 
-*Planned: the silent decompressor, start_kernel, the console, driver probing, mounting root and starting init, with the expected messages.*
+What follows is the console of a BeagleBone Black booting this kernel from the SD card. **Expected**: built from the format strings in the source, with `...` for values that depend on the build and the board, and only the lines worth knowing. Timestamps come from `CONFIG_PRINTK_TIME=y`, in seconds since the kernel started.
+
+```
+Starting kernel ...
+
+[    0.000000] Booting Linux on physical CPU 0x0
+[    0.000000] Linux version 7.1.0-rc1-g66edb901bf87 (me@build) (arm-none-linux-gnueabihf-gcc (Arm GNU Toolchain 15.2.Rel1 ...) 15.2.1 ..., ...) #1 SMP ...
+[    0.000000] CPU: ARMv7 Processor [...] revision ... (ARMv7), cr=...
+[    0.000000] OF: fdt: Machine model: TI AM335x BeagleBone Black
+...
+[    0.000000] Kernel command line: console=ttyS0,115200n8 root=/dev/mmcblk0p2 rw rootfstype=ext4 rootwait
+...
+[    0.000000] Memory: ...K/524288K available (...K kernel code, ...K rwdata, ...K rodata, ...K init, ...K bss, ...K reserved, ...K cma-reserved, ...K highmem)
+...
+[    ...] 44e09000.serial: ttyS0 at MMIO 0x44e09000 (irq = ..., base_baud = 3000000) is a 8250
+[    ...] printk: legacy console [ttyS0] enabled
+...
+[    ...] mmc0: new high speed SDHC card at address ...
+[    ...] mmcblk0: mmc0:... ... GiB
+[    ...]  mmcblk0: p1 p2
+...
+[    ...] Waiting for root device /dev/mmcblk0p2...
+[    ...] EXT4-fs (mmcblk0p2): mounted filesystem ... r/w with ordered data mode. ...
+[    ...] VFS: Mounted root (ext4 filesystem) on device 179:2.
+[    ...] devtmpfs: mounted
+[    ...] VFS: Pivoted into new rootfs
+[    ...] Freeing unused kernel image (initmem) memory: ...K
+[    ...] Run /sbin/init as init process
+```
+
+Reading it stage by stage:
+
+1. **Between `Starting kernel ...` and the first line, nothing.** The decompressor can print `Uncompressing Linux... done, booting the kernel.` (`arch/arm/boot/compressed/misc.c`), but only with `CONFIG_DEBUG_UNCOMPRESS`, which depends on `!ARCH_MULTIPLATFORM` (`arch/arm/Kconfig.debug`). `omap2plus_defconfig` builds a multi-platform kernel, so this kernel's decompressor is silent. The first lines are printed into a memory buffer and only appear once a console exists; the gap before them is normal.
+2. **`setup_arch()` reads the DTB.** `Machine model:` is the `model` property of the root node (section 12). `Kernel command line:` is the final command line of section 10: check it first when something behaves differently from what `bootargs` says.
+3. **`Memory:`** reports the RAM the kernel manages: `524288K` is the 512 MiB from the DTB's memory node (U-Boot fixes it to the real size). With `CONFIG_HIGHMEM` and the 3 GB/1 GB split of `CONFIG_VMSPLIT_3G`, the part above the kernel's direct mapping is reported as highmem.
+4. **The console comes up** when the 8250 driver probes UART0: `ttyS0 at MMIO 0x44e09000` is UART0's address, and `base_baud = 3000000` is its 48 MHz clock divided by 16. `printk: legacy console [ttyS0] enabled` (`kernel/printk/internal.h`; `legacy` marks a console driver not yet converted to the newer `nbcon` interface) is the moment everything buffered so far is printed. Before this line, only `earlycon` can show anything (section 18).
+5. **Drivers probe** as their initcalls run, in an order that isn't guaranteed. The SD card appears as `mmcblk0`, with its partitions listed.
+6. **The root filesystem.** `Waiting for root device` appears when `rootwait` is set and the card isn't detected yet (`init/do_mounts.c`). `179:2` is the device number: major 179 is MMC, minor 2 the second partition of the first card. Then devtmpfs is mounted on `/dev`, and the kernel moves the mounted root to `/` (`VFS: Pivoted into new rootfs`, in this tree's `prepare_namespace()`).
+7. **`Freeing unused kernel image (initmem) memory`**: code and data used only during boot are released. Then `Run /sbin/init as init process` (`init/main.c`): the kernel's boot is over, and the next lines come from `init`.
+
+Everything printed since power-on is still in the kernel's log buffer once the system is up: `dmesg` on the board shows it, including the lines printed before the console existed.
 
 ## 12. The device tree from the kernel's side
 
-*Planned: machine matching, driver matching by compatible, status and aliases, /proc/device-tree, a board DTS that includes the BeagleBone Black's.*
+The bootloader note looked at the DTB as a file that U-Boot loads and edits. The kernel reads it as the list of hardware that exists on the board.
+
+**What the DTB in use says**, inspected on the build machine (**Real output**, on the `am335x-boneblack.dtb` of the earlier build):
+
+```
+$ fdtget -t s am335x-boneblack.dtb / model
+TI AM335x BeagleBone Black
+$ fdtget -t s am335x-boneblack.dtb / compatible
+ti,am335x-bone-black ti,am335x-bone ti,am33xx
+$ fdtget -t s am335x-boneblack.dtb /chosen stdout-path
+serial0:115200n8
+$ fdtget -t s am335x-boneblack.dtb /aliases serial0
+/ocp/interconnect@44c00000/segment@200000/target-module@9000/serial@0
+$ fdtget -t x am335x-boneblack.dtb /memory@80000000 reg
+80000000 20000000
+```
+
+**How the kernel uses it**, from source:
+
+- **The machine.** The root `compatible` list goes from the most specific to the most generic. The kernel looks for a machine description that matches any entry: `arch/arm/mach-omap2/board-generic.c` declares `DT_MACHINE_START(AM33XX_DT, "Generic AM33XX (Flattened Device Tree)")` for `ti,am33xx`. There is no BeagleBone-specific C code: the board is entirely described by the tree.
+- **The drivers.** Each node with a `compatible` property becomes a device, and a driver binds to it when its `of_match_table` lists the same string. Three examples on this board:
+
+  | Node | `compatible` | Driver |
+  |---|---|---|
+  | UART0 | `ti,am3352-uart` | `drivers/tty/serial/8250/8250_omap.c` |
+  | SD card controller (MMC0) | `ti,am335-sdhci` | `drivers/mmc/host/sdhci-omap.c` |
+  | Ethernet switch | `ti,am335x-cpsw-switch`, `ti,cpsw-switch` | `drivers/net/ethernet/ti/cpsw_new.c` |
+
+  When a device doesn't work, `grep -r '"<compatible>"' drivers/` finds the driver, and its Kconfig symbol tells you what to enable (section 5).
+- **`status`.** A node with `status = "disabled"` gets no device. SoC `.dtsi` files disable most peripherals, and the board `.dts` enables the ones wired on the board with `status = "okay"`.
+- **`aliases` fix the numbering.** `serial0 = &uart0` makes UART0 `ttyS0`. In `am33xx.dtsi`, `mmc0 = &mmc1` and `mmc1 = &mmc2` make the SD card slot (the SoC's first controller) `mmcblk0` and the eMMC `mmcblk1`, whatever order they probe in. `ethernet0` names the first Ethernet port.
+- **`/chosen`.** `bootargs` is the command line (section 10); `stdout-path` names the console when the command line has no `console=`.
+
+On the board, the tree the kernel actually received, after U-Boot's changes, is visible as files:
+
+```sh
+# cat /proc/device-tree/model; echo
+# ls /proc/device-tree/chosen/
+# dtc -I fs -O dts /sys/firmware/devicetree/base > running.dts    # needs dtc on the board
+```
+
+**A device tree for your own board.** A product based on the BeagleBone Black, or a cape that is always fitted, gets its own `.dts` that includes the board's and changes it. For example, an SSD1306 OLED display on I2C2 (the bus on header pins P9_19 and P9_20):
+
+```dts
+// arch/arm/boot/dts/ti/omap/am335x-boneblack-myproduct.dts
+/dts-v1/;
+#include "am335x-boneblack.dts"
+
+/ {
+	model = "My product (BeagleBone Black)";
+};
+
+&i2c2 {
+	oled@3c {
+		compatible = "solomon,ssd1306fb-i2c";
+		reg = <0x3c>;
+	};
+};
+```
+
+Then add it to `arch/arm/boot/dts/ti/omap/Makefile`, next to the BeagleBone Black's lines:
+
+```make
+dtb-$(CONFIG_SOC_AM33XX) += am335x-boneblack-myproduct.dtb
+DTC_FLAGS_am335x-boneblack-myproduct += -@
+```
+
+and build it alone with `make O=$B ti/omap/am335x-boneblack-myproduct.dtb`. `-@` keeps the label symbols, so overlays can still be applied on top (bootloader note). I2C2 is already enabled in `am335x-bone-common.dtsi` (it carries the cape EEPROMs), so only the child node is new; for a peripheral on other pins, the pin multiplexing (`pinctrl-0`, `AM33XX_PADCONF`) has to be added too. The display also needs its driver enabled in the configuration, which is the "three things must agree" of section 1. `make dtbs_check` validates trees against the binding schemas in `Documentation/devicetree/bindings/` (it needs the `dtschema` Python package).
 
 ## 13. Root filesystem, initramfs and init
 
-*Planned: root=, rootwait, NFS, the built-in initramfs, rdinit and init, the init search order, devtmpfs and /dev/console.*
+**The order**, from source (`init/main.c`, `init/initramfs.c`, `init/do_mounts.c`):
+
+1. The kernel always starts with a RAM filesystem as `/` (rootfs) and unpacks an initramfs into it: the one built into the kernel, then the one the bootloader passed, if any. When nothing was configured, the built-in one is the default list in `usr/default_cpio_list`:
+
+   ```
+   dir /dev 0755 0 0
+   nod /dev/console 0600 0 0 c 5 1
+   dir /root 0700 0 0
+   ```
+
+2. It opens `/dev/console` there as standard input, output and error for the first process. Without it: `Warning: unable to open an initial console.`
+3. **If `/init` exists in that RAM filesystem** (or the program named by `rdinit=`), the kernel runs it and is done. Mounting the real root filesystem is then the initramfs's job (`switch_root`).
+4. **Otherwise it mounts the root itself** (`prepare_namespace()`): waits `rootdelay=` seconds if given, waits for drivers to finish probing, parses `root=`, waits for the device with `rootwait`, mounts it, mounts devtmpfs on its `/dev`, and makes it `/`.
+5. **It runs the first program**: `init=` if given (a failure panics with `Requested init /sbin/xyz failed (error -2).`), else `CONFIG_DEFAULT_INIT` if set, else the first of `/sbin/init`, `/etc/init`, `/bin/init`, `/bin/sh` that starts. If none does: `Kernel panic - not syncing: No working init found.  Try passing init= option to kernel. See Linux Documentation/admin-guide/init.rst for guidance.`
+
+**What the kernel needs from the root filesystem**, which is the boundary with the [rootfs note](../rootfs/):
+
+- The **filesystem driver built in** (`CONFIG_EXT4_FS=y` here), and the **storage driver built in** (`CONFIG_MMC_SDHCI_OMAP=y`). A module can't be loaded from a filesystem that isn't mounted yet; only an initramfs can load storage drivers as modules.
+- An **empty `/dev` directory**, where the kernel mounts devtmpfs (`CONFIG_DEVTMPFS_MOUNT=y`). Without it, `devtmpfs: error mounting -2` (`drivers/base/devtmpfs.c`; `-2` is `ENOENT`), and `init` starts with an empty `/dev`.
+- An **`init` that can run on this CPU**: an ARM binary, and, if dynamically linked, the right dynamic loader and C library. When the loader is missing, `exec` fails with `ENOENT` (error -2) even though `/sbin/init` exists; the [toolchain note](../cross-compilation-toolchain/cross-compilation-toolchain.md) explains why.
+- **`/proc` and `/sys` directories**, which `init` scripts mount.
+
+**When the root can't be mounted**, from source (`init/do_mounts.c`), the kernel prints `VFS: Cannot open root device "..." or unknown-block(...): error ...`, then `Please append a correct "root=" boot option; here are the available partitions:` followed by the block devices it knows, then panics with `VFS: Unable to mount root fs on ...`. That list is the most useful line of the log: if `mmcblk0p2` isn't in it, the storage driver or the device tree is the problem; if it is, check `root=` and `rootfstype=`. An unparsable `root=` with `rootwait` prints `Disabling rootwait; root= is invalid.` instead of waiting forever.
+
+**An initramfs** is a cpio archive of a small root filesystem. Two ways to use one:
+
+| | Built into the kernel | Loaded by the bootloader |
+|---|---|---|
+| How | `CONFIG_INITRAMFS_SOURCE` names a directory or a file list; the build packs it into `vmlinux` | A separate file; U-Boot loads it and passes its address in `/chosen` (`bootz <kernel> <initrd> <fdt>`) |
+| Updating it | Rebuild the kernel | Replace the file |
+| Typical use | Small systems that run entirely from RAM; recovery images | Distribution-style early boot (decrypt, assemble RAID, then `switch_root`) |
+
+An example from the earlier BeagleBone work: an initramfs wrapped as a legacy U-Boot image (**Real output**):
+
+```
+$ mkimage -l initramfs
+Image Name:   Root Filesystem
+Created:      Sun Jun 14 19:50:37 2026
+Image Type:   ARM Linux RAMDisk Image (uncompressed)
+Data Size:    3098001 Bytes = 3025.39 KiB = 2.95 MiB
+Load Address: 80800000
+Entry Point:  80800000
+$ dd if=initramfs bs=64 skip=1 2>/dev/null | file -
+/dev/stdin: gzip compressed data, from Unix
+$ dd if=initramfs bs=64 skip=1 2>/dev/null | zcat | cpio -tv 2>/dev/null | grep -E ' (init|sbin/init)( |$)'
+lrwxrwxrwx   1 ...       10 May 12  2026 init -> /sbin/init
+lrwxrwxrwx   1 ...       19 May 12  2026 sbin/init -> /sbin/init.sysvinit
+```
+
+The payload after the 64-byte header is a gzip-compressed cpio archive of 849 entries ("RAMDisk Image (uncompressed)" describes the U-Boot wrapper, not the content; the kernel decompresses gzip itself with `CONFIG_RD_GZIP=y`). It contains `/init`, so the kernel runs it (step 3) and ignores `root=`: that init, SysV init here, runs from RAM. With a legacy image U-Boot knows the size from the header (`bootz ${kernel_addr_r} ${ramdisk_addr_r} ${fdt_addr_r}`); a raw cpio file needs `${ramdisk_addr_r}:${filesize}`.
 
 ## 14. Modules on the target
 

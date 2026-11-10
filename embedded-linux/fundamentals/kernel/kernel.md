@@ -828,7 +828,8 @@ $ git format-patch v7.1..bbb-7.1 -o patches/
 **Moving to a new release:**
 
 ```sh
-$ git rebase --onto v7.2 v7.1 bbb-7.2       # replay your commits on the new release (after branching bbb-7.2 from bbb-7.1)
+$ git branch bbb-7.2 bbb-7.1                # keep the old branch as it is
+$ git rebase --onto v7.2 v7.1 bbb-7.2       # replay your commits on the new release
 $ scripts/kconfig/merge_config.sh -O $B arch/arm/configs/omap2plus_defconfig bbb.config
 $ make O=$B listnewconfig                    # options new in this release, with their default values
 ```
@@ -867,27 +868,216 @@ $ scp $B/drivers/usb/gadget/legacy/g_ether.ko root@board:/tmp/
 
 ## 18. When the console stays silent
 
-*Planned: earlycon for the AM335x, keep_bootcon, DEBUG_LL, reading the log buffer after a reset.*
+`Starting kernel ...` followed by nothing is the most common kernel boot failure, and the one with the least information. Work through it in this order:
+
+1. **Check the command line.** `printenv bootargs` at the U-Boot prompt, or the `append` line of `extlinux.conf`: `console=ttyS0,115200n8` must be there, spelled right, and not the literal text `console=${console}` (bootloader note). No `bootargs` at all means `CONFIG_CMDLINE` and its `ttyO2` (section 10).
+2. **Check the files.** The right `zImage` (`md.l ${kernel_addr_r} 10` in U-Boot: word 9 is `016f2818`), the BeagleBone Black's DTB and not another board's, loads that didn't overlap. A kernel built for the wrong family also hangs here: one with `CONFIG_ARM_LPAE=y` (the `multi_v7_lpae` configurations) can't run on a Cortex-A8, which has no LPAE.
+3. **Add `earlycon`** to the command line:
+
+   ```
+   earlycon=uart8250,mmio32,0x44e09000,115200n8
+   ```
+
+   The early console writes to UART0's registers directly, from very early in `start_kernel()`, long before the 8250 driver probes. `omap2plus_defconfig` has the support (`CONFIG_SERIAL_EARLYCON=y`, `CONFIG_SERIAL_8250_CONSOLE=y`). A bare `earlycon`, which takes the UART from `stdout-path`, doesn't work on this SoC: the AM335x UART's `ti,am3352-uart` isn't in any early console's match list (the bootloader note's troubleshooting section has the details). If messages now appear and stop at some point, the last lines name the problem.
+4. **Add `keep_bootcon`** if the output stops exactly when the real console takes over (`printk: legacy console [ttyS0] enabled`): the early console stays active, so messages keep coming even if the real driver is broken. Remove it afterwards: everything is printed twice.
+5. **Add `ignore_loglevel`** (and remove `quiet`) to see every message.
+6. **Low-level debug output** when even `earlycon` shows nothing, meaning the kernel dies before parsing its command line: enable `CONFIG_DEBUG_LL`, choose "Kernel low-level debugging messages via AM33XX UART1" (`CONFIG_DEBUG_AM33XXUART1`: TI numbers the UARTs from 1, so UART1 is the board's UART0 at `0x44e09000`), and add `earlyprintk` to the command line. The kernel then writes to that UART from its first instructions, but runs only on this SoC: never ship it.
+
+When the board hangs instead of rebooting, the log is still in RAM. A warm reset (the reset button, not a power cycle) keeps DDR contents, and pstore (section 19) is the clean way to get it back.
 
 ## 19. Reading an oops and a panic
 
-*Planned: the parts of an oops, decode_stacktrace.sh and faddr2line, panic=, pstore and ramoops.*
+An **oops** is the kernel reporting a fault in its own code: an invalid memory access, a `BUG()`, an undefined instruction. The faulting task is killed and the kernel continues, marked as tainted. A **panic** stops the system: an oops in an interrupt handler or in `init`, an oops with `panic_on_oops=1`, or a fatal condition such as `No working init found`. With `panic=10`, the board reboots 10 seconds later instead of hanging.
+
+An oops on 32-bit Arm, from the format in `arch/arm/mm/fault.c` and `arch/arm/kernel/traps.c` (**Illustrative**: a NULL pointer write in the out-of-tree module of section 15):
+
+```
+8<--- cut here ---
+Unable to handle kernel NULL pointer dereference at virtual address 00000000 when write
+[00000000] *pgd=00000000
+Internal error: Oops: 805 [#1] SMP ARM
+Modules linked in: hello(O+) g_ether usb_f_rndis u_ether libcomposite
+CPU: 0 UID: 0 PID: 245 Comm: insmod Tainted: G           O        7.1.0-rc1-g66edb901bf87 #1
+Hardware name: Generic AM33XX (Flattened Device Tree)
+PC is at hello_init+0x14/0x1000 [hello]
+LR is at do_one_initcall+0x...
+pc : [<bf0a0014>]    lr : [<c0101e2c>]    psr: 60000013
+...
+Call trace:
+ hello_init [hello] from do_one_initcall+0x...
+ do_one_initcall from do_init_module+0x...
+ ...
+Code: e3a03000 e3a02001 ... (e5832000)
+```
+
+What each part tells you:
+
+| Line | Meaning |
+|---|---|
+| `Unable to handle kernel NULL pointer dereference at virtual address 00000000 when write` | The cause and the faulting address. A small address means a NULL pointer plus a structure offset |
+| `Oops: 805 [#1]` | The fault status code, and the number of oopses since boot. Only `#1` is reliable: later ones may be consequences |
+| `Modules linked in:` | Loaded modules, with their taint flags: `O` out-of-tree, `E` unsigned, `+` being loaded |
+| `Tainted: G O` | `G`: only GPL modules; `O`: an out-of-tree module is loaded. The release string follows |
+| `Hardware name:` | The machine description matched in section 12 |
+| `PC is at hello_init+0x14/0x1000 [hello]` | Where it happened: function, offset into it, function size, module |
+| `LR is at` | The return address: usually the caller |
+| `Call trace:` | The chain of callers |
+| `Code:` | The instruction bytes around the PC; the one in parentheses faulted |
+
+**Turning addresses into source lines** needs the `vmlinux` and the unstripped modules of that exact build, with debug information (`CONFIG_DEBUG_INFO`; without it you only get function names). On the build machine:
+
+```sh
+$ scripts/decode_stacktrace.sh $B/vmlinux $B < oops.txt
+$ scripts/faddr2line $B/vmlinux do_one_initcall+0x5c/0x2a0
+$ scripts/faddr2line hello.ko hello_init+0x14/0x1000
+$ ${CROSS_COMPILE}objdump -dS hello.ko | less          # source mixed with the assembly
+```
+
+`decode_stacktrace.sh` rewrites every `function+offset` of the oops as `file:line`; the second argument is where to find the modules. **Keep the `vmlinux` and the unstripped modules of every kernel you ship**, next to its release string: an oops from the field can only be decoded with the exact files that built it.
+
+**Getting the oops back after the reboot: pstore.** On a board in the field, nobody watches the console. `CONFIG_PSTORE` and `CONFIG_PSTORE_RAM` (not in `omap2plus_defconfig`; the fragment of section 5 adds them) make the kernel write its log into a RAM area that a warm reset preserves (a watchdog reset or `panic=`, not a power cut). The area is declared in the device tree:
+
+```dts
+/ {
+	reserved-memory {
+		#address-cells = <1>;
+		#size-cells = <1>;
+		ranges;
+
+		ramoops@9c000000 {
+			compatible = "ramoops";
+			reg = <0x9c000000 0x100000>;     /* 1 MiB at RAM + 448 MiB */
+			record-size = <0x20000>;
+			console-size = <0x20000>;
+		};
+	};
+};
+```
+
+(If the board's tree already has a `reserved-memory` node, add the `ramoops` child to it.) Choose an address that U-Boot doesn't use: it relocates itself to the top of RAM (`bdinfo` shows where), and copies the DTB below `0x90000000` (bootloader note). After the next boot:
+
+```sh
+# mount -t pstore pstore /sys/fs/pstore     # often mounted by systemd already
+# ls /sys/fs/pstore/
+# cat /sys/fs/pstore/dmesg-ramoops-0
+```
+
+Test it once with `echo c > /proc/sysrq-trigger`, which crashes the kernel on purpose.
 
 ## 20. Looking inside a running kernel
 
-*Planned: dmesg and log levels, sysfs and bound drivers, deferred probe, debugfs, dynamic debug, ftrace, magic SysRq.*
+| Question | Where to look |
+|---|---|
+| What did the kernel say? | `dmesg` (`-w` to follow, `-l err,warn` to filter, `-T` for wall-clock times). Levels go from 0 (`emerg`) to 7 (`debug`); `/proc/sys/kernel/printk` sets which reach the console |
+| Is this driver built in, a module, or absent? | `zcat /proc/config.gz \| grep FOO` (section 5); `lsmod`; `/lib/modules/$(uname -r)/modules.builtin` |
+| Which driver handles this device? | `ls -l /sys/bus/platform/devices/<device>/driver`; `/sys/bus/platform/drivers/<driver>/` lists the bound devices |
+| Why didn't this device probe? | `cat /sys/kernel/debug/devices_deferred`: devices waiting for a resource (a clock, a regulator, a GPIO), with the reason |
+| Which interrupts fire, which addresses are mapped? | `/proc/interrupts`, `/proc/iomem` |
+| What does the device tree say now? | `/proc/device-tree/` (section 12) |
+
+**debugfs** holds most debugging interfaces. `omap2plus_defconfig` builds it in (`CONFIG_DEBUG_FS=y`); mount it with `mount -t debugfs none /sys/kernel/debug`. Besides `devices_deferred`, it has the clock tree (`clk/clk_summary`), regulators, GPIOs (`gpio`), pin multiplexing (`pinctrl/`) and many driver-specific files.
+
+**Dynamic debug** turns on a driver's `pr_debug()` and `dev_dbg()` messages at run time, without rebuilding. It needs `CONFIG_DYNAMIC_DEBUG` (not in `omap2plus_defconfig`; in the fragment of section 5):
+
+```sh
+# echo 'module g_ether +p' > /sys/kernel/debug/dynamic_debug/control     # one module
+# echo 'file drivers/mmc/core/* +p' > /sys/kernel/debug/dynamic_debug/control
+```
+
+For a driver that's built in or loaded at boot, put it on the command line instead: `dyndbg="module sdhci_omap +p"`, or `<module>.dyndbg=+p`.
+
+**ftrace** traces kernel functions and events, from `/sys/kernel/tracing`. `omap2plus_defconfig` enables the framework (`CONFIG_FTRACE=y`) but not the function tracer; add `CONFIG_FUNCTION_TRACER=y` to trace functions. Events need no extra option once tracing is built:
+
+```sh
+# cd /sys/kernel/tracing
+# echo 1 > events/irq/irq_handler_entry/enable
+# cat trace_pipe
+```
+
+**Magic SysRq** (`CONFIG_MAGIC_SYSRQ=y` here) talks to the kernel even when userspace is stuck. On the serial console, send a BREAK followed by a letter (in picocom: `Ctrl-A` `Ctrl-\` sends the break); from a shell, `echo <letter> > /proc/sysrq-trigger`. Useful letters: `t` (dump all tasks), `w` (blocked tasks), `m` (memory), `s` (sync), `b` (reboot now), `c` (crash, to test pstore).
+
+**KGDB** debugs the kernel itself with GDB over the serial line (`kgdboc=ttyS0,115200 kgdbwait`). It's powerful but out of scope here; `Documentation/process/debugging/kgdb.rst` describes it.
 
 ## 21. Size and boot time
 
-*Planned: where the size goes, trimming the configuration, compression, initcall_debug and asynchronous probing.*
+**Where the size goes.** `omap2plus_defconfig` serves a dozen SoC families and hundreds of boards, so most of what it builds never runs on a BeagleBone Black:
+
+```sh
+$ ${CROSS_COMPILE}size $B/vmlinux                         # text, data, bss of the kernel
+$ ls -l $B/arch/arm/boot/zImage
+$ scripts/bloat-o-meter old/vmlinux $B/vmlinux            # which functions grew or shrank
+```
+
+Ways to cut, from the safest:
+
+1. **Remove other SoCs.** Turn off `ARCH_OMAP3`, `ARCH_OMAP4`, `SOC_OMAP5`, `SOC_AM43XX`, `SOC_DRA7XX` and keep `SOC_AM33XX`. Their drivers and support code disappear with them.
+2. **Drop the modules the board never loads.** `localmodconfig` turns off every module that isn't loaded on a running system: run `lsmod > lsmod.txt` on the board with all its hardware in use, then `make O=$B LSMOD=lsmod.txt localmodconfig` on the build machine. Anything plugged in later (a cape, a USB device) must have been in use when `lsmod` ran, or be added back in the fragment.
+3. **Remove whole subsystems** the product doesn't have: sound, graphics, Bluetooth, wireless, filesystems you never mount.
+4. **Start from `tinyconfig`** and add what you need, for the smallest result. It's the most work, and every missing option is a debugging session.
+
+Keep the result as a defconfig or a fragment (section 16), and remember that each removed option is one more difference from the configuration everyone else tests.
+
+**Boot time.** Measure before changing anything:
+
+- The timestamps of the kernel log (section 11) give the kernel's share; the bootloader note covers the time before `Starting kernel ...`.
+- `initcall_debug` on the command line logs every initcall with its duration. `dmesg > boot.log` on the board, then `perl scripts/bootgraph.pl < boot.log > boot.svg` on the build machine draws them.
+
+Common gains:
+
+| Cause | Fix |
+|---|---|
+| **The serial console itself.** At 115200 baud, the UART sends about 11,500 characters per second. A boot log of 30 KB takes over two seconds to print, and the console slows the boot while it does | `quiet` (or `loglevel=3`): messages still go to the log buffer and `dmesg`, not to the UART |
+| Waiting for the root device | Fine as is for SD cards; with the root on eMMC, check how long `Waiting for root device` lasts |
+| A driver probing slowly or retrying (deferred probe) | `initcall_debug`; build in what the boot needs, make the rest modules |
+| Drivers for hardware the board doesn't have | The size cuts above |
+| Probing devices one after the other | Asynchronous probing for drivers that support it: `driver_async_probe=<driver>,...` on the command line |
+| Decompression | Compression choice (section 7): measure LZ4 or gzip against LZMA on your storage |
 
 ## 22. Maintenance and security
 
-*Planned: following stable updates, CVEs, hardening options, module signing.*
+A kernel that ships in a product needs updates for as long as the product is in the field.
+
+- **Base the product on an LTS release and follow its stable updates.** Stable releases contain only fixes, so moving from `7.1.3` to `7.1.9` is a rebase of your patches (section 16) and a test run, not a port.
+- **CVEs.** Since 2024 the kernel project is its own CVE numbering authority and assigns CVEs to a large share of its fixes. Judging each one against your configuration doesn't scale; the practical policy is to stay on the latest stable update of your branch, and use your configuration (what's not built can't be exploited) to prioritize.
+- **License.** The kernel is GPL-2.0. Shipping a kernel binary means providing its corresponding source, including your patches and configuration. Keeping everything as patches and fragments (section 16) makes that easy.
+
+**Hardening.** `omap2plus_defconfig` already enables `CONFIG_STACKPROTECTOR_STRONG` and `CONFIG_STRICT_KERNEL_RWX` (kernel code read-only, data not executable). Others worth considering for a product, after checking their cost on this CPU:
+
+| Option | Effect |
+|---|---|
+| `HARDENED_USERCOPY` | Checks the bounds of copies between kernel and user memory |
+| `FORTIFY_SOURCE` | Compile-time and run-time checks of string and memory functions |
+| `INIT_ON_ALLOC_DEFAULT_ON` | Zeroes memory on allocation: no leaks of old data, at a performance cost |
+| `RANDOMIZE_KSTACK_OFFSET` | Random kernel stack offset per system call |
+| `SECURITY_DMESG_RESTRICT` | Only root reads `dmesg`, which contains kernel addresses |
+| `STRICT_DEVMEM` or no `DEVMEM` | No raw physical memory access through `/dev/mem` |
+
+The kernel also ships a `hardening.config` fragment (`make hardening.config` on top of the base configuration), a reasonable starting list.
+
+**Remove debugging features from production builds:** `DEBUG_FS` (or don't mount it), `MAGIC_SYSRQ` on the serial console, `KGDB`, `IKCONFIG_PROC` if the configuration is sensitive, and the `earlycon`/`ignore_loglevel` parameters.
+
+**Module signing.** `CONFIG_MODULE_SIG=y` with `CONFIG_MODULE_SIG_ALL=y` signs every module at `modules_install` with a key generated during the build (`certs/signing_key.pem` in the build directory, unless `CONFIG_MODULE_SIG_KEY` names your own). `CONFIG_MODULE_SIG_FORCE=y` refuses unsigned modules; out-of-tree modules are then signed with `scripts/sign-file`. Keep the private key out of the product and out of version control. Signed modules only mean something if the kernel itself is verified, which is the bootloader's job (verified boot, in the bootloader note), and if the root filesystem is protected too (dm-verity, in the [rootfs note](../rootfs/)).
 
 ## 23. Other architectures: arm64 and the Raspberry Pi 4
 
-*Planned: what changes on 64-bit Arm, Image and booti, the Raspberry Pi kernel fork and its firmware.*
+Everything above applies to other architectures; the names change.
+
+| | 32-bit Arm (BeagleBone Black) | 64-bit Arm (Raspberry Pi 4, i.MX8M, RK3399...) | RISC-V |
+|---|---|---|---|
+| `ARCH`, `CROSS_COMPILE` | `arm`, `arm-linux-gnueabihf-` | `arm64`, `aarch64-linux-gnu-` | `riscv`, `riscv64-linux-gnu-` |
+| Configuration | One defconfig per SoC family (`omap2plus_defconfig`, `imx_v6_v7_defconfig`...) or `multi_v7_defconfig` | One `defconfig` for every arm64 SoC | One `defconfig` |
+| Image | `zImage`, self-decompressing | `Image` (uncompressed, with a header giving its size and load offset); `Image.gz` for storage, decompressed by the bootloader | `Image` |
+| U-Boot command | `bootz` | `booti` | `booti` |
+| Device trees | `arch/arm/boot/dts/<vendor>/` | `arch/arm64/boot/dts/<vendor>/` | `arch/riscv/boot/dts/<vendor>/` |
+| DTB address in | `r2` | `x0` | `a1`, with OpenSBI in between |
+| Memory above about 768 MiB | Highmem (`CONFIG_HIGHMEM`) | Directly mapped, no highmem | Directly mapped |
+
+**Raspberry Pi 4.** The Pi's firmware, not U-Boot, usually loads the kernel (bootloader note), so the files are named the way the firmware expects:
+
+- The Raspberry Pi kernel is a fork, `github.com/raspberrypi/linux` (branches `rpi-<version>.y`), built with `bcm2711_defconfig`. Mainline supports the Pi 4 with the arm64 `defconfig` and `broadcom/bcm2711-rpi-4-b.dtb`, but camera, display and some peripherals work best on the fork, and Raspberry Pi OS ships the fork.
+- Build: `make ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- bcm2711_defconfig`, then `Image.gz modules dtbs`.
+- Install: the image goes on the FAT boot partition as `kernel8.img` (or any name given by `kernel=` in `config.txt`); the DTBs (`broadcom/bcm2711-rpi-4-b.dtb`) to the boot partition's root and the overlays (`overlays/*.dtbo`) to `overlays/`; modules with `modules_install` onto the root partition as in section 9.
+- The command line comes from `cmdline.txt` on the boot partition, and the firmware edits the device tree (memory, MAC address, overlays from `config.txt`) before starting the kernel.
 
 ## 24. Troubleshooting by symptom
 

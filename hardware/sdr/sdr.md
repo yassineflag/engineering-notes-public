@@ -1118,11 +1118,226 @@ Keep the digital amplitude below about 0.7: values beyond ±1.0 clip in the conv
 
 ## 15. Other drivers and APIs: SoapySDR, UHD, libiio and librtlsdr
 
-*Planned: The driver layers, SoapySDR and its utilities, UHD and USRPs, libiio and the Pluto, librtlsdr and the DVB driver, network streaming, choosing an API for a product.*
+**The layers**, from the application down:
+
+```
+ application        GNU Radio, GQRX, SDR++, rtl_433, srsRAN, your program
+      │
+ abstraction        SoapySDR  │  gr-osmosdr  │  (or the vendor API directly)
+      │
+ vendor library     libhackrf │ librtlsdr │ libiio + libad9361 │ UHD │ libbladeRF │ LimeSuite
+      │
+ transport          libusb (user space)  │  network  │  libiio's USB or network backend
+      │
+ kernel             USB host controller and usbfs; no SDR-specific driver for most USB SDRs
+```
+
+Most USB SDRs have **no kernel driver**: the vendor library talks to the device through libusb and the kernel's generic usbfs. That's why access is a matter of udev rules and groups (section 6), and why a kernel driver that grabs the device first gets in the way (the RTL-SDR's DVB driver, below). The Pluto is the exception: its own Linux kernel drives the radio chip, and the host talks to that kernel's IIO subsystem (below).
+
+**libhackrf directly.** For a small program on an embedded host, the vendor library alone is enough. The callback receives each USB transfer of raw cs8 samples:
+
+```c
+/* hackrf-power.c: average power of each USB transfer for 5 s.
+ * Build: gcc -O2 -o hackrf-power hackrf-power.c -lhackrf -lm */
+#include <libhackrf/hackrf.h>
+#include <math.h>
+#include <stdio.h>
+#include <unistd.h>
+
+static int rx_cb(hackrf_transfer *t)
+{
+    const int8_t *b = (const int8_t *)t->buffer;
+    double p = 0;
+
+    for (int i = 0; i < t->valid_length; i++)
+        p += (double)b[i] * b[i];
+    p /= t->valid_length / 2;                         /* I² + Q² per complex sample */
+    printf("%6.1f dBFS\n", 10 * log10(p / (128.0 * 128.0)));
+    return 0;                                         /* non-zero stops the stream */
+}
+
+int main(void)
+{
+    hackrf_device *dev = NULL;
+
+    if (hackrf_init() != HACKRF_SUCCESS || hackrf_open(&dev) != HACKRF_SUCCESS) {
+        fprintf(stderr, "no HackRF\n");
+        return 1;
+    }
+    hackrf_set_sample_rate(dev, 8e6);
+    hackrf_set_freq(dev, 98000000);
+    hackrf_set_amp_enable(dev, 0);
+    hackrf_set_lna_gain(dev, 16);
+    hackrf_set_vga_gain(dev, 20);
+
+    hackrf_start_rx(dev, rx_cb, NULL);
+    sleep(5);
+    hackrf_stop_rx(dev);
+    hackrf_close(dev);
+    hackrf_exit();
+    return 0;
+}
+```
+
+The callback runs in libhackrf's USB thread: it must return quickly, or transfers back up and samples are lost. A real program copies the buffer into a queue and processes it in another thread. For an Arm board, cross-compile it against the target's libhackrf as in the [toolchain note](../../embedded-linux/fundamentals/cross-compilation-toolchain/cross-compilation-toolchain.md) (`pkg-config --cflags --libs libhackrf` with the target sysroot).
+
+**SoapySDR** is one API (C++, C and Python) for many devices, with one plugin module per device type. GNU Radio's *Soapy* blocks, SDR++, rtl_433, SatDump and many others use it, so a device with a Soapy module works in all of them. In Python (`python3-soapysdr`):
+
+```python
+import numpy as np
+import SoapySDR
+from SoapySDR import SOAPY_SDR_RX, SOAPY_SDR_CF32
+
+sdr = SoapySDR.Device(dict(driver="hackrf"))
+sdr.setSampleRate(SOAPY_SDR_RX, 0, 8e6)
+sdr.setFrequency(SOAPY_SDR_RX, 0, 98e6)
+sdr.setGain(SOAPY_SDR_RX, 0, "LNA", 16)
+sdr.setGain(SOAPY_SDR_RX, 0, "VGA", 20)
+
+rx = sdr.setupStream(SOAPY_SDR_RX, SOAPY_SDR_CF32)
+sdr.activateStream(rx)
+buf = np.empty(65536, np.complex64)
+for _ in range(100):
+    sr = sdr.readStream(rx, [buf], len(buf))
+    if sr.ret < 0:                    # negative: an error code, -4 is SOAPY_SDR_OVERFLOW
+        print("error", sr.ret)
+        continue
+    print(sr.ret, "samples, mean power", np.mean(np.abs(buf[: sr.ret]) ** 2))
+sdr.deactivateStream(rx)
+sdr.closeStream(rx)
+```
+
+Changing the dictionary to `driver=rtlsdr` or `driver=plutosdr` (with the module installed) runs the same code on another device; only the gain names and the sample rate limits change (`SoapySDRUtil --probe` lists them). **SoapyRemote** serves a device over the network: `SoapySDRServer --bind` on the machine with the SDR, `driver=remote,remote=<host>` on the client.
+
+**UHD** is Ettus Research's driver for the USRPs. The FPGA images must match the UHD version, and `uhd_images_downloader` fetches them:
+
+```sh
+$ sudo apt install uhd-host
+$ sudo uhd_images_downloader
+$ uhd_find_devices
+$ uhd_usrp_probe                            # daughterboards, ranges, clock and time sources
+$ /usr/lib/uhd/examples/rx_samples_to_file --freq 98e6 --rate 8e6 --duration 10 --type short $REC/fm.cs16
+```
+
+UHD has what the HackRF lacks: device timestamps on every buffer (`rx_time` tags in GNU Radio), commands timed to a sample, external 10 MHz and PPS inputs, and full duplex. Cellular stacks (srsRAN, OpenAirInterface) are developed mainly against it (section 18). The examples' directory can differ between distributions.
+
+**libiio and the Pluto.** The Pluto's AD9363 is driven by an IIO (Industrial I/O) driver in the Pluto's own Linux kernel. Its settings are IIO attributes (frequency, gain, sample rate) and its samples flow through IIO buffers. The `iiod` daemon on the Pluto serves them over USB or the network, and **libiio** on the host is the client: the same API works locally on the device (`local:`), over USB (`usb:`) and over the network (`ip:`):
+
+```sh
+$ sudo apt install libiio-utils python3-pip
+$ iio_info -s                                          # find contexts: usb:... and ip:192.168.2.1
+$ iio_attr -u ip:192.168.2.1 -c ad9361-phy altvoltage0 frequency 433920000    # RX LO
+$ iio_attr -u ip:192.168.2.1 -i -c ad9361-phy voltage0 gain_control_mode manual
+$ iio_attr -u ip:192.168.2.1 -i -c ad9361-phy voltage0 hardwaregain 40
+```
+
+In `ad9361-phy`, `altvoltage0` is the RX LO and `altvoltage1` the TX LO; `voltage0` is the first RX (input) or TX (output) channel. The sample buffers are on the `cf-ad9361-lpc` device (RX) and `cf-ad9361-dds-core-lpc` (TX). The syntax above is that of libiio 0.2x; libiio 1.0 changes the API and some tool options, so check which version your distribution ships. In Python, **pyadi-iio** wraps the same attributes:
+
+```python
+import adi
+
+sdr = adi.Pluto("ip:192.168.2.1")
+sdr.sample_rate = int(4e6)
+sdr.rx_lo = int(433.92e6)
+sdr.rx_rf_bandwidth = int(2e6)
+sdr.gain_control_mode_chan0 = "manual"
+sdr.rx_hardwaregain_chan0 = 40
+sdr.rx_buffer_size = 2 ** 16
+x = sdr.rx()               # NumPy complex array; 12-bit sample values
+```
+
+In GNU Radio 3.10, the *PlutoSDR Source* and *Sink* blocks (gr-iio, part of GNU Radio) take the same URI.
+
+**librtlsdr and the DVB driver.** The RTL2832U is a DVB-T TV receiver chip, and the kernel's `dvb_usb_rtl28xxu` driver claims it as a TV tuner, after which librtlsdr can't open it (`usb_claim_interface error -6`). Debian's `rtl-sdr` package blacklists the module; otherwise:
+
+```sh
+$ echo 'blacklist dvb_usb_rtl28xxu' | sudo tee /etc/modprobe.d/blacklist-rtlsdr.conf
+$ sudo modprobe -r dvb_usb_rtl28xxu
+$ rtl_test                                         # finds the stick, tests for lost samples
+$ rtl_sdr -f 98e6 -s 2.4e6 -n 24000000 $REC/fm_98M_2M4.cu8
+$ rtl_fm -f 98e6 -M wbfm -s 200000 -r 48000 - | aplay -r 48000 -f S16_LE
+```
+
+The RTL-SDR Blog V4 uses an R828D tuner and a built-in HF upconverter that older librtlsdr releases don't drive correctly: use a librtlsdr with V4 support (the RTL-SDR Blog fork, or an upstream release that includes it).
+
+**Streaming over a network.** `rtl_tcp`, SoapyRemote, or GNU Radio's *ZMQ PUB Sink* / *ZMQ SUB Source* and UDP blocks move samples between machines. Count the bandwidth first: 8 Msps as cf32 is 64 MB/s, half of a gigabit link and far beyond Wi-Fi. Send integers instead of floats, or decimate before sending.
+
+**Choosing an API for a product:**
+
+| Need | Choice |
+|---|---|
+| One device type, full control, smallest footprint | Its vendor library (libhackrf, librtlsdr, libiio, UHD) |
+| Several device types, or freedom to change device later | SoapySDR |
+| Rapid development, a GUI, an existing block library | GNU Radio; move hot spots to C++ blocks (section 13) |
+| Timestamped samples, timed transmission | UHD, or libiio and Soapy drivers that support time; not the HackRF (section 17) |
+| Processing next to the radio | The Pluto's local IIO context, or an FPGA (section 16) |
 
 ## 16. SDR on embedded Linux: Raspberry Pi 4, BeagleBone Black and the Pluto
 
-*Planned: USB and CPU budgets on small boards, decimating early, VOLK profiles, a headless receiver as a systemd service, Buildroot and Yocto, the Pluto as an embedded Linux SDR, FPGA-based SDRs.*
+An SDR on a small board is a common product shape: a sensor receiver that publishes decoded values, a spectrum monitor, an ADS-B or AIS station. The limits are the USB link, the CPU, and storage.
+
+**Budgets**, **typical**:
+
+| Host | USB | CPU | What fits |
+|---|---|---|---|
+| Raspberry Pi 4 | Two USB 3.0 and two USB 2.0 ports, all behind one VL805 controller on PCIe | 4 × Cortex-A72, 1.5 to 1.8 GHz, NEON | HackRF capture at 8 to 10 Msps; FM demodulation with early decimation; decoders such as rtl_433, dump1090 and AIS-catcher |
+| BeagleBone Black | One USB 2.0 host port (MUSB controller) | 1 × Cortex-A8, 1 GHz, NEON | An RTL-SDR at 1 to 2.4 Msps with a light decoder (rtl_433); a HackRF only at low rates with almost no processing |
+| ADALM-Pluto, on the device | | 2 × Cortex-A9, 667 MHz, plus a Zynq-7010 FPGA | Light processing next to the radio; only the results cross USB |
+
+**How to fit:**
+
+- **Pick the lowest sample rate that works.** Bytes per second and CPU load both scale with it.
+- **Decimate first and in stages.** At 8 Msps, a cheap filter with a wide transition followed by `/8`, then a sharper filter at 1 Msps, costs much less than one sharp filter at 8 Msps. Every block after the first decimation runs at the lower rate.
+- **No GUI sinks**, no Python loops over samples: the headless program of section 10 or a C program (section 15).
+- **Run `volk_profile` on the target** once. Without a profile, VOLK may use generic kernels instead of NEON ones.
+- **Set the CPU governor to `performance`** while measuring: frequency scaling makes throughput vary and can cause overflows on load changes.
+- **Don't record to the SD card at high rates.** SD cards stall for hundreds of milliseconds while they erase; use a tmpfs, a USB SSD, or decimate before writing.
+- **Power.** A HackRF draws several hundred mA from USB. The Pi 4 limits the total current of its USB ports, and the BBB's host port supplies 500 mA. A powered hub fixes power but can add USB trouble (section 17); prefer a board supply with enough margin.
+
+**Debian on the Pi**: Raspberry Pi OS (64-bit) has the same packages as section 6 (`hackrf`, `gnuradio`, `rtl-433`, `soapysdr-module-hackrf`), so a prototype is an `apt install` away.
+
+**A headless receiver as a service**: rtl_433 decodes the 433 MHz sensors and publishes them to an MQTT broker on the network (`192.168.0.10`, a placeholder):
+
+```ini
+# /etc/systemd/system/sensors433.service
+[Unit]
+Description=433 MHz sensor receiver
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+ExecStart=/usr/bin/rtl_433 -d driver=hackrf -f 433.92M -s 2M -F mqtt://192.168.0.10:1883
+Restart=on-failure
+RestartSec=5
+User=sdr
+Group=plugdev
+
+[Install]
+WantedBy=multi-user.target
+```
+
+```sh
+# useradd --system --groups plugdev sdr
+# systemctl daemon-reload && systemctl enable --now sensors433
+# journalctl -u sensors433 -f
+```
+
+On a BusyBox system without systemd, the same command goes into a start script under `/etc/init.d/` as in the [rootfs note](../../embedded-linux/fundamentals/rootfs/rootfs.md#7-init-inittab-and-the-startup-scripts), with a loop that restarts it, and a udev or mdev rule for the device permissions (rootfs note, section 6).
+
+**Build systems.** Buildroot has packages for `hackrf`, `librtlsdr` (`rtl-sdr`), `libiio`, `gnuradio` (with one option per component: analog, filter, audio, Python, ...) and `gr-osmosdr` (with HackRF and RTL-SDR options). For Yocto, the `meta-sdr` layer provides GNU Radio, UHD, HackRF and RTL-SDR recipes; check the layer index for one compatible with your Yocto release. GNU Radio with Python and its dependencies (Boost, FFTW, Volk, NumPy) adds tens of MB to a root filesystem; a C program on libhackrf or librtlsdr adds a few hundred kB. The [Buildroot](../../embedded-linux/linux-build-systems/buildroot/) and [Yocto](../../embedded-linux/linux-build-systems/yocto/) notes cover the build systems themselves.
+
+**The Pluto is an embedded Linux system.** Inside: a Zynq-7010 (two Cortex-A9 cores and an FPGA), the AD9363 transceiver, 512 MB of DDR3L and 32 MB of QSPI flash. Its firmware, built from the `plutosdr-fw` repository, packs the pieces of the embedded Linux notes into one file, `pluto.frm`: U-Boot, an ADI Linux kernel with the IIO drivers, a device tree, the FPGA bitstream (built with Xilinx Vivado), and a Buildroot root filesystem run as an initramfs. Over USB it appears as a composite gadget:
+
+| USB function | What it gives |
+|---|---|
+| Mass storage | `config.txt` (network and USB settings), `info.html`, and firmware updates: copy `pluto.frm` to it and eject |
+| Network (RNDIS / ECM) | The Pluto at `192.168.2.1`: libiio (`ip:192.168.2.1`) and SSH (`root`, default password `analog`; change it on a shared network) |
+| Serial (ACM) | A console, `/dev/ttyACM0` on the host |
+| libiio over USB | The `usb:` context |
+
+From an SSH session on the Pluto, the radio is a local IIO context. A program cross-compiled for its Cortex-A9 (`arm-linux-gnueabihf`, the same toolchain family as the BBB in the toolchain note) can run there, process samples locally and send only results over USB. Two things the community does with it: extend the tuning range to 70 MHz to 6 GHz and 56 MHz of bandwidth by declaring the chip as an AD9364 (`fw_setenv attr_name compatible`, `fw_setenv attr_val ad9364`, reboot; documented on the ADI wiki, outside the AD9363's specification, works on most units), and alternative firmware that moves more processing into the FPGA (Maia SDR: a waterfall computed in the FPGA, served to a browser).
+
+**FPGA-based SDR.** When the host can't keep up, the first stages move into an FPGA: digital downconversion, filtering, decimation, triggering, sometimes whole demodulators. USRPs have RFNoC (a framework for blocks inside the USRP's FPGA), the Pluto and Zynq boards have the ADI HDL reference designs, and RFSoC boards put the ADCs, DACs and FPGA on one chip. That's HDL work, outside this note.
 
 ## 17. Throughput, timing and synchronization
 

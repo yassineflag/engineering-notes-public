@@ -1341,11 +1341,57 @@ From an SSH session on the Pluto, the radio is a local IIO context. A program cr
 
 ## 17. Throughput, timing and synchronization
 
-*Planned: USB throughput arithmetic, overruns and underruns, buffers and latency, external clocks, triggers and multi-device synchronization, timestamps.*
+**Bytes per second:**
+
+| Stream | Rate | Over |
+|---|---|---|
+| HackRF, 20 Msps, cs8 | 40 MB/s | USB 2.0 high speed carries about 35 to 45 MB/s of bulk data in practice: at the limit |
+| HackRF, 8 Msps, cs8 | 16 MB/s | Comfortable on a dedicated port |
+| RTL-SDR, 2.4 Msps, cu8 | 4.8 MB/s | Easy |
+| Pluto, 4 Msps, cs16, one channel | 16 MB/s | Around the Pluto's practical USB limit |
+| USRP B210, 56 Msps, sc16, one channel | 224 MB/s | USB 3.0 |
+| Any stream at 8 Msps as cf32 inside GNU Radio | 64 MB/s per connection | Memory bandwidth, per buffer |
+
+**Where samples get lost**, and the first thing to check for each:
+
+| Cause | Check |
+|---|---|
+| The USB link: a shared controller, a hub, a USB-C dock, a virtual machine's USB passthrough, a long or poor cable | `hackrf_transfer -r /dev/null -s 20000000 -n 200000000`: the rate line must match the sample rate × 2 |
+| The CPU: the flowgraph is slower than the stream | `top` per thread (`H`): one block's thread at 100% is the bottleneck |
+| The disk: writes stall | Write to `/dev/null`, then to a tmpfs, then to the disk |
+| Power saving: CPU frequency scaling, USB autosuspend | `performance` governor; `cat /sys/bus/usb/devices/*/power/control` |
+
+Test the layers in that order: USB alone (`/dev/null`), then the disk, then the processing. `hackrf_transfer` prints `Couldn't transfer any bytes for one second.` when the stream stops altogether, which is usually a USB or power problem.
+
+**Buffers and latency.** Each stage holds samples: USB transfers (libhackrf uses transfers of a few hundred kB, so tens of ms each at 8 Msps), GNU Radio's buffers between blocks, the audio card's buffer. Larger buffers absorb jitter and reduce overflows; smaller ones reduce latency. A host-based SDR has a latency of milliseconds to hundreds of milliseconds from antenna to application. Protocols that must answer within microseconds (Wi-Fi ACKs, cellular HARQ timing) need the response generated in the FPGA or a dedicated chip. In GNU Radio, a block's maximum output buffer (in its *Advanced* tab) trades one against the other.
+
+**Timestamps.** HackRF samples carry no time: the time of a sample is its index divided by the sample rate, counted from a start that the host knows only within the USB latency (milliseconds). UHD devices timestamp every buffer with the device's own clock (`rx_time`), which a **PPS** (pulse per second) input sets to absolute time; libiio and some Soapy drivers support time as well. Anything that compares the timing of signals across devices (time difference of arrival, TDD frame alignment) needs that.
+
+**Frequency synchronization.** Devices that share a reference run at the same frequency: chain the HackRFs from CLKOUT to CLKIN, or distribute one 10 MHz signal (from a GPSDO) to all of them. **Start synchronization**: the HackRF's hardware trigger (the trigger pins on its expansion header, with `hackrf_transfer -H` to wait for the trigger) starts several devices on the same edge.
+
+**Phase coherence** is a third, harder requirement: the HackRF's synthesizers and mixers settle at an arbitrary phase after each tune, so two HackRFs on the same reference still have an unknown, changing phase difference. Direction finding and beamforming need receivers designed for it: channels sharing one LO (the two channels of a USRP B210 or bladeRF 2.0), or multi-channel receivers built for coherence (KrakenSDR), with a calibration step.
 
 ## 18. Applications: aircraft, sensors, satellites, GNSS and cellular
 
-*Planned: ADS-B, ISM sensors, weather satellites, spectrum surveys with hackrf_sweep, GNSS with gnss-sdr, LTE cell scanning and open-source cellular stacks, what each needs from the hardware.*
+| Application | Frequency | Tool | What it needs |
+|---|---|---|---|
+| FM and AM broadcast, airband voice | 87.5 to 108 MHz, 118 to 137 MHz (AM) | GQRX, SDR++ | Any SDR; section 10 |
+| ISM sensors and remotes | 433.92, 868, 915 MHz | rtl_433, URH | Any SDR; section 12 |
+| ADS-B from aircraft | 1090 MHz | dump1090-fa, readsb, then tar1090 for a map | 2 Msps; a 1090 MHz filter and a good antenna; RTL-SDR is the usual choice, HackRF works with builds that support it |
+| AIS from ships | 161.975 and 162.025 MHz | AIS-catcher | Most SDRs, including the HackRF through SoapySDR |
+| Weather satellites | 137 MHz (Meteor-M LRPT); 1.7 GHz (HRPT, GOES HRIT, with a dish) | SatDump | A V-dipole or QFH antenna for 137 MHz. The NOAA APT satellites were retired in 2025 |
+| Spectrum surveys | 1 MHz to 6 GHz | `hackrf_sweep`, QSpectrumAnalyzer | The HackRF's sweep mode (section 7) |
+| GNSS (GPS, Galileo) | 1575.42 MHz (L1/E1) | gnss-sdr | An active antenna powered by the bias tee (`-p 1`, or `bias=1` in an osmosdr device string); a stable clock helps acquisition (section 8); 2 to 4 Msps |
+| LTE and NR cell information | The operator bands ([cellular note](../../wireless-protocols-and-connectivity/cellular/cellular.md#7-physical-channels-cell-search-system-information-and-random-access)) | srsRAN 4G's `cell_search`, LTE cell scanners | Receive only; the broadcast part (MIB, SIBs) is unencrypted |
+| Running an LTE or 5G network | Test bands | srsRAN 4G, srsRAN Project, OpenAirInterface | Full duplex, timestamps and a good clock: USRP B210 or similar, not a HackRF |
+
+**GNSS signals are below the noise floor**: about -130 dBm, spread over 2 MHz, where the thermal noise is about -111 dBm (section 3). The receiver finds them by correlating with the known spreading code: one millisecond of correlation narrows 2 MHz to about 1 kHz, about 33 dB of processing gain, and longer integration adds more. That's also why 8 bits are enough. Acquisition searches frequency in steps; a ±20 ppm crystal adds ±31 kHz of uncertainty at 1575 MHz, which widens the search and slows the first fix. Never transmit on GNSS frequencies, even into a cable in a building: leakage is enough to disturb receivers nearby, and it is illegal everywhere.
+
+**Cellular, receive side.** The LTE cell search signals (PSS, SSS) and the PBCH occupy the central 1.08 MHz of the carrier, and an NR SSB occupies 240 subcarriers: 3.6 MHz at 15 kHz spacing, 7.2 MHz at 30 kHz. Both fit in the HackRF's bandwidth, so the cell identity, the MIB and the frequency error can be measured with it; the [cellular note](../../wireless-protocols-and-connectivity/cellular/cellular.md#7-physical-channels-cell-search-system-information-and-random-access) describes what the cell search finds. srsRAN 4G's tools reach devices through its RF layer (UHD, bladeRF, SoapySDR). A cell's reported frequency offset is also the most accurate calibration a HackRF owner usually has (section 8).
+
+**Cellular, network side.** An open-source eNB or gNB with a programmable SIM is the way to study attach, registration and the core from the inside, with the test PLMN 001-01 of the cellular note. It needs a full-duplex SDR with timestamps (a USRP B210 is the reference), a host with enough CPU, and either a shielded enclosure with cables and attenuators, or a test licence for the band. Transmitting on an operator's band without one interferes with real users and emergency calls.
+
+**Wi-Fi and Bluetooth.** A 20 MHz Wi-Fi channel needs 20 Msps of clean bandwidth, the HackRF's limit; GNU Radio's gr-ieee802-11 decodes it with a better device. Bluetooth hops over 79 MHz faster than any USB SDR can follow; dedicated hardware (Ubertooth) or a wideband SDR is needed.
 
 ## 19. Troubleshooting by symptom
 

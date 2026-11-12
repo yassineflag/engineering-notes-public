@@ -570,15 +570,269 @@ The output reports whether a clock signal is detected on CLKIN.
 
 ## 9. GNU Radio concepts: flowgraphs, blocks, streams, tags and messages
 
-*Planned: Flowgraphs and blocks, items and sample rates, sync, decimating and interpolating blocks, the scheduler and buffers, tags, messages and PDUs, GNU Radio Companion and the generated Python, GNU Radio 3.10 and 4.0.*
+GNU Radio is a framework of signal processing **blocks** written in C++ with Python bindings, a runtime that moves samples between them, and a graphical editor, **GNU Radio Companion** (GRC). A program is a **flowgraph**: blocks connected output to input, from **sources** (an SDR, a file, a signal generator) to **sinks** (audio, a file, a display, a network socket).
+
+```
+ Soapy HackRF Source ──> Frequency Xlating FIR Filter ──> WBFM Receive ──> Rational Resampler ──> Audio Sink
+   complex, 8 Msps          complex, 500 ksps                float, 50 ksps     float, 48 ksps
+         │
+         └──> QT GUI Frequency Sink
+```
+
+**Streams and items.** Each connection carries a stream of **items** of one type. GRC colors ports by type, and connecting two different types is an error:
+
+| Type | C++ type | Size | GRC port color | Typical use |
+|---|---|---|---|---|
+| complex | `gr_complex` (two float32) | 8 bytes | Blue | IQ samples |
+| float | `float` | 4 bytes | Orange | Audio, demodulated signals, magnitudes |
+| int, short | `int32_t`, `int16_t` | 4, 2 bytes | Green, yellow | Raw device samples, counters |
+| byte | `uint8_t` / `int8_t` | 1 byte | Purple | Bits (one bit per byte), raw cs8/cu8 samples, packet bytes |
+| message | PMT | | Grey, dashed connection | Asynchronous messages (below) |
+
+A port can also carry **vectors** of N items (an FFT frame of 1024 complex values is one item of a vector stream).
+
+**The sample rate isn't in the stream.** A block only sees numbers; the rate is a parameter you give to the blocks that need it (filters, demodulators, displays). If two blocks disagree, nothing fails: the audio plays at the wrong pitch or a filter cuts the wrong band. Keep the rates in GRC variables (`samp_rate`, `quad_rate`) and derive every block's parameters from them.
+
+**What sets the pace.** A hardware source produces samples at its rate and an audio sink consumes them at its rate; the flowgraph runs as fast as they allow. A flowgraph with only a file source and a GUI sink has no clock and runs as fast as the CPU can: the **Throttle** block limits it to a given rate. Use a Throttle only in flowgraphs with no hardware or audio clock (section 11); two clocks in one flowgraph drift apart.
+
+**Kinds of blocks:**
+
+| Kind | Items in : out | Examples |
+|---|---|---|
+| Sync | 1 : 1 | Multiply, Complex to Mag, Quadrature Demod |
+| Decimator | N : 1 | FIR filters with decimation, Keep 1 in N |
+| Interpolator | 1 : N | Repeat, interpolating FIR filters |
+| General | Any ratio, decided at run time | Rational Resampler, Symbol Sync, packet decoders |
+| Hierarchical | A group of blocks presented as one | WBFM Receive (a demodulator, a de-emphasis filter, a decimating low-pass filter) |
+
+**The scheduler.** The default scheduler runs **each block in its own thread**. Between two blocks is a circular buffer. A block's `work()` function is called with as many input items as are available and as much output space as is free, and returns how many it produced. When a buffer fills, the block upstream waits. That back-pressure is fine between software blocks; a hardware source can't wait, so when the flowgraph is too slow, its driver drops samples and reports an **overflow** (section 17).
+
+**Tags** attach metadata to one item of a stream: a key and a value at an absolute item index, traveling with the samples through the blocks. Examples: UHD sources tag the first sample with `rx_time` and `rx_freq`; packet blocks mark packet starts with a length tag (`packet_len`); a burst transmitter uses `tx_sob` and `tx_eob` (start and end of burst). The *Tag Debug* block prints the tags it sees.
+
+**Messages** are asynchronous: a block posts a message on a message port, not tied to any sample. Examples: a GUI sends a `freq` command to the Soapy source to retune it; a decoder outputs each decoded packet as a **PDU** (protocol data unit: a dictionary of metadata plus a vector of bytes or samples); *Message Debug* prints them. Values in tags and messages are **PMTs** (polymorphic types: numbers, strings, dictionaries, vectors).
+
+**GNU Radio Companion.** GRC saves a flowgraph as a `.grc` file (YAML) and **generates** a Python program from it, then runs that program. The *Options* block chooses the output: a Qt GUI application, a no-GUI program, or a hierarchical block for reuse in other flowgraphs. The generated Python can be read, run without GRC, and copied as the starting point of a hand-written program (section 10). Use GRC variables for values and *QT GUI Range* blocks for sliders: changing them at run time calls the matching setters in the running blocks.
+
+```sh
+$ gnuradio-companion $SDR/fm_rx.grc
+```
+
+**GNU Radio 3.10 and 4.0.** This note uses **3.10**, the stable line packaged by distributions (3.10.12.0 in Debian 13). **GNU Radio 4.0** is a rewrite (a C++23 block API, a new scheduler, compile-time graph checks), in release candidates since March 2026 and not yet tagged final in November 2026. Flowgraphs and out-of-tree modules for 3.10 don't carry over to 4.0 as they are; check the project's news before starting a long-lived project on either.
 
 ## 10. A first flowgraph: an FM broadcast receiver
 
-*Planned: The FM receiver in GNU Radio Companion block by block, the rate plan, the same flowgraph as headless Python, overruns and audio underruns.*
+FM broadcast is a good first signal: strong, continuous, and the result is audible. A station occupies about 200 kHz around its frequency. The receiver must take the 8 Msps stream from the HackRF, select that 200 kHz, demodulate it, and deliver audio at the sound card's 48 kHz.
+
+**The rate plan** comes first. Every rate must divide cleanly into the next one:
+
+```
+HackRF, fc = station - 1 MHz        8 Msps complex      station at +1 MHz (offset tuning, section 8)
+  │ Frequency Xlating FIR Filter: shift by -1 MHz, low-pass 100 kHz, decimate by 16
+  ▼                                  500 ksps complex
+  │ WBFM Receive: FM demodulation, de-emphasis, decimate by 10
+  ▼                                  50 ksps float (mono audio)
+  │ Rational Resampler: × 24 / 25
+  ▼                                  48 ksps float  ──> Audio Sink
+```
+
+**The blocks in GRC:**
+
+| Block | Parameter | Value |
+|---|---|---|
+| Options | Generate Options | QT GUI |
+| Variable `samp_rate` | | `8e6` |
+| Variable `offset` | | `1e6` |
+| QT GUI Range `station` | Default, start, stop, step | `98e6`, `87.5e6`, `108e6`, `100e3` |
+| QT GUI Range `vga` | Default, start, stop, step | `20`, `0`, `62`, `2` |
+| Soapy HackRF Source | Sample rate | `samp_rate` |
+| | Center frequency | `station - offset` |
+| | Bandwidth | `0` (the driver picks the filter) |
+| | Amplifier, IF (LNA) gain, VGA gain | off, `16`, `vga` |
+| Frequency Xlating FIR Filter | Decimation | `16` |
+| | Taps | `firdes.low_pass(1, samp_rate, 100e3, 50e3)` |
+| | Center frequency | `offset` |
+| | Sample rate | `samp_rate` |
+| WBFM Receive | Quadrature rate | `samp_rate / 16` |
+| | Audio decimation | `10` |
+| Rational Resampler (float) | Interpolation, decimation | `24`, `25` |
+| Multiply Const (float) | Constant | `0.5` (volume) |
+| Audio Sink | Sample rate | `48000` |
+| QT GUI Frequency Sink | Center frequency, bandwidth | `station - offset`, `samp_rate`; input from the source |
+| QT GUI Waterfall Sink | Same | Same |
+
+Parameter labels vary slightly between 3.10 releases. Where the WBFM Receive block offers a de-emphasis time constant, use 50 µs in Europe and 75 µs in the Americas.
+
+**What each choice does:**
+
+- **Offset tuning**: the station sits 1 MHz away from the DC spike and from the IQ image of the center (section 8).
+- **The filter**: a 100 kHz cutoff with a 50 kHz transition keeps the station and rejects its neighbors. A narrower transition means more taps and more CPU; `len(taps)` in a Python shell shows how many (a few hundred here). The *Frequency Xlating FIR Filter* computes only the outputs it keeps after decimation, so its cost is taps × output rate.
+- **Decimating early**: everything after the filter runs at 500 ksps instead of 8 Msps.
+- **The resampler**: 50 kHz to 48 kHz is the ratio 24/25. Audio cards accept 44.1 or 48 kHz; feeding them another rate gives the wrong pitch or underruns.
+
+**Console messages:**
+
+| Message | Meaning | Fix |
+|---|---|---|
+| `aU` | Audio underrun: the sound card wanted samples that weren't there | Check the rate plan ends at the sink's rate; check the CPU load; check that no Throttle also paces the flowgraph |
+| `O`, or an overflow message from the driver | The hardware delivered samples nobody read in time; samples were lost | Lower the sample rate, decimate earlier, close GUI sinks (section 17) |
+| Occasional `aU` after hours | The SDR clock and the sound card clock differ by a few ppm | Normal for a long-running receiver; an adaptive resampler removes it |
+
+**The same receiver as a headless Python program.** Without Qt, it runs over SSH, as a service, or on an embedded board (section 16):
+
+```python
+#!/usr/bin/env python3
+# fm_rx.py STATION_HZ: headless wideband FM receiver, HackRF, GNU Radio 3.10
+import argparse
+import signal
+import sys
+
+from gnuradio import analog, audio, filter, gr, soapy
+from gnuradio.fft import window
+from gnuradio.filter import firdes
+
+
+class FmRx(gr.top_block):
+    def __init__(self, station, lna, vga, samp_rate=8e6, offset=1e6):
+        gr.top_block.__init__(self, "fm_rx")
+        self.offset = offset
+        decim = 16
+        quad_rate = samp_rate / decim                       # 500 ksps
+
+        self.src = soapy.source("driver=hackrf", "fc32", 1, "", "", [""], [""])
+        self.src.set_sample_rate(0, samp_rate)
+        self.src.set_bandwidth(0, 0)
+        self.src.set_gain(0, "AMP", False)
+        self.src.set_gain(0, "LNA", lna)
+        self.src.set_gain(0, "VGA", vga)
+        self.set_station(station)
+
+        taps = firdes.low_pass(1.0, samp_rate, 100e3, 50e3, window.WIN_HAMMING)
+        self.xlate = filter.freq_xlating_fir_filter_ccf(decim, taps, offset, samp_rate)
+        self.demod = analog.wfm_rcv(quad_rate=quad_rate, audio_decimation=10)
+        self.resamp = filter.rational_resampler_fff(interpolation=24, decimation=25)
+        self.sink = audio.sink(48000, "", True)
+
+        self.connect(self.src, self.xlate, self.demod, self.resamp, self.sink)
+
+    def set_station(self, station):
+        self.src.set_frequency(0, station - self.offset)
+
+
+def main():
+    p = argparse.ArgumentParser(description="Wideband FM receiver for a HackRF")
+    p.add_argument("station", type=float, help="station frequency in Hz")
+    p.add_argument("--lna", type=float, default=16, help="LNA gain, 0 to 40 dB in 8 dB steps")
+    p.add_argument("--vga", type=float, default=20, help="VGA gain, 0 to 62 dB in 2 dB steps")
+    a = p.parse_args()
+
+    tb = FmRx(a.station, a.lna, a.vga)
+
+    def stop(sig=None, frame=None):
+        tb.stop()
+        tb.wait()
+        sys.exit(0)
+
+    signal.signal(signal.SIGINT, stop)
+    signal.signal(signal.SIGTERM, stop)
+    tb.start()
+    tb.wait()
+
+
+if __name__ == "__main__":
+    main()
+```
+
+```sh
+$ python3 $SDR/fm_rx.py $FM_HZ --lna 16 --vga 20
+```
+
+The calls are the ones GRC generates for the same blocks. `tb.start()` starts one thread per block and returns; `tb.wait()` blocks until the flowgraph ends, which for a hardware source is never, so the signal handler stops it.
 
 ## 11. Recordings: file formats, SigMF and offline processing
 
-*Planned: Sample formats of the common devices, converting between them, SigMF metadata, reading recordings in NumPy, replaying a recording through a flowgraph, Throttle and Head.*
+Recording once and processing many times is the normal way to develop a receiver: the same samples, every time, without the device.
+
+**Sample formats:**
+
+| Name | SigMF `core:datatype` | Bytes per complex sample | Values | Written by |
+|---|---|---|---|---|
+| cs8 | `ci8` | 2 | -128 to 127 | `hackrf_transfer` |
+| cu8 | `cu8` | 2 | 0 to 255, zero at 127.5 | `rtl_sdr` (RTL-SDR) |
+| cs16 | `ci16_le` | 4 | 16-bit integers; often 12-bit values in 16 bits | Pluto (libiio), USRP (`sc16`), bladeRF (`SC16_Q11`) |
+| cf32 | `cf32_le` | 8 | float32, about ±1.0 | GNU Radio *File Sink* of type complex, GQRX raw I/Q recordings |
+| IQ WAV | | 4 (2 channels × 16 bits) | | SDR++ and Windows SDR programs; I and Q as left and right |
+
+**Converting** a HackRF recording to cf32 in NumPy:
+
+```python
+import numpy as np
+
+raw = np.fromfile("fm.cs8", dtype=np.int8).astype(np.float32) / 128.0
+iq = (raw[0::2] + 1j * raw[1::2]).astype(np.complex64)
+iq.tofile("fm.cf32")
+
+# other formats:
+# cu8  (RTL-SDR): r = (np.fromfile(f, np.uint8).astype(np.float32) - 127.5) / 127.5
+# cs16 (12-bit):  r = np.fromfile(f, np.int16).astype(np.float32) / 2048.0
+# cf32:           iq = np.fromfile(f, np.complex64)
+```
+
+Memory grows eightfold from cs8 to complex64: 10 seconds at 8 Msps is 160 MB on disk and 640 MB as complex64. For long recordings, open the file with `np.memmap` and process it in blocks.
+
+**A spectrum from a recording**, averaged over many FFTs:
+
+```python
+import numpy as np
+import matplotlib.pyplot as plt
+
+fs, fc, n = 8e6, 97e6, 4096
+iq = np.fromfile("fm.cf32", np.complex64)
+frames = iq[: (len(iq) // n) * n].reshape(-1, n)[:2000]           # 2000 FFTs of 4096 samples
+spec = np.fft.fftshift(np.fft.fft(frames * np.hanning(n), axis=1), axes=1)
+psd = 10 * np.log10(np.mean(np.abs(spec) ** 2, axis=0))
+freq = fc + np.fft.fftshift(np.fft.fftfreq(n, 1 / fs))
+plt.plot(freq / 1e6, psd); plt.xlabel("MHz"); plt.ylabel("dB (relative)"); plt.grid(True)
+plt.show()
+```
+
+**Replaying a recording through a flowgraph.** Replace the SDR source with a *File Source* (type complex, repeat on) reading the cf32 file, and keep the rest of the flowgraph. Whether a *Throttle* is needed depends on the sinks:
+
+| Sinks in the flowgraph | Throttle |
+|---|---|
+| An Audio Sink | No: the sound card paces the flowgraph |
+| Only GUI sinks | Yes, at the recording's sample rate, right after the File Source |
+| Only file sinks or decoders, batch processing | No: let it run as fast as the CPU can |
+
+For a raw cs8 file, *File Source* (type byte) followed by *IChar To Complex* and a *Multiply Const* of `1/128` does the conversion inside the flowgraph. Most GNU Radio examples expect cf32, so converting once is simpler.
+
+**Head** passes N items and then ends the flowgraph: `File Source → Head (N = 8e6) → ...` processes the first second of a recording and stops, which suits tests and batch jobs.
+
+**Recording from a flowgraph:** a *File Sink* of type complex writes cf32. Record after the first decimating filter when you only need one channel: 500 ksps instead of 8 Msps is 16 times less disk.
+
+**SigMF metadata.** A raw file loses its frequency, rate and format as soon as it's renamed. SigMF (the Signal Metadata Format) keeps them in a JSON file next to the data: `NAME.sigmf-data` (the raw samples, unchanged) and `NAME.sigmf-meta`:
+
+```json
+{
+  "global": {
+    "core:datatype": "ci8",
+    "core:sample_rate": 8000000,
+    "core:version": "1.2.0",
+    "core:hw": "HackRF One r9, ANT500, amp off, LNA 16 dB, VGA 20 dB",
+    "core:recorder": "hackrf_transfer 2026.01.3",
+    "core:description": "FM broadcast band, station at +1 MHz"
+  },
+  "captures": [
+    { "core:sample_start": 0, "core:frequency": 97000000, "core:datetime": "2026-11-12T20:04:31Z" }
+  ],
+  "annotations": [
+    { "core:sample_start": 0, "core:sample_count": 80000000,
+      "core:freq_lower_edge": 97900000, "core:freq_upper_edge": 98100000,
+      "core:label": "FM station" }
+  ]
+}
+```
+
+`captures` records each retune (a new entry at the sample where the frequency changed); `annotations` marks signals in time and frequency. The `sigmf` Python package reads and validates these files, and viewers such as IQEngine display them with their annotations. Record the gains and the antenna in `core:hw`: without them, a recording's levels can't be compared with another's.
 
 ## 12. Digital signals: decoding a 433 MHz sensor
 

@@ -18,6 +18,7 @@ Every note aims to be practical, so you'll find configs and commands you can reu
 
 ## Latest notes
 
+- [Software-Defined Radio: HackRF One and GNU Radio](hardware/sdr/sdr.md)
 - [Root Filesystems for Embedded Linux](embedded-linux/fundamentals/rootfs/rootfs.md)
 - [The Linux Kernel for Embedded Linux](embedded-linux/fundamentals/kernel/kernel.md)
 - [Bootloaders for Embedded Linux: U-Boot](embedded-linux/fundamentals/bootloader/bootloader.md)

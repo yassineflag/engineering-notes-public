@@ -18,7 +18,7 @@ The protocol notes ([Wi-Fi](../../wireless-protocols-and-connectivity/wifi/wifi.
 - **Rule of thumb** marks practical advice that depends on the setup and the environment.
 - Every command is generic: it follows the documentation of the tool it calls and was not run for this note.
 
-**Verification status:** *Planned.*
+**Verification status:** nothing in this note was run. No device was connected, nothing was recorded or transmitted, and no flowgraph, script or program was executed. Commands, options and APIs follow the documentation and source of the tools: the HackRF documentation and the usage of `hackrf_transfer`, `hackrf_sweep` and `hackrf_spiflash`; GNU Radio 3.10's block documentation and the Python that GRC generates; SoapySDR, libiio and pyadi-iio, librtlsdr, rtl_433 and UHD. Versions were checked online in November 2026: HackRF release v2026.01.3 (also packaged by Debian), GNU Radio 3.10.12.0 in Debian, GNU Radio 4.0 at its third release candidate (October 2026). For the Pluto, v0.39 is the latest firmware release found. Hardware figures (TX power, frequency accuracy, practical USB rates, prices) are **typical** values from vendor documentation and common experience, not measurements. Scripts and flowgraph descriptions were written for this note and are untested; read them before using them.
 
 **How to read it:**
 - **To learn:** Parts 1 to 3 in order. They go from "what is an IQ sample" to a working FM receiver and a decoder for a 433 MHz sensor.
@@ -1395,12 +1395,122 @@ Test the layers in that order: USB alone (`/dev/null`), then the disk, then the 
 
 ## 19. Troubleshooting by symptom
 
-*Planned: Symptom tables for the device and USB, the signal, GNU Radio, transmission and the other devices.*
+**The device and USB:**
+
+| Symptom | Likely cause | Check, then see |
+|---|---|---|
+| `hackrf_info`: `No HackRF boards found.` | Not enumerated: a charge-only cable, a bad port, no firmware | `lsusb`: `1d50:6089` normal, `1fc9:000c` DFU mode, nothing at all: the cable (section 6) |
+| `hackrf_open() failed: Access denied (insufficient permissions)` | No udev rule, or the user isn't in `plugdev` yet | `id` shows `plugdev`; log out and in after `usermod` (section 6) |
+| `hackrf_open() failed: Resource busy` | Another program has the device open | Close GQRX, SDR++, other flowgraphs; `lsof | grep -i usb` |
+| Firmware and library versions differ in `hackrf_info`, or odd errors after an update | Host tools and firmware from different releases; two libhackrf copies installed | Flash the matching firmware; `which hackrf_info`, `ldd` (section 6) |
+| No device after `hackrf_spiflash` | Interrupted or wrong firmware file | DFU recovery (section 6) |
+| `Couldn't transfer any bytes for one second.` | USB stalled: power, cable, controller, hub | Another port directly on the machine; a powered setup (sections 16, 17) |
+| The rate in `hackrf_transfer` is below `2 × fs` bytes/s | Samples lost on USB or disk | `-r /dev/null` first, then the disk (section 17) |
+| `SoapySDR::Device::make() no match` | The Soapy module for the device isn't installed or doesn't load | `SoapySDRUtil --info` lists modules and load errors (section 6) |
+
+**The signal:**
+
+| Symptom | Likely cause | Check, then see |
+|---|---|---|
+| Nothing but noise | Wrong antenna for the band, gain too low, bias tee needed for an active antenna | A strong known signal first (FM broadcast); LNA up in 8 dB steps (section 8) |
+| A spike at the exact center | DC offset and LO leakage (zero-IF) | Offset tuning (section 8) |
+| A weaker copy of a signal on the other side of the center | IQ imbalance image | Retune by 100 kHz: an image moves twice as far (section 8) |
+| Signals everywhere, FM stations at odd frequencies, a raised floor | Front-end overload or ADC clipping | The 10 dB test; lower gain; a band-stop filter (section 8) |
+| Narrow lines that move with the center frequency | Spurs from the device itself | Note them; offset tuning around them (section 8) |
+| Signals a few kHz to tens of kHz off their known frequency | Crystal error | Measure ppm against a reliable signal (section 8) |
+| A narrow signal is noisy or distorted at low sample rates | Aliasing below 8 Msps | 8 Msps or more, decimate in software (section 5) |
+| Bursts missing from a long recording | Lost samples | Rate line, overflows (section 17) |
+| A recording looks like noise in a viewer or NumPy | Wrong format: cs8 read as cu8, cs16 as cf32, wrong sample rate | Format table (section 11); SigMF from then on |
+
+**GNU Radio:**
+
+| Symptom | Likely cause | Check, then see |
+|---|---|---|
+| `aU` on the console, choppy audio | The rate plan doesn't end at the audio sink's rate, the CPU can't keep up, or a Throttle also paces the graph | Recompute the rate plan; `top -H` (section 10) |
+| `O` or overflow messages | The flowgraph is slower than the source | Decimate earlier, remove GUI sinks, lower the rate (sections 10, 16, 17) |
+| Audio at the wrong pitch, filters cutting the wrong band | Blocks disagree about the sample rate | Every rate derived from GRC variables (section 9) |
+| A file-only flowgraph uses 100% CPU and the GUI races | No clock in the flowgraph | Add a Throttle (section 11) |
+| `ModuleNotFoundError: No module named 'osmosdr'` (or `soapy`, `iio`) | The package isn't installed for this Python | `apt install gr-osmosdr`; same Python as GNU Radio |
+| An OOT block is missing in GRC, or `AttributeError` on import | GRC doesn't search `/usr/local`; bindings not regenerated; `ldconfig` not run | `local_blocks_path`, `gr_modtool bind`, `PYTHONPATH` (section 13) |
+| The constellation is a ring or a cloud | No carrier or timing lock: wrong samples per symbol, too much frequency offset | Symbol Sync parameters, Costas loop order (section 12) |
+
+**Transmission:**
+
+| Symptom | Likely cause | Check, then see |
+|---|---|---|
+| Nothing on the receiver | TX VGA at 0 and too much attenuation, wrong frequency, the receiver is the same HackRF | Raise `-x` in steps; a second receiver (section 14) |
+| A wide, splattered signal | Digital amplitude above 1.0 clips | Keep the amplitude below about 0.7 (section 14) |
+| A line at the TX center frequency | LO leakage | Offset the signal from the center (section 14) |
+| Signals at 2× and 3× the frequency | Harmonics: the HackRF has no output filter | A filter before any antenna (section 14) |
+| The receiving SDR stops working after a test | Too much power at its input | Attenuation: below -30 dBm at the receiver, never above -5 dBm for a HackRF (sections 5, 14) |
+
+**Other devices:**
+
+| Symptom | Likely cause | Check, then see |
+|---|---|---|
+| RTL-SDR: `usb_claim_interface error -6` | The DVB-T driver holds the stick | Blacklist `dvb_usb_rtl28xxu` (section 15) |
+| RTL-SDR Blog V4: wrong frequencies, no HF | librtlsdr without V4 support | A librtlsdr with V4 support (section 15) |
+| Pluto not at 192.168.2.1 | The USB network interface isn't up on the host, or `config.txt` changed the address | `ip addr` for a new `usb0` or `enx...` interface; read `config.txt` on the mass storage (section 16) |
+| Pluto: overflows above a few Msps | USB 2.0 throughput | 4 Msps or less, or process on the Pluto (section 16) |
+| `iio_attr` options rejected | libiio 1.0 tools against 0.2x syntax, or the reverse | `iio_info -V`; the tool's `--help` (section 15) |
+| USRP: `FPGA image not found` or version mismatch | Images don't match the UHD version | `uhd_images_downloader` (section 15) |
+| GNSS: no fix | No antenna power, no sky view, large frequency error | Bias tee, antenna outdoors, an external reference (section 18) |
 
 ## 20. Not covered here
 
-*Planned: Topics left to other notes.*
+- **Signal processing in depth**: filter design, the FFT, windows, multirate systems: the [signal processing](../signal-processing/) folder.
+- **Modulation, synchronization and coding theory**: matched filters, carrier and timing recovery, OFDM, channel coding: the [baseband](../baseband/) folder.
+- **RF design**: antennas, LNAs, filters, mixers, link budgets: the [RF](../rf/) folder.
+- **The protocols**: what Wi-Fi and cellular transmit and why: the [Wi-Fi](../../wireless-protocols-and-connectivity/wifi/wifi.md) and [cellular](../../wireless-protocols-and-connectivity/cellular/cellular.md) notes.
+- **FPGA development for SDR**: RFNoC, the ADI HDL reference designs, RFSoC.
+- **GNU Radio 4.0**: its block API and scheduler, once released.
+- **The PortaPack and its firmware**, the Opera Cake, and the HackRF Pro.
+- **Security research on radio devices** (replay, rolling codes, jamming detection): only on your own devices, within the law (section 2).
 
 ## References
 
-*Planned.*
+HackRF (https://greatscottgadgets.com/hackrf/):
+
+- Documentation: https://hackrf.readthedocs.io: hardware components, the frequency plan, gain stages, sample rates, firmware updates and DFU recovery, CLKIN/CLKOUT and hardware triggering, `hackrf_sweep`.
+- Source and releases: https://github.com/greatscottgadgets/hackrf
+- `hackrf_transfer -h`, `hackrf_sweep -h`: every option.
+
+GNU Radio (https://www.gnuradio.org):
+
+- Wiki and tutorials: https://wiki.gnuradio.org: the beginner tutorials, *Your First Flowgraph*, *Creating Python OOT with gr-modtool*, *Creating C++ OOT with gr-modtool*, *Stream Tags*, *Message Passing*, *Embedded Python Block*.
+- Block documentation: https://wiki.gnuradio.org/index.php/Category:Block_Docs
+- VOLK: https://www.libvolk.org
+- News, including the GNU Radio 4.0 release candidates: https://www.gnuradio.org/news/
+
+Drivers and APIs:
+
+- SoapySDR: https://github.com/pothosware/SoapySDR/wiki
+- UHD and the USRP manual: https://files.ettus.com/manual/
+- libiio: https://analogdevicesinc.github.io/libiio/ and pyadi-iio: https://analogdevicesinc.github.io/pyadi-iio/
+- ADALM-Pluto: https://wiki.analog.com/university/tools/pluto and the firmware: https://github.com/analogdevicesinc/plutosdr-fw
+- RTL-SDR: https://osmocom.org/projects/rtl-sdr/wiki and the RTL-SDR Blog V4 guide: https://www.rtl-sdr.com/V4/
+- Linux IIO: https://docs.kernel.org/driver-api/iio/
+
+Tools:
+
+- inspectrum: https://github.com/miek/inspectrum
+- Universal Radio Hacker: https://github.com/jopohl/urh
+- rtl_433: https://github.com/merbanan/rtl_433 (and its `docs/ANALYZE.md` for unknown devices)
+- GQRX: https://gqrx.dk; SDR++: https://github.com/AlexandreRouma/SDRPlusPlus
+- SigMF specification: https://github.com/sigmf/SigMF
+- SatDump: https://github.com/SatDump/SatDump; AIS-catcher: https://github.com/jvde-github/AIS-catcher
+- gnss-sdr: https://gnss-sdr.org
+- srsRAN: https://www.srsran.com; OpenAirInterface: https://openairinterface.org
+
+Regulation:
+
+- ERC Recommendation 70-03 (short range devices in CEPT countries): https://docdb.cept.org
+- FCC Part 15: 47 CFR Part 15, https://www.ecfr.gov
+- Your national regulator, for licences and the exact rules of each band.
+
+Books and courses:
+
+- Marc Lichtman, *PySDR: A Guide to SDR and DSP using Python* (free): https://pysdr.org: IQ sampling, filters, synchronization, with the Pluto and other devices.
+- Michael Ossmann, *Software Defined Radio with HackRF* (free video course): https://greatscottgadgets.com/sdr/
+- Travis F. Collins, Robin Getz, Di Pu, Alexander M. Wyglinski, *Software-Defined Radio for Engineers* (Artech House, 2018; free PDF from Analog Devices), built around the Pluto.
+- Richard G. Lyons, *Understanding Digital Signal Processing*: the DSP behind every block.

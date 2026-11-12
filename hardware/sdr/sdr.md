@@ -246,19 +246,327 @@ This note uses the HackRF One because it covers both directions and the widest f
 
 ## 5. Inside the HackRF One
 
-*Planned: The block diagram, the frequency plan with the mixer and the IF, the gain stages, the baseband filter, the clock, half-duplex operation, the firmware and the CPLD, limits and the HackRF Pro.*
+The HackRF One is a two-stage design: a wideband mixer brings any frequency from 1 MHz to 6 GHz to an intermediate frequency (IF) around 2.5 GHz, and a zero-IF transceiver chip converts that IF to baseband I and Q.
+
+```
+ ANTENNA (SMA) ─ RF switches ─┬─ RX amplifier (on/off) ─┐
+                              └─ TX amplifier (on/off) ─┤
+                                                        │  frequency plan (approximate):
+                       ┌─ low-pass path, below ~2.15 GHz: RFFC5072 mixer, up to the IF
+         RF filters ───┼─ bypass, ~2.15 to 2.75 GHz:      straight to the transceiver
+                       └─ high-pass path, above ~2.75 GHz: RFFC5072 mixer, down to the IF
+                                                        │
+       MAX2839 (r9) or MAX2837 transceiver, 2.3 to 2.7 GHz:
+         RX: LNA ─ quadrature mixer ─ baseband filter ─ VGA ─┐
+         TX: VGA ─ baseband filter ─ quadrature mixer ───────┤
+                                                             │
+       MAX5864 ADC / DAC (8 bits, I and Q) ─ CPLD ─ LPC4320 microcontroller ─ USB 2.0 high speed ─ host
+
+       Si5351C clock generator: on-board crystal, or a 10 MHz reference on CLKIN
+         ─> sample clock, mixer and transceiver references, CLKOUT
+```
+
+**Gain stages.** Each tool names them differently; this table maps the names:
+
+| Stage | Direction | Range | `hackrf_transfer` | SoapySDR | gr-osmosdr |
+|---|---|---|---|---|---|
+| RF amplifier | RX and TX | Off, or on (about 11 to 14 dB) | `-a 0` / `-a 1` | `AMP` | RF gain (0 or 14) |
+| LNA (in the transceiver, at IF) | RX | 0 to 40 dB in 8 dB steps | `-l` | `LNA` | IF gain |
+| Baseband VGA | RX | 0 to 62 dB in 2 dB steps | `-g` | `VGA` | BB gain |
+| TX VGA | TX | 0 to 47 dB in 1 dB steps | `-x` | `VGA` | IF gain |
+
+**Sample rate and filter.** The sample rate goes from 2 to 20 Msps. The HackRF documentation recommends **8 Msps or more**: the ADC is specified from 8 Msps up, and the baseband filter's narrowest setting (1.75 MHz) can't prevent aliasing at lower rates. To work on a narrow signal, sample at 8 Msps or more and decimate in software (section 10). The **baseband filter** is programmable from 1.75 to 28 MHz. The tools set it to about three quarters of the sample rate unless you set it yourself (`-b`).
+
+**Limits to respect:**
+
+| Limit | Value | Consequence |
+|---|---|---|
+| Maximum input power | **-5 dBm** | Above it, the front end can be permanently damaged. Never connect a transmitter, including another HackRF, without attenuators (section 14) |
+| TX output power | **Typical**: up to about 10 to 15 dBm below 2.7 GHz, falling to about 0 dBm at 4 GHz and below 0 dBm near 6 GHz | Varies with frequency and unit; measure it if it matters |
+| Duplex | Half: one antenna port, receive or transmit, not both | No two-way real-time protocols (cellular stacks need full duplex) |
+| Resolution | 8 bits | About 48 dB of dynamic range in the full band (section 3) |
+| Frequency accuracy | An on-board crystal, **typically** within ±10 to 20 ppm | Tens of kHz of error at GHz frequencies until calibrated (section 8) |
+| Antenna port power | 3.3 V, up to 50 mA, when enabled (`-p 1`) | Powers active antennas and LNAs; can damage equipment that shorts DC. Off by default |
+
+**Clocks.** CLKIN accepts a 10 MHz reference (check the hardware documentation for the level), and the HackRF switches to it when it detects one. CLKOUT outputs 10 MHz to drive another device. A header on the board carries a trigger signal to start several HackRFs together (section 17).
+
+**Firmware.** The LPC4320 runs firmware stored in SPI flash. It configures the chips, moves samples between the CPLD and USB, and implements the sweep mode. The CPLD bitstream is part of the firmware image and is loaded at boot by current releases, so one file updates both. The host library (libhackrf) and the firmware talk through a versioned USB API: use the **same release on both sides** (section 6).
+
+**USB identities:** `1d50:6089` in normal operation, `1fc9:000c` (the NXP boot ROM) in DFU recovery mode.
+
+**Add-ons not covered here:** the Opera Cake antenna switch, and the PortaPack screen with its community firmware (Mayhem), which turn the HackRF into a stand-alone device.
 
 ## 6. Installing the host software and updating the firmware
 
-*Planned: Debian packages, USB permissions, hackrf_info, firmware updates and DFU recovery, SoapySDR and gr-osmosdr, GUI receivers.*
+**Packages:**
+
+```sh
+$ sudo apt install hackrf libhackrf-dev \
+      gnuradio gnuradio-dev gr-osmosdr \
+      soapysdr-tools soapysdr-module-hackrf \
+      gqrx-sdr inspectrum rtl-433 python3-numpy python3-matplotlib
+$ apt policy hackrf gnuradio
+```
+
+| Package | What it brings |
+|---|---|
+| `hackrf`, `libhackrf-dev` | `hackrf_info`, `hackrf_transfer`, `hackrf_sweep`, `hackrf_spiflash`, `hackrf_clock`, `hackrf_debug`; the library and its header |
+| `gnuradio`, `gnuradio-dev` | GNU Radio 3.10, GNU Radio Companion (`gnuradio-companion`), `gr_modtool` and the development headers (section 13) |
+| `gr-osmosdr` | The *osmocom Source/Sink* blocks: one block for HackRF, RTL-SDR, bladeRF, USRP and others |
+| `soapysdr-tools`, `soapysdr-module-hackrf` | `SoapySDRUtil` and the HackRF module for SoapySDR, used by GNU Radio's own *Soapy* blocks and by many applications (section 15) |
+| `gqrx-sdr`, `inspectrum`, `rtl-433` | A GUI receiver, a recording viewer, a decoder for ISM-band devices |
+
+**Versions.** `apt policy` shows what Debian provides. The host tools and the firmware should come from the same HackRF release. If the packaged tools are older than the firmware you want, either flash the firmware of the packaged release, or build the host tools from the release tarball:
+
+```sh
+$ cd $SDR
+$ wget https://github.com/greatscottgadgets/hackrf/releases/download/v2026.01.3/hackrf-2026.01.3.tar.xz
+$ tar xf hackrf-2026.01.3.tar.xz
+$ cd hackrf-2026.01.3/host
+$ cmake -B build -DCMAKE_INSTALL_PREFIX=/usr/local
+$ cmake --build build -j$(nproc)
+$ sudo cmake --install build && sudo ldconfig
+```
+
+Remove the Debian `hackrf` package first, or check with `which hackrf_info` and `ldd $(which hackrf_info)` which copy runs: two libhackrf versions on one system cause API mismatches.
+
+**USB permissions.** The package installs a udev rule that gives the `plugdev` group access to the device. Add yourself to the group, then log out and in again:
+
+```sh
+$ sudo usermod -aG plugdev $USER
+$ lsusb | grep -i hackrf
+```
+
+**Expected:**
+
+```
+Bus 001 Device 007: ID 1d50:6089 OpenMoko, Inc. Great Scott Gadgets HackRF One SDR
+```
+
+**hackrf_info:**
+
+```sh
+$ hackrf_info
+```
+
+**Expected** (the serial number and part ID are placeholders):
+
+```
+hackrf_info version: 2026.01.3
+libhackrf version: 2026.01.3 (0.9)
+Found HackRF
+Index: 0
+Serial number: 0000000000000000xxxxxxxxxxxxxxxx
+Board ID Number: 2 (HackRF One)
+Firmware Version: 2026.01.3 (API:1.09)
+Part ID Number: 0xa000cb3c 0x00xxxxxx
+Hardware Revision: r9
+Hardware appears to have been manufactured by Great Scott Gadgets.
+Hardware supported by installed firmware:
+    HackRF One
+```
+
+Check that the firmware version matches the `libhackrf` version, and that the hardware revision is listed as supported.
+
+**Updating the firmware** of a working HackRF, from the release tarball above:
+
+```sh
+$ hackrf_spiflash -w $SDR/hackrf-2026.01.3/firmware-bin/hackrf_one_usb.bin
+```
+
+Then press **RESET** on the board (or unplug it) and run `hackrf_info` again. Use `hackrf_one_usb.bin` for a HackRF One; other boards (HackRF Pro, Jawbreaker, rad1o) have their own files.
+
+**DFU recovery**, when a bad flash leaves the board without working firmware:
+
+1. Hold the **DFU** button and press **RESET** (or plug it in while holding DFU), then release DFU. `lsusb` shows `1fc9:000c`.
+2. Load the firmware into RAM and run it, then write it to flash from there:
+
+```sh
+$ sudo apt install dfu-util
+$ dfu-util --device 1fc9:000c --alt 0 --download $SDR/hackrf-2026.01.3/firmware-bin/hackrf_one_usb.dfu
+$ hackrf_spiflash -w $SDR/hackrf-2026.01.3/firmware-bin/hackrf_one_usb.bin
+```
+
+The `.dfu` file runs from RAM only; the second command makes the update permanent.
+
+**SoapySDR** sees the HackRF through its module:
+
+```sh
+$ SoapySDRUtil --info                    # lists the installed modules; look for hackrf
+$ SoapySDRUtil --find="driver=hackrf"
+$ SoapySDRUtil --probe="driver=hackrf"   # sample rates, gains and their ranges, antennas
+```
+
+**Expected** for `--find`:
+
+```
+Found device 0
+  device = HackRF One
+  driver = hackrf
+  label = HackRF One #0 xxxxxxxx
+  part_id = a000cb3c00xxxxxx
+  serial = 0000000000000000xxxxxxxxxxxxxxxx
+  version = 2026.01.3
+```
+
+**Device strings** select a device in each framework:
+
+| Framework | String | With several devices |
+|---|---|---|
+| SoapySDR | `driver=hackrf` | `driver=hackrf,serial=<serial>` |
+| gr-osmosdr (GQRX, osmocom blocks) | `hackrf=0` | `hackrf=<serial>` |
+| hackrf tools | (first device) | `-d <serial>` |
+
+**A GUI receiver** is the quickest way to check that everything works. In **GQRX**, choose the HackRF device (string `hackrf=0`), an input rate of 8 Msps, and the WFM (stereo) mode, then tune to `$FM_HZ`. **SDR++** (binaries on its GitHub release page) has its own HackRF source module. Only one program can open the HackRF at a time: close GQRX before running `hackrf_transfer` or a flowgraph.
 
 ## 7. First reception with the command-line tools
 
-*Planned: hackrf_transfer to a file, the cs8 format, hackrf_sweep, looking at a recording with inspectrum, GQRX and SDR++.*
+**Recording to a file.** Tune 1 MHz below the FM station, so that it lands at +1 MHz and not on the spike at the center (section 8), and record 10 seconds at 8 Msps:
+
+```sh
+$ CF=$((FM_HZ - 1000000))
+$ hackrf_transfer -r $REC/fm_${CF}_8M.cs8 -f $CF -s 8000000 -n 80000000 -a 0 -l 16 -g 20
+```
+
+| Option | Meaning |
+|---|---|
+| `-r FILE` | Receive to a file (`-` for standard output) |
+| `-f HZ` | Center frequency |
+| `-s HZ` | Sample rate |
+| `-n N` | Number of samples, then stop (10 s at 8 Msps here); without it, Ctrl-C stops |
+| `-a 0`, `-l 16`, `-g 20` | RF amplifier off, LNA 16 dB, VGA 20 dB (section 8) |
+| `-b HZ` | Baseband filter bandwidth, when the default isn't wanted |
+| `-p 1` | Antenna port power on (active antennas only) |
+
+**Expected** (the line format differs between releases):
+
+```
+call hackrf_set_sample_rate(8000000 Hz/8.000 MHz)
+call hackrf_set_hw_sync_mode(0)
+call hackrf_set_freq(97000000 Hz/97.000 MHz)
+Stop with Ctrl-C
+15.3 MiB / 1.000 sec = 15.3 MiB/second, average power -21.4 dBfs
+15.3 MiB / 1.000 sec = 15.3 MiB/second, average power -21.5 dBfs
+...
+Exiting...
+Total time: 10.00012 s
+```
+
+Two numbers to watch. The **rate** must match `2 × fs` bytes per second (8 Msps × 2 bytes = 16 MB/s = 15.3 MiB/s); less means samples are being lost (section 17). The **average power** should stay well below 0 dBfs; a value near 0 means clipping (section 8).
+
+**The file** has no header: it is a raw sequence of bytes `I0 Q0 I1 Q1 ...`, each a signed 8-bit integer (-128 to 127). That format is called **cs8** (complex signed 8-bit), `ci8` in SigMF. The center frequency and sample rate exist only in the file name, which is why this note puts them there, or in a SigMF metadata file (section 11). Ten seconds at 8 Msps is 160 MB; at 20 Msps, 400 MB.
+
+**Viewing it** in inspectrum, which reads the format from the extension (`.cs8`, `.cu8`, `.cs16`, `.cf32`):
+
+```sh
+$ inspectrum $REC/fm_${CF}_8M.cs8
+```
+
+Set the sample rate to 8000000 in the side panel. Time runs down, frequency across; the FM station is a wide band 1 MHz right of the center. inspectrum is most useful for bursts (section 12): its cursors measure durations and symbol rates.
+
+**Sweeping a wide range.** `hackrf_sweep` retunes quickly across a range and outputs power per frequency bin, faster than any GUI receiver:
+
+```sh
+$ hackrf_sweep -f 80:120 -w 100000 -a 0 -l 16 -g 20 -1 -r $REC/sweep_80-120.csv
+```
+
+| Option | Meaning |
+|---|---|
+| `-f MIN:MAX` | Range in MHz |
+| `-w HZ` | Bin width |
+| `-1` | One sweep, then exit (without it, sweeps repeat until Ctrl-C) |
+| `-r FILE` | Output file (standard output by default) |
+
+Each output line covers a slice of a few MHz: date, time, low and high frequencies in Hz, bin width, number of samples, then one power value per bin, in dB. **Expected** (truncated):
+
+```
+2026-11-12, 21:04:31.512048, 80000000, 85000000, 100000.00, 20, -71.32, -70.85, -69.97, -72.10, ...
+```
+
+A short script turns sweeps into a max-hold plot, which shows every transmitter in the range:
+
+```python
+#!/usr/bin/env python3
+# sweep-plot.py FILE: max-hold plot of hackrf_sweep CSV output
+import sys
+import numpy as np
+import matplotlib.pyplot as plt
+
+peak = {}
+for line in open(sys.argv[1]):
+    f = line.split(",")
+    lo, step = float(f[2]), float(f[4])
+    for i, db in enumerate(f[6:]):
+        hz = lo + (i + 0.5) * step
+        peak[hz] = max(peak.get(hz, -200.0), float(db))
+hz = np.array(sorted(peak))
+plt.plot(hz / 1e6, [peak[h] for h in hz])
+plt.xlabel("MHz"); plt.ylabel("dB (uncalibrated)"); plt.grid(True)
+plt.show()
+```
+
+```sh
+$ python3 $SDR/sweep-plot.py $REC/sweep_80-120.csv
+```
+
+The power values are relative (section 3): they compare frequencies within one sweep, not with other devices.
 
 ## 8. Gain, overload and calibration
 
-*Planned: Gain staging, ADC clipping and front-end overload, the DC spike and offset tuning, IQ imbalance and images, frequency error in ppm and how to measure it, external references.*
+**Gain staging.** Too little gain buries weak signals under the receiver's own noise; too much clips the ADC or overloads the front end, and creates signals that don't exist. **Rule of thumb** for the HackRF:
+
+1. Start with the RF amplifier off, LNA 16 dB, VGA 20 dB.
+2. Raise the LNA in 8 dB steps while watching the noise floor on a spectrum display. Stop when it rises by a few dB: from then on, the noise you see comes from the antenna, and more gain only reduces dynamic range.
+3. Use the VGA to set the digital level: peaks well below full scale, average power in the -30 to -15 dBfs range.
+4. Turn the RF amplifier on only for weak signals with no strong transmitter nearby, typically above 1 GHz.
+
+**Clipping** shows in the time domain: in a *QT GUI Time Sink*, I or Q flat at ±1.0 (±127 in the raw file). In the spectrum it shows as a raised floor and spurs everywhere.
+
+**Front-end overload** is subtler: a strong signal outside the band you look at (FM broadcast, a nearby cell tower, a pager transmitter) saturates the amplifiers or the mixer before any filter can remove it. The result is **intermodulation**: signals at combinations of the strong ones (`2·f1 - f2`, `f1 + f2`). **The 10 dB test** tells real signals from products: lower the gain by 10 dB (or insert a 10 dB attenuator). A real signal drops by 10 dB; a third-order product drops by about 30 dB and often disappears.
+
+| Fix | When |
+|---|---|
+| Lower the front-end gain first (amplifier, then LNA) | Always the first step |
+| A band-stop filter for the offending band (FM broadcast is the usual one) | A known strong band outside the one you want |
+| A band-pass filter for the band you want | A fixed application (ADS-B at 1090 MHz, GNSS) |
+| Move the antenna away from the transmitter, or indoors | A tower or a pager transmitter next door |
+| A receiver with more bits and better front-end filtering | Constant strong-signal environments (section 4) |
+
+**The DC spike.** In a zero-IF stage, DC offsets and LO leakage appear as a spike at exactly the center frequency. Two fixes:
+
+- **Offset tuning**: tune the hardware a few hundred kHz to 1 MHz away from the signal, and shift it to 0 Hz in software (section 10). The spike stays where nothing is.
+- A **DC Blocker** block (a narrow high-pass filter). It also removes the signal's own content near 0 Hz, so it's fine for a wide signal but not for one centered on the spike.
+
+**IQ imbalance and images.** If the I and Q paths differ slightly in gain or phase, every signal gets a weak **mirror image** at the opposite offset: a signal at `fc + 1 MHz` creates a ghost at `fc - 1 MHz`, typically 25 to 40 dB lower. To tell an image from a real signal, change `fc` by 100 kHz: a real signal stays at the same absolute frequency, and an image moves by 200 kHz. Offset tuning puts the image where it does no harm. GQRX has an IQ balance setting; AD936x-based devices (Pluto, USRP B2xx, bladeRF 2.0) correct it on chip.
+
+**Spurs** from the device's own clocks, mixers and USB activity show as narrow fixed lines. A spur stays at the same offset from the center when you retune, or jumps around; a real signal stays put in absolute frequency. Note the spurs of your device at the frequencies you use.
+
+**Frequency error.** The crystal's error is a fraction of its frequency, given in **parts per million** (ppm), and every frequency derived from it carries the same fraction:
+
+```
+error (Hz) = ppm × f / 1e6        20 ppm at 100 MHz: 2 kHz    at 1 GHz: 20 kHz    at 2.4 GHz: 48 kHz
+```
+
+That's harmless for FM broadcast (200 kHz channels), annoying for narrow FM (12.5 kHz channels), and blocking for LTE cell search and GNSS acquisition, which only search a limited frequency range. The sample rate carries the same error, which matters for long recordings and timing measurements.
+
+**Measuring the error:** receive a signal whose frequency is known to be accurate, and compare. Measure after 10 to 15 minutes of warm-up; the crystal drifts by a few ppm as the board heats.
+
+| Reference | Accuracy | How |
+|---|---|---|
+| An LTE or NR cell | Base stations hold ±0.05 ppm (3GPP TS 36.104, TS 38.104) | A cell scanner reports the offset (section 18) |
+| A GSM cell, where they still exist | Same requirement | `kal` (kalibrate) for the device |
+| A GPS-disciplined signal generator or reference | Better than 0.01 ppm | Measure the peak of its tone on a fine FFT |
+| FM broadcast carriers | Allowed ±2 kHz: too loose | Not a reference |
+
+If the measured frequency of a known signal is `f_meas` and its true frequency `f_true`, the error is `ppm = (f_meas - f_true) / f_true × 1e6`. A fast crystal makes signals appear **low**. To correct, tune to `f × (1 + ppm/1e6)` with the ppm value as measured (negative when signals appear low), or use the framework's correction parameter (gr-osmosdr: *Freq. Corr. (ppm)*). Recalibrate when the temperature changes a lot.
+
+**An external reference** removes the problem instead: a 10 MHz signal from a GPS-disciplined oscillator (GPSDO) on CLKIN brings the HackRF to the reference's accuracy, typically parts per billion. Check that it is in use:
+
+```sh
+$ hackrf_clock -i
+```
+
+The output reports whether a clock signal is detected on CLKIN.
 
 ## 9. GNU Radio concepts: flowgraphs, blocks, streams, tags and messages
 

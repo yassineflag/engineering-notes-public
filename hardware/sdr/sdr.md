@@ -836,15 +836,285 @@ For a raw cs8 file, *File Source* (type byte) followed by *IChar To Complex* and
 
 ## 12. Digital signals: decoding a 433 MHz sensor
 
-*Planned: Finding the signal, OOK demodulation in GNU Radio, reading pulse widths, line codes, FSK and PSK receivers in outline, URH and rtl_433 as references.*
+Cheap wireless devices in the 433 MHz band (weather sensors, doorbells, remote sockets) mostly use **OOK** (on-off keying: the carrier is on or off), sometimes 2-FSK (two frequencies). Their frames are short bursts, repeated a few times. This section decodes one of your own devices; the method is the same for any unknown signal.
+
+**1. Find it.** In GQRX or SDR++, tune to 433.92 MHz with a few Msps of bandwidth and watch the waterfall: weather sensors send every 30 to 60 seconds, doorbells and remotes when pressed. Cheap transmitters can be 100 to 200 kHz off their nominal frequency, so note where the bursts really are.
+
+**2. Record a burst.** Tune 1 MHz below and record 3 seconds while you press the button (or around the sensor's next transmission):
+
+```sh
+$ CF=$((ISM_HZ - 1000000))
+$ hackrf_transfer -r $REC/ism_${CF}_8M.cs8 -f $CF -s 8000000 -n 24000000 -a 0 -l 24 -g 20
+```
+
+**3. Look at it** in inspectrum (sample rate 8000000). Zoom into a burst. Right-click it and add an **amplitude plot** derived from the selection: the pulses appear as a square wave. Enable the cursors and set them over a few pulses to read their duration and the symbol rate.
+
+**4. Measure the pulses.** A short script shifts the burst to 0 Hz, takes the envelope, and prints the width of each pulse and gap. The offset argument is where the burst sits relative to the center (about +920 kHz for a sensor exactly on 433.92 MHz):
+
+```python
+#!/usr/bin/env python3
+# ook-pulses.py FILE.cs8 FS OFFSET_HZ: pulse and gap widths of the OOK bursts in a recording
+import sys
+import numpy as np
+
+path, fs, off = sys.argv[1], float(sys.argv[2]), float(sys.argv[3])
+raw = np.fromfile(path, np.int8).astype(np.float32) / 128.0
+iq = (raw[0::2] + 1j * raw[1::2]).astype(np.complex64)
+iq *= np.exp(-2j * np.pi * off / fs * np.arange(len(iq))).astype(np.complex64)  # burst to 0 Hz
+width = int(fs / 200e3)                                     # moving average: ~200 kHz low-pass
+env = np.abs(np.convolve(iq, np.ones(width, np.float32) / width, mode="same"))
+threshold = (env.max() + np.median(env)) / 2                 # halfway between noise and pulses
+on = env > threshold
+edges = np.flatnonzero(np.diff(on.astype(np.int8))) + 1
+state = on[edges[0]]
+for w in np.diff(edges)[:300] / fs * 1e6:
+    print(f"{'pulse' if state else 'gap  '} {w:9.1f} us")
+    state = not state
+```
+
+```sh
+$ python3 $SDR/ook-pulses.py $REC/ism_${CF}_8M.cs8 8e6 920e3
+```
+
+**Expected** shape of the output (the widths depend on the device):
+
+```
+pulse     500.4 us
+gap      1001.2 us
+pulse     499.9 us
+gap      2003.0 us
+pulse     500.1 us
+gap      1000.8 us
+...
+gap      9001.5 us
+```
+
+Two or three distinct widths, then a long gap between repetitions of the frame.
+
+**5. Find the line code:**
+
+| Code | What carries the bit | Looks like |
+|---|---|---|
+| PWM (pulse width) | Short pulse = one value, long pulse = the other; constant period | Two pulse widths, gaps that complement them |
+| PPM (pulse position, gap width) | Constant pulse; short or long gap | One pulse width, two gap widths (the output above) |
+| Manchester | The direction of the transition in the middle of each bit | Pulses and gaps of one or two half-bit widths |
+| NRZ | The level during each bit period | Widths that are multiples of one bit period |
+
+**6. Turn bits into fields.** Write the bits of several frames one above the other and compare them with what changed between transmissions (the temperature, the button pressed): the constant part is a preamble or an identifier, a changing byte or two is the value, and the last bits are often a checksum or a CRC.
+
+**The same steps in GNU Radio**, live or on a recording:
+
+```
+Source ─> Frequency Xlating FIR Filter ─> Complex to Mag ─> Moving Average ─> QT GUI Time Sink (triggered)
+          center = offset, decimation 32,                    length 10,         ─> Threshold ─> Float To Char ─> File Sink
+          low-pass 100 kHz: 250 ksps                         scale 1/10            (hysteresis)    (0 and 1 bytes)
+```
+
+Set the time sink's trigger to *Normal* on a level between noise and pulses: it then shows each burst, still on screen. The *Threshold* block's two levels (low and high) give hysteresis, so noise on the edges doesn't create extra pulses.
+
+**Reference tools:**
+
+- **rtl_433** decodes several hundred device types and has a generic pulse analyzer. Despite the name it reads files from any SDR and drives SoapySDR devices:
+
+```sh
+$ rtl_433 -r $REC/ism_${CF}_8M.cs8 -s 8M -A               # -A: pulse analysis and a guess at the coding
+$ rtl_433 -d driver=hackrf -f 433.92M -s 2M -g "LNA=24,VGA=20"   # live, all known decoders
+```
+
+  Its analyzer output proposes a flexible decoder (`-X 'n=name,m=OOK_PPM,s=...,l=...,r=...'`) with the measured widths, which decodes the device from then on.
+
+- **Universal Radio Hacker** (URH, `pipx install urh`) records from a HackRF, detects the modulation and bit length, shows the bits of each frame side by side, and applies decodings (Manchester, inversion). Its generator tab builds frames for transmission (section 14).
+
+**FSK and PSK receivers**, in outline. Each block corrects one impairment of a real signal:
+
+| Impairment | FSK chain | PSK chain |
+|---|---|---|
+| Wrong channel, too much bandwidth | Frequency Xlating FIR Filter | Same |
+| Unknown amplitude | (FM demodulation ignores it) | AGC |
+| Modulation to symbols | Quadrature Demod (gain `fs / (2π · deviation)`) | (stays complex) |
+| Symbol timing | Symbol Sync (Gardner or Mueller-Müller detector, samples per symbol = `fs / baud`) | Symbol Sync with a root-raised-cosine matched filter |
+| Frequency and phase offset | (small offsets only shift the demodulated level) | Costas Loop (order 2 for BPSK, 4 for QPSK) |
+| Multipath | | Linear Equalizer |
+| Symbols to bits | Binary Slicer | Constellation Decoder, then Differential Decoder if differentially coded |
+| Start of the packet | Correlate Access Code - Tag Stream (the sync word) | Same |
+
+The *QT GUI Constellation Sink* after the Costas loop shows whether the receiver has locked: four tight clusters for QPSK, a ring or a cloud when it hasn't. The theory of these loops belongs to the [baseband](../baseband/) notes.
 
 ## 13. Writing your own blocks
 
-*Planned: The Embedded Python Block, out-of-tree modules with gr_modtool, a C++ block and its work function, bindings, VOLK, installing and debugging.*
+**An Embedded Python Block** lives inside the `.grc` file: add the block in GRC, open its code editor, and replace the template. This one passes samples through and tags the start and end of each burst above a threshold, which makes bursts visible to every block downstream:
+
+```python
+import numpy as np
+import pmt
+from gnuradio import gr
+
+
+class blk(gr.sync_block):
+    """Burst tagger: tags the first and last sample of each burst above a threshold"""
+
+    def __init__(self, threshold=0.1):
+        gr.sync_block.__init__(self, name="Burst tagger",
+                               in_sig=[np.complex64], out_sig=[np.complex64])
+        self.threshold = threshold
+        self.active = False
+
+    def work(self, input_items, output_items):
+        x = input_items[0]
+        output_items[0][:] = x
+        above = np.abs(x) > self.threshold
+        before = np.concatenate(([self.active], above[:-1]))
+        for i in np.flatnonzero(above != before):
+            self.active = bool(above[i])
+            key = "burst_start" if self.active else "burst_end"
+            self.add_item_tag(0, self.nitems_written(0) + i, pmt.intern(key), pmt.PMT_T)
+        return len(x)
+```
+
+The constructor arguments become the block's parameters in GRC. `work()` receives NumPy arrays and must return the number of items it produced. Vectorized NumPy code keeps up with a few Msps; a Python loop over every sample is about a thousand times slower, which is why the loop above runs only over the transitions.
+
+**An out-of-tree (OOT) module** is the way to package blocks in C++ or Python, reuse them across flowgraphs and install them:
+
+```sh
+$ cd $SDR
+$ gr_modtool newmod lab                    # creates gr-lab/
+$ cd gr-lab
+$ gr_modtool add -t sync -l cpp burst_tagger --argument-list "float threshold" --add-python-qa
+```
+
+| Path | What to edit |
+|---|---|
+| `include/gnuradio/lab/burst_tagger.h` | The public interface: `make()` and setters |
+| `lib/burst_tagger_impl.h`, `lib/burst_tagger_impl.cc` | The implementation: the constructor (input and output signatures) and `work()` |
+| `python/lab/qa_burst_tagger.py` | The unit test |
+| `grc/lab_burst_tagger.block.yml` | The GRC description: parameters, ports, the generated Python call |
+| `python/lab/bindings/` | pybind11 bindings, regenerated by `gr_modtool bind` |
+
+The C++ `work()` of the same block:
+
+```cpp
+int burst_tagger_impl::work(int noutput_items,
+                            gr_vector_const_void_star& input_items,
+                            gr_vector_void_star& output_items)
+{
+    auto in = static_cast<const gr_complex*>(input_items[0]);
+    auto out = static_cast<gr_complex*>(output_items[0]);
+
+    for (int i = 0; i < noutput_items; i++) {
+        out[i] = in[i];
+        const bool above = std::norm(in[i]) > d_threshold * d_threshold;  // |x|^2 > t^2
+        if (above != d_active) {
+            d_active = above;
+            add_item_tag(0, nitems_written(0) + i,
+                         pmt::intern(above ? "burst_start" : "burst_end"), pmt::PMT_T);
+        }
+    }
+    return noutput_items;
+}
+```
+
+`d_threshold` and `d_active` are members declared in `burst_tagger_impl.h`. A sync block only has `work()`; a general block also implements `forecast()` (how many inputs it needs for a given output) and calls `consume_each()`.
+
+The QA test runs a tiny flowgraph from a vector source to a vector sink and checks the tags:
+
+```python
+def test_tags(self):
+    src = blocks.vector_source_c([0, 0, 1, 1, 0], False)
+    dut = lab.burst_tagger(0.5)
+    dst = blocks.vector_sink_c()
+    self.tb.connect(src, dut, dst)
+    self.tb.run()
+    tags = [(t.offset, pmt.symbol_to_string(t.key)) for t in dst.tags()]
+    self.assertEqual(tags, [(2, "burst_start"), (4, "burst_end")])
+```
+
+**Building, testing and installing:**
+
+```sh
+$ gr_modtool bind burst_tagger           # after every change to the public header
+$ cmake -B build -DCMAKE_INSTALL_PREFIX=/usr/local
+$ cmake --build build -j$(nproc)
+$ (cd build && ctest --output-on-failure)
+$ sudo cmake --install build && sudo ldconfig
+```
+
+Installed under `/usr/local`, the module needs two things to be found:
+
+- **Python**: `python3 -c "from gnuradio import lab"` must work. If it fails with `ModuleNotFoundError`, add the directory the install step printed for `lab/__init__.py` to `PYTHONPATH`.
+- **GRC**: the block files go to `/usr/local/share/gnuradio/grc/blocks`, which GRC doesn't search by default. Add it in `~/.gnuradio/config.conf`:
+
+```ini
+[grc]
+local_blocks_path=/usr/local/share/gnuradio/grc/blocks
+```
+
+**VOLK** (Vector-Optimized Library of Kernels) holds SIMD versions (SSE, AVX, NEON) of common vector operations, and GNU Radio's own blocks use it. In your blocks, `volk_32fc_magnitude_squared_32f()` and similar calls replace loops over samples. VOLK picks the fastest implementation from a profile of the machine, written once by:
+
+```sh
+$ volk_profile                 # writes ~/.volk/volk_config; minutes, run once per machine
+```
+
+This matters most on Arm boards (section 16).
+
+**Logging**: in C++, `d_logger->info("burst at {}", nitems_written(0) + i);` (GNU Radio 3.10 uses spdlog-style format strings); in Python blocks, `self.logger.info(...)` where available, or `print`. The log level is set in `~/.gnuradio/config.conf` under `[LOG]`.
 
 ## 14. Transmitting safely and legally
 
-*Planned: The rules, testing into cables and attenuators, the HackRF transmit chain and its levels, hackrf_transfer and a GNU Radio transmitter, harmonics and filtering, half duplex.*
+**The rules** of section 2 apply in full here: everything in this section goes **into a cable** with attenuators, or into a dummy load. Over the air only with an amateur licence and within its rules, or within the exact rules of a licence-exempt band, with a filter (below).
+
+**The test bench.** The HackRF can't receive while it transmits, so a second receiver watches the output:
+
+```
+ HackRF One (TX) ──> 30 dB attenuator ──> 20 dB attenuator ──> RTL-SDR or second SDR (RX)
+                     (rated 1 W or more)
+```
+
+The arithmetic: at most +15 dBm out, minus 50 dB, gives -35 dBm at the receiver, well under the HackRF's -5 dBm input limit and in the linear range of an RTL-SDR. **Rule of thumb**: keep the receiver input below -30 dBm, and start every test with the TX VGA at 0 dB and the amplifier off. Never connect two SDRs directly, and never point a transmitting antenna at a receiver at close range without attenuation.
+
+**A carrier** for a first check. `-c` sends a constant value to the DAC, which comes out as an unmodulated carrier at the center frequency:
+
+```sh
+$ hackrf_transfer -c 64 -f $ISM_HZ -s 8000000 -x 0 -a 0
+```
+
+On the receiver, a single line at 433.92 MHz, plus your HackRF's frequency error (section 8).
+
+**Transmitting a file.** `hackrf_transfer -t` sends a cs8 file. This script writes one second of a tone 200 kHz above the center at half amplitude. A whole number of cycles in the file keeps the phase continuous when the file repeats:
+
+```python
+#!/usr/bin/env python3
+# make-tone.py OUT.cs8: 1 s of a tone at +200 kHz, half amplitude, 8 Msps
+import sys
+import numpy as np
+
+fs, f, amp = 8e6, 200e3, 0.5
+x = amp * np.exp(2j * np.pi * f / fs * np.arange(int(fs)))
+out = np.empty(2 * len(x), np.int8)
+out[0::2] = np.round(x.real * 127)
+out[1::2] = np.round(x.imag * 127)
+out.tofile(sys.argv[1])
+```
+
+```sh
+$ python3 $SDR/make-tone.py $SDR/tone.cs8
+$ hackrf_transfer -t $SDR/tone.cs8 -f $((ISM_HZ - 200000)) -s 8000000 -x 10 -a 0 -R
+```
+
+`-x` sets the TX VGA (0 to 47 dB), `-a 1` would add the RF amplifier, and `-R` repeats the file until Ctrl-C. The tone lands at 433.92 MHz while the LO, and its leakage, stays 200 kHz away: offset tuning works for transmission too.
+
+**A transmitter in GNU Radio:**
+
+```
+Signal Source (complex, cosine, 200 kHz, amplitude 0.5) ──> Soapy HackRF Sink
+                                                            sample rate samp_rate, center ISM_HZ - 200e3,
+                                                            amplifier off, VGA 0 to start
+```
+
+Keep the digital amplitude below about 0.7: values beyond ±1.0 clip in the conversion to 8 bits and spread energy over neighboring frequencies. The decoder of section 12 can be tested the same way: generate the pulses of a known frame (URH's generator tab, or a *Vector Source* of 0 and 1 values repeated to the right pulse widths, multiplied by a carrier), transmit them into the cable, and check that rtl_433 or your own flowgraph decodes the bits you sent.
+
+**Spectral purity.** The HackRF has **no output filtering** for its harmonics and mixer products: a 433 MHz carrier also comes out at 866 MHz, 1.3 GHz and beyond, and other products appear around the wanted signal. Their level varies with frequency and settings (**typical**: a few tens of dB below the carrier). In a cable, that's harmless. Over the air, it would transmit outside the band you're allowed to use: an over-the-air transmitter needs a band-pass or low-pass filter for its band, and a check of the output on a spectrum analyzer (another SDR shows its own harmonics as well, which makes it a poor judge).
+
+**Half duplex.** The HackRF either receives or transmits. Switching means stopping one stream and starting the other, which takes milliseconds and isn't timed precisely. That rules out protocols with a tight receive-to-transmit turnaround: a cellular UE or base station, Wi-Fi acknowledgements, most two-way packet radios. For those, a full-duplex device (Pluto, bladeRF, USRP B210, LimeSDR; section 4).
 
 ## 15. Other drivers and APIs: SoapySDR, UHD, libiio and librtlsdr
 

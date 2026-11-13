@@ -2,7 +2,7 @@
 
 A beginner's path from power-on to a running Linux kernel: what a bootloader does, how to build U-Boot, how to use its command line in QEMU, and how to put it on a BeagleBone Black or a Raspberry Pi 4.
 
-**You need:** the PC, toolchains and settings files from the [cross-compilation note](../cross-compilation-toolchain/cross-compilation-toolchain.md) (sections 3 and 4). No board is needed until section 9. For a board, you also need a 3.3 V USB-to-serial cable.
+**You need:** the PC, toolchains and settings files from the [cross-compilation note](../cross-compilation-toolchain/cross-compilation-toolchain_v2_2026-11-08.md) (sections 3 and 4). No board is needed until section 9. For a board, you also need a 3.3 V USB-to-serial cable.
 
 **How to read it:**
 - **Parts 1 and 2 are essential.** Read them in order and type the commands.
@@ -1008,3 +1008,7 @@ Boards:
 
 - BeagleBone Black: [documentation](https://docs.beagleboard.org/boards/beaglebone/black/index.html), [AM335x technical reference manual](https://www.ti.com/lit/pdf/spruh73), chapter "Initialization"
 - Raspberry Pi 4: [config.txt](https://www.raspberrypi.com/documentation/computers/config_txt.html), [boot sequence and EEPROM](https://www.raspberrypi.com/documentation/computers/raspberry-pi.html), [UARTs](https://www.raspberrypi.com/documentation/computers/configuration.html)
+
+---
+
+Version 2 · 2026-11-09

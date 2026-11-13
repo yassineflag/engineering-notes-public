@@ -2,7 +2,7 @@
 
 The mental model you need to bring an embedded Linux device onto a network and debug it when it doesn't work: how frames and packets are addressed, switched and routed, what DHCP, DNS, TCP, TLS, NAT and firewalls do along the way, how Linux implements each piece, and how it all fits together in products where a Linux application processor shares a modem's cellular connection.
 
-This note explains the concepts from the **device's side**. [Building a Home Gateway on Linux](../gateway/gateway.md) applies the same concepts from the **router's side** (VLANs, NAT, firewall rules, dnsmasq), and [Networking on OpenWrt](../openwrt/openwrt.md) does it with OpenWrt's components (netifd, UCI, firewall4, odhcpd), so this note links there instead of repeating the router configuration.
+This note explains the concepts from the **device's side**. [Building a Home Gateway on Linux](../gateway/gateway_v1_2026-10-26.md) applies the same concepts from the **router's side** (VLANs, NAT, firewall rules, dnsmasq), and [Networking on OpenWrt](../openwrt/openwrt_v1_2026-10-29.md) does it with OpenWrt's components (netifd, UCI, firewall4, odhcpd), so this note links there instead of repeating the router configuration.
 
 **Concept, Linux, vendor:** each section separates the protocol (what any implementation does), Linux's implementation (kernel subsystem, daemon, tool) and vendor-specific mechanisms, which are labeled as such.
 
@@ -92,7 +92,7 @@ Each device on the path only looks at the layers it needs: a switch reads the Et
 
 ### Network A: a board on a wired LAN
 
-Most examples in Part 1 use this network. It's the trusted LAN of the [gateway note](../gateway/gateway.md#networks), seen from a board plugged into it.
+Most examples in Part 1 use this network. It's the trusted LAN of the [gateway note](../gateway/gateway_v1_2026-10-26.md#networks), seen from a board plugged into it.
 
 ```mermaid
 flowchart LR
@@ -129,7 +129,7 @@ flowchart LR
 
 `203.0.113.0/24` and `198.51.100.0/24` are **reserved for documentation** (RFC 5737): they play the role of public addresses here, but they're never assigned to real hosts. The MACs come from the documentation block `00:00:5e:00:53:xx` (RFC 7042). Replace both with your own values.
 
-**Physical and logical interfaces:** `eth0` on the board and `eth0`/`eth1` on the gateway are **physical** interfaces, each backed by a NIC and its driver. `br-lan` is a **logical** interface created in software (a bridge, section 3); other logical interfaces are VLAN interfaces (`vlan10`), tunnels (`wg0`), veth pairs (section 17) and loopback (`lo`). IP addresses belong to an interface, not to a device: the gateway's LAN address sits on `br-lan`, while `eth1` carries frames but has no address. In the [gateway note](../gateway/gateway.md#networks) there's one more layer: `eth1` carries tagged VLANs, and `br-lan` bridges the VLAN interface `vlan10`.
+**Physical and logical interfaces:** `eth0` on the board and `eth0`/`eth1` on the gateway are **physical** interfaces, each backed by a NIC and its driver. `br-lan` is a **logical** interface created in software (a bridge, section 3); other logical interfaces are VLAN interfaces (`vlan10`), tunnels (`wg0`), veth pairs (section 17) and loopback (`lo`). IP addresses belong to an interface, not to a device: the gateway's LAN address sits on `br-lan`, while `eth1` carries frames but has no address. In the [gateway note](../gateway/gateway_v1_2026-10-26.md#networks) there's one more layer: `eth1` carries tagged VLANs, and `br-lan` bridges the VLAN interface `vlan10`.
 
 ### Network B: a cellular product with an AP and a modem
 
@@ -222,13 +222,13 @@ Three related ideas that are easy to mix up:
 - **IP subnet** (layer 3): an address range such as `192.168.10.0/24`. It decides which destinations a host treats as on-link (section 4). It says nothing about cabling.
 - **VLAN** (layer 2): a way to split one switched network into several separate broadcast domains. Ports are assigned to VLANs, and links shared by several VLANs (trunks) mark each frame with an 802.1Q tag.
 
-The usual design maps **one subnet to one VLAN**, as in this note and the gateway note, but it's a convention, not a rule. Two subnets can share one broadcast domain: their hosts receive each other's broadcasts, yet each treats the other subnet as off-link and goes through a router. That's sometimes done on purpose (migrations, a second address range), and sometimes by accident (a board with a wrong static address still "sees" the LAN's ARP traffic but can't talk to anything). The [gateway note](../gateway/gateway.md#networks) puts VLAN, bridge and subnet side by side. Section 7 compares bridging with routing.
+The usual design maps **one subnet to one VLAN**, as in this note and the gateway note, but it's a convention, not a rule. Two subnets can share one broadcast domain: their hosts receive each other's broadcasts, yet each treats the other subnet as off-link and goes through a router. That's sometimes done on purpose (migrations, a second address range), and sometimes by accident (a board with a wrong static address still "sees" the LAN's ARP traffic but can't talk to anything). The [gateway note](../gateway/gateway_v1_2026-10-26.md#networks) puts VLAN, bridge and subnet side by side. Section 7 compares bridging with routing.
 
 A Linux **bridge** is a software switch: same learning and flooding, between network interfaces of one machine. On embedded devices you meet it when:
 
 - A Wi-Fi access point joins the wired LAN (`wlan0` and `eth0` in one bridge, like the gateway's `br-lan`).
 - A board has two Ethernet ports and must pass traffic through (daisy-chained industrial devices).
-- A switch chip sits behind the SoC (most routers, some industrial boards): with the kernel's **DSA** (Distributed Switch Architecture) driver, each front port shows up as its own interface (`lan1`, `lan2`...), and you group them with a bridge. Most current OpenWrt routers work this way (the [OpenWrt note](../openwrt/openwrt.md#bridges-routed-interfaces-and-vlans) covers bridges and VLANs there).
+- A switch chip sits behind the SoC (most routers, some industrial boards): with the kernel's **DSA** (Distributed Switch Architecture) driver, each front port shows up as its own interface (`lan1`, `lan2`...), and you group them with a bridge. Most current OpenWrt routers work this way (the [OpenWrt note](../openwrt/openwrt_v1_2026-10-29.md#bridges-routed-interfaces-and-vlans) covers bridges and VLANs there).
 
 ```bash
 ip link add name br0 type bridge
@@ -683,7 +683,7 @@ default via fe80::200:5eff:fe00:5301 dev eth0 proto ra metric 1024 expires 1795s
 ip -6 addr show dev eth0       # fe80:: (scope link) and, with SLAAC, a global address (scope global)
 ```
 
-A missing IPv6 default route therefore means "no RA received or accepted", not a DHCPv6 problem. On a Linux host either the kernel processes RAs (`accept_ra=1`, and only while `forwarding=0`; `accept_ra=2` accepts them even on a router) or the network manager does it in user space (systemd-networkd, for example). On a cellular PDN the carrier sends RAs with a `/64` dedicated to the device (section 21 uses that to give the PC IPv6). The gateway note covers [IPv6 on the router side](../gateway/gateway.md#ipv6-in-short) (prefix delegation, sending RAs), the OpenWrt note [does it with odhcpd](../openwrt/openwrt.md#7-ipv6). Blocking ICMPv6 breaks IPv6 entirely, because RAs and Neighbor Discovery both use it.
+A missing IPv6 default route therefore means "no RA received or accepted", not a DHCPv6 problem. On a Linux host either the kernel processes RAs (`accept_ra=1`, and only while `forwarding=0`; `accept_ra=2` accepts them even on a router) or the network manager does it in user space (systemd-networkd, for example). On a cellular PDN the carrier sends RAs with a `/64` dedicated to the device (section 21 uses that to give the PC IPv6). The gateway note covers [IPv6 on the router side](../gateway/gateway_v1_2026-10-26.md#ipv6-in-short) (prefix delegation, sending RAs), the OpenWrt note [does it with odhcpd](../openwrt/openwrt_v1_2026-10-29.md#7-ipv6). Blocking ICMPv6 breaks IPv6 entirely, because RAs and Neighbor Discovery both use it.
 
 ### Dual stack
 
@@ -917,7 +917,7 @@ The **MTU** is the largest IP packet a link carries. It shrinks wherever somethi
 | VLAN-tagged Ethernet | 1500: the tag enlarges the frame, not the IP packet, on switches that support it |
 | PPPoE | 1492 |
 | WireGuard tunnel | 1420 by default |
-| Cellular PDN | Set by the network for each session, often below 1500. The connection manager reports it (`mmcli -b <N>` shows it, see the [gateway note](../gateway/gateway.md#method-2-cellular-modem-quectel-ec25)) and should apply it to the interface |
+| Cellular PDN | Set by the network for each session, often below 1500. The connection manager reports it (`mmcli -b <N>` shows it, see the [gateway note](../gateway/gateway_v1_2026-10-26.md#method-2-cellular-modem-quectel-ec25)) and should apply it to the interface |
 | IPv6 minimum | 1280: every IPv6 link must carry at least this |
 
 **Fragmentation:** when a packet is larger than the next link's MTU:
@@ -928,7 +928,7 @@ The **MTU** is the largest IP packet a link carries. It shrinks wherever somethi
 
 **Path MTU discovery (PMTUD):** the sender learns the smallest MTU on the path from those ICMP messages and caches it per destination (`ip route get` shows a cached `mtu`). If a firewall drops the ICMP, the sender never learns: the handshake works (small packets), bulk transfers stall. That **PMTUD black hole** is behind the classic "SSH logs in, then freezes on `ls`" and "some websites never load". Linux can fall back to probing (`net.ipv4.tcp_mtu_probing=1`, packetization-layer PMTUD, RFC 4821), off by default.
 
-**MSS clamping:** a TCP SYN announces the MSS, the largest segment the sender accepts (MTU minus 40 bytes for IPv4 + TCP, so 1460; minus 60 for IPv6, so 1440). A router can rewrite the MSS in forwarded SYNs to fit its outgoing link, so both ends send small enough segments from the start. It's essential whenever a device forwards traffic from a 1500-byte link into a smaller one: PPPoE, tunnels, and a PC tethered to a cellular product (section 21). In nftables: `tcp flags syn tcp option maxseg size set rt mtu` (the gateway note's [forward chain](../gateway/gateway.md#method-1-nftables-recommended)). MSS clamping only helps TCP: for UDP, clients must know the real MTU, which a router can advertise with DHCP option 26 (interface MTU) and the RA MTU option.
+**MSS clamping:** a TCP SYN announces the MSS, the largest segment the sender accepts (MTU minus 40 bytes for IPv4 + TCP, so 1460; minus 60 for IPv6, so 1440). A router can rewrite the MSS in forwarded SYNs to fit its outgoing link, so both ends send small enough segments from the start. It's essential whenever a device forwards traffic from a 1500-byte link into a smaller one: PPPoE, tunnels, and a PC tethered to a cellular product (section 21). In nftables: `tcp flags syn tcp option maxseg size set rt mtu` (the gateway note's [forward chain](../gateway/gateway_v1_2026-10-26.md#method-1-nftables-recommended)). MSS clamping only helps TCP: for UDP, clients must know the real MTU, which a router can advertise with DHCP option 26 (interface MTU) and the RA MTU option.
 
 ---
 
@@ -1019,7 +1019,7 @@ Terminology and Linux mechanisms:
 | DNAT / port forward | Destination rewritten: a public port reaches a LAN host | `dnat to 192.168.10.10:443` in a `prerouting` NAT chain |
 | CGNAT / NAT444 | The carrier NATs again: the device's "WAN" address is itself private (`100.64.0.0/10`) | Not on the device: in the carrier network |
 
-NAT rules only see the **first packet** of each connection; conntrack translates the rest, both directions. Configuration is in the [gateway note, section 7](../gateway/gateway.md#7-firewall-and-nat).
+NAT rules only see the **first packet** of each connection; conntrack translates the rest, both directions. Configuration is in the [gateway note, section 7](../gateway/gateway_v1_2026-10-26.md#7-firewall-and-nat).
 
 What NAT means for a device:
 
@@ -1157,7 +1157,7 @@ What the picture means in practice:
 - **`tcpdump` sees incoming packets before** tc ingress, the firewall and `rp_filter`: a captured packet may still be dropped afterwards. It sees **outgoing packets after** the firewall, tc and the qdisc: a packet dropped by the output chain or a full queue never appears. A packet dropped by an XDP program isn't seen at all.
 - **Locally delivered** packets cross prerouting and input; **forwarded** packets cross prerouting, forward and postrouting; **locally sent** packets cross output and postrouting. A rule in the wrong chain silently does nothing.
 - **Conntrack** runs in prerouting and output, so the firewall can match connection state, and NAT happens on the first packet of each connection only.
-- **Bridged** frames take the bridge path and don't cross the IP chains, unless `br_netfilter` is loaded (Docker loads it), which sends them through the IP hooks too (see the [gateway note's remarks](../gateway/gateway.md#notes-on-the-rules)).
+- **Bridged** frames take the bridge path and don't cross the IP chains, unless `br_netfilter` is loaded (Docker loads it), which sends them through the IP hooks too (see the [gateway note's remarks](../gateway/gateway_v1_2026-10-26.md#notes-on-the-rules)).
 - **Flowtables and hardware offload** let established flows skip most of this path, and with it the firewall chains and sometimes the taps (section 20).
 
 **Where packets are counted and dropped**, which tells you which tool to check:
@@ -1222,7 +1222,7 @@ nft list ruleset
 
 - The first lease usually arrives through the client's packet socket, which sees frames before the input hook (section 8), so it can work with no rule at all. Renewals are unicast replies to the board's address, and clients that receive them on a UDP socket need this rule. Without it, the board works for half a lease, then loses its address.
 - The rule doesn't match the server's address, because it can change (another DHCP server, a failover pair). Restrict it with `iifname "eth0"` if the board has other interfaces.
-- DHCPv6 is different: replies from `fe80::/10`, UDP 547 → 546 (see the [gateway note's input chain](../gateway/gateway.md#method-1-nftables-recommended)). RAs and SLAAC are covered by the ICMPv6 rule.
+- DHCPv6 is different: replies from `fe80::/10`, UDP 547 → 546 (see the [gateway note's input chain](../gateway/gateway_v1_2026-10-26.md#method-1-nftables-recommended)). RAs and SLAAC are covered by the ICMPv6 rule.
 - Test with the firewall active: get a lease, then force a renewal (BusyBox `udhcpc` renews on `SIGUSR1`, or shorten the lease on the server) and check the address is still there.
 
 Embedded caveats:
@@ -1405,7 +1405,7 @@ A minimal kernel config may lack things a desktop distribution kernel normally h
 
 ### Who configures the network
 
-Exactly **one** tool should own each interface (same rule as on the [gateway](../gateway/gateway.md#who-does-what-on-the-gateway)). Buildroot and Yocto install whatever the configuration selects, so there's no single default. These are common combinations, each with its assumption:
+Exactly **one** tool should own each interface (same rule as on the [gateway](../gateway/gateway_v1_2026-10-26.md#who-does-what-on-the-gateway)). Buildroot and Yocto install whatever the configuration selects, so there's no single default. These are common combinations, each with its assumption:
 
 | Image (assumption) | Network manager | Config |
 |---|---|---|
@@ -1414,7 +1414,7 @@ Exactly **one** tool should own each interface (same rule as on the [gateway](..
 | Yocto, sysvinit image with `init-ifupdown` | `ifupdown` | `/etc/network/interfaces` |
 | Yocto image that includes ConnMan (e.g. Poky's `core-image-sato`) | ConnMan | `connmanctl` |
 | Debian-based images (Raspberry Pi OS since Bookworm...) | NetworkManager | `nmcli` |
-| OpenWrt | netifd | `/etc/config/network` (UCI), see the [OpenWrt note](../openwrt/openwrt.md#3-linux-networking-the-openwrt-way) |
+| OpenWrt | netifd | `/etc/config/network` (UCI), see the [OpenWrt note](../openwrt/openwrt_v1_2026-10-29.md#3-linux-networking-the-openwrt-way) |
 
 Cellular data interfaces add a second kind of owner: a **connection manager** that talks to the modem (ModemManager, often paired with NetworkManager; a vendor daemon; OpenWrt's protocol handlers) and must hand the session's address, routes, DNS and MTU to whatever configures interfaces (section 20).
 
@@ -1432,7 +1432,7 @@ The kernel names interfaces by type and probe order; on systemd images, udev ren
 | Name | Created by | Notes |
 |---|---|---|
 | `eth0`, `end0`, `enp1s0` | NIC drivers; renamed by systemd-udevd | `end0`: device-tree based controller (naming scheme v252 and later). `enp1s0`: PCIe NIC |
-| `wlan0` | Wi-Fi driver | See [Wi-Fi for Embedded Linux Engineers](../../wireless-protocols-and-connectivity/wifi/wifi.md) |
+| `wlan0` | Wi-Fi driver | See [Wi-Fi for Embedded Linux Engineers](../../wireless-protocols-and-connectivity/wifi/wifi_v1_2026-11-01.md) |
 | `wwan0` | `qmi_wwan`, `cdc_mbim` (USB modems), or links of the kernel's WWAN framework | Cellular data, often raw-IP |
 | `qmimux0` | `qmi_wwan` with QMAP multiplexing enabled | One per multiplexed data session |
 | `rmnet_data0` (name chosen at creation; a Qualcomm convention) | `rmnet` on top of `qmi_wwan`, MHI or IPA | Qualcomm MAP sessions |
@@ -1505,7 +1505,7 @@ ip rule                                # any policy rules besides local/main/def
 ```
 
 - **Metrics decide, not installation order.** For routes with the same prefix in the same table, the lowest metric wins. Each network manager picks its own defaults (NetworkManager uses 100 for Ethernet, 600 for Wi-Fi and 700 for modems; systemd-networkd uses 1024 for DHCP routes unless `RouteMetric=` is set; a BusyBox `udhcpc` script uses whatever it was written to use). If two default routes end up with the same metric, the outcome depends on how they were installed, so don't rely on it: give each uplink a distinct metric and check with `ip route get`.
-- **A metric only orders routes that exist.** When `eth0` loses carrier, most network managers remove its routes and the backup takes over. The kernel alone keeps the route, marked `linkdown`, unless `net.ipv4.conf.all.ignore_routes_with_linkdown=1`. If `eth0` keeps its link but the upstream is dead, nothing changes and traffic is lost: detecting that needs an explicit failover mechanism (the gateway note's [failover section](../gateway/gateway.md#failover) shows the principle and its limits).
+- **A metric only orders routes that exist.** When `eth0` loses carrier, most network managers remove its routes and the backup takes over. The kernel alone keeps the route, marked `linkdown`, unless `net.ipv4.conf.all.ignore_routes_with_linkdown=1`. If `eth0` keeps its link but the upstream is dead, nothing changes and traffic is lost: detecting that needs an explicit failover mechanism (the gateway note's [failover section](../gateway/gateway_v1_2026-10-26.md#failover) shows the principle and its limits).
 - A point-to-point link to a laptop must not install a default route at all, or internet traffic goes to the laptop.
 
 ### Policy routing: choosing by source, interface or mark
@@ -1545,7 +1545,7 @@ The destination rule alone could have been a plain route in the main table (`ip 
 
 - **Replies must leave through the interface their connection came in on.** An SSH session to `192.168.10.20` over `eth0` must not have its replies sent out `wwan0` because cellular happens to be the preferred default: they'd leave with the wrong source address for that link and be dropped. One table per uplink plus a `from <address> lookup <table>` rule per address fixes it.
 - **Marks** select traffic by anything nftables can match (`meta mark set 0x1` in a `route`-type output chain, then `ip rule add fwmark 0x1 lookup 100`); **`uidrange`** selects by user (`ip rule add uidrange 1001-1001 lookup 100`), handy to confine one service to one PDN.
-- **Reverse-path filtering** in strict mode (`rp_filter=1`) drops packets arriving on an interface that isn't the best route back to their source, which is normal with several uplinks. Use loose mode (`2`) there (the gateway note explains it in [kernel settings](../gateway/gateway.md#6-kernel-settings)).
+- **Reverse-path filtering** in strict mode (`rp_filter=1`) drops packets arriving on an interface that isn't the best route back to their source, which is normal with several uplinks. Use loose mode (`2`) there (the gateway note explains it in [kernel settings](../gateway/gateway_v1_2026-10-26.md#6-kernel-settings)).
 
 ### NAT and DNS with several uplinks
 
@@ -1586,7 +1586,7 @@ IPv6 has no NAT to hide mismatches. Each upstream provides its own prefix, the c
 
 In a cellular product, two processors run separate software. The **application processor** (AP) runs Linux and the product's applications. The **modem** (baseband processor) runs vendor firmware, often an RTOS, sometimes its own Linux, that handles the radio, the cellular protocol stack and the data sessions with the carrier. To Linux, the modem is a peripheral that offers two kinds of interfaces: one to **control** it, one to carry **data**.
 
-This section covers the networking architecture and packet paths, not the radio. Hands-on modem commands for one module (a Quectel EC25 over QMI) are in the [gateway note](../gateway/gateway.md#method-2-cellular-modem-quectel-ec25); deeper modem integration (USB compositions, QMI/MBIM details, firmware) belongs in a dedicated note. The cellular protocols themselves (registration, sessions, reject causes, power saving) are in [Cellular Protocols](../../wireless-protocols-and-connectivity/cellular/cellular.md).
+This section covers the networking architecture and packet paths, not the radio. Hands-on modem commands for one module (a Quectel EC25 over QMI) are in the [gateway note](../gateway/gateway_v1_2026-10-26.md#method-2-cellular-modem-quectel-ec25); deeper modem integration (USB compositions, QMI/MBIM details, firmware) belongs in a dedicated note. The cellular protocols themselves (registration, sessions, reject causes, power saving) are in [Cellular Protocols](../../wireless-protocols-and-connectivity/cellular/cellular_v1_2026-11-02.md).
 
 ### Who does what
 
@@ -1684,7 +1684,7 @@ When the device routes traffic between `usb0` and `wwan0`, the default path is *
 | Vendor accelerator between USB/Ethernet and the modem (e.g. Qualcomm IPA in vendor BSPs) | Dedicated hardware, configured by vendor daemons | No: the AP's CPU may never see the packets |
 | Modem router mode | The modem itself | No: the AP sees only its LAN side |
 
-In mainline Linux, the `ipa` driver provides the AP-modem data path; the tethering-offload features of such accelerators come from vendor BSP kernels and daemons. The [OpenWrt note](../openwrt/openwrt.md#connection-tracking-nat-and-offloading) covers flowtable offload on routers.
+In mainline Linux, the `ipa` driver provides the AP-modem data path; the tethering-offload features of such accelerators come from vendor BSP kernels and daemons. The [OpenWrt note](../openwrt/openwrt_v1_2026-10-29.md#connection-tracking-nat-and-offloading) covers flowtable offload on routers.
 
 **Effect on debugging:** offloaded packets don't hit firewall rules or taps, interface counters may not count them, and throughput can exceed what the CPU could forward. To see a flow, disable the offload temporarily. NIC segmentation offloads have a similar effect on captures: with TSO/GRO, `tcpdump` shows "packets" much larger than the MTU, because it sees them before the NIC splits them or after the stack merged them (`ethtool -K eth0 gro off tso off` while capturing).
 
@@ -2018,7 +2018,7 @@ For a tethered PC on a cellular product, the boundaries are different:
 
 Then follow the **reply** back the same way. The first point where a packet stops appearing brackets the fault between two captures. Captures on raw-IP interfaces have no Ethernet header (`-e` shows nothing), and `tcpdump -i any` uses a Linux "cooked" header for every interface. With offload active, captures on the AP may show only the first packets of a flow (section 20).
 
-The gateway note gives the [router-side debug order](../gateway/gateway.md#how-a-packet-crosses-the-gateway) and a [symptom table](../gateway/gateway.md#14-troubleshooting); the OpenWrt note has [playbooks](../openwrt/openwrt.md#playbooks) for the same steps on OpenWrt.
+The gateway note gives the [router-side debug order](../gateway/gateway_v1_2026-10-26.md#how-a-packet-crosses-the-gateway) and a [symptom table](../gateway/gateway_v1_2026-10-26.md#14-troubleshooting); the OpenWrt note has [playbooks](../openwrt/openwrt_v1_2026-10-29.md#playbooks) for the same steps on OpenWrt.
 
 ---
 
@@ -2032,7 +2032,7 @@ Topics for separate, more advanced notes:
 - **Kernel network stack internals**: `sk_buff`, NAPI, GRO/GSO, XDP and eBPF, socket buffers and their sysctls.
 - **Network driver development**: MAC drivers, PHY and MDIO, `phylink`, DSA switch drivers, WWAN drivers ([linux-kernel-device-driver-development/](../../linux-kernel-device-driver-development/)).
 - **Network boot**: U-Boot networking, TFTP, NFS root, `ip=` in detail.
-- **Wireless links**: Wi-Fi (now in [its own note](../../wireless-protocols-and-connectivity/wifi/wifi.md)), cellular radio protocols, GNSS ([wireless-protocols-and-connectivity/](../../wireless-protocols-and-connectivity/)).
+- **Wireless links**: Wi-Fi (now in [its own note](../../wireless-protocols-and-connectivity/wifi/wifi_v1_2026-11-01.md)), cellular radio protocols, GNSS ([wireless-protocols-and-connectivity/](../../wireless-protocols-and-connectivity/)).
 - **IPv6 in depth**: privacy addresses, DHCPv6 details, MLD, multicast routing.
 - **QoS design**: HTB hierarchies, DSCP marking, `cake` tuning for variable-rate links.
 - **Device security**: TLS client certificates and provisioning, WireGuard, hardening network services.
@@ -2092,3 +2092,7 @@ Linux documentation:
 - Buildroot manual: <https://buildroot.org/downloads/manual/manual.html>
 
 Book: W. Richard Stevens and Kevin R. Fall, *TCP/IP Illustrated, Volume 1: The Protocols* (2nd edition): the reference for how these protocols behave on the wire.
+
+---
+
+Version 1 · 2026-10-29

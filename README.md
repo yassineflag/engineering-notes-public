@@ -18,16 +18,16 @@ Every note aims to be practical, so you'll find configs and commands you can reu
 
 ## Latest notes
 
-- [Software-Defined Radio: HackRF One and GNU Radio](hardware/sdr/sdr.md)
-- [Root Filesystems for Embedded Linux](embedded-linux/fundamentals/rootfs/rootfs.md)
-- [The Linux Kernel for Embedded Linux](embedded-linux/fundamentals/kernel/kernel.md)
-- [Bootloaders for Embedded Linux: U-Boot](embedded-linux/fundamentals/bootloader/bootloader.md)
-- [Cross-Compilation and Toolchains for Embedded Linux](embedded-linux/fundamentals/cross-compilation-toolchain/cross-compilation-toolchain.md)
-- [Cellular Protocols: LTE, 5G NR and Cellular IoT](wireless-protocols-and-connectivity/cellular/cellular.md)
-- [Wi-Fi for Embedded Linux Engineers](wireless-protocols-and-connectivity/wifi/wifi.md)
-- [Networking Fundamentals for Embedded Linux Engineers](networking/fundamentals/fundamentals.md)
-- [Networking on OpenWrt](networking/openwrt/openwrt.md)
-- [Building a Home Gateway on Linux](networking/gateway/gateway.md)
+- [Software-Defined Radio: HackRF One and GNU Radio](hardware/sdr/sdr_v1_2026-11-12.md)
+- [Root Filesystems for Embedded Linux](embedded-linux/fundamentals/rootfs/rootfs_v1_2026-11-11.md)
+- [The Linux Kernel for Embedded Linux](embedded-linux/fundamentals/kernel/kernel_v1_2026-11-10.md)
+- [Bootloaders for Embedded Linux: U-Boot](embedded-linux/fundamentals/bootloader/bootloader_v2_2026-11-09.md)
+- [Cross-Compilation and Toolchains for Embedded Linux](embedded-linux/fundamentals/cross-compilation-toolchain/cross-compilation-toolchain_v2_2026-11-08.md)
+- [Cellular Protocols: LTE, 5G NR and Cellular IoT](wireless-protocols-and-connectivity/cellular/cellular_v1_2026-11-02.md)
+- [Wi-Fi for Embedded Linux Engineers](wireless-protocols-and-connectivity/wifi/wifi_v1_2026-11-01.md)
+- [Networking Fundamentals for Embedded Linux Engineers](networking/fundamentals/fundamentals_v1_2026-10-29.md)
+- [Networking on OpenWrt](networking/openwrt/openwrt_v1_2026-10-29.md)
+- [Building a Home Gateway on Linux](networking/gateway/gateway_v1_2026-10-26.md)
 
 ## Conventions
 

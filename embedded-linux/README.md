@@ -13,5 +13,5 @@ Notes on building and running Linux on embedded targets: bootloaders, kernel, ro
 
 ### Linux build systems
 
-- [Yocto](linux-build-systems/yocto/)
+- [The Yocto Project for Embedded Linux](linux-build-systems/yocto/yocto_v1_2026-11-14.md): from the concepts to a product image for a BeagleBone Black with Yocto 6.0 "Wrynose": BitBake, layers, recipes, machine, distro and image, the build machine, `bitbake-setup` and fragments, a first image in QEMU, the build directory, then your own layer, recipes and packages, the machine and the card, your own image and distribution configuration, append files, the kernel and the bootloader, `wic`, then BitBake syntax and overrides, `devtool`, the SDK, shared state, debugging a failed build, and production (reproducible builds, licenses, SBOM and CVE checks, hardening, updates), releases and what changed since 5.0, and troubleshooting by symptom.
 - [Buildroot](linux-build-systems/buildroot/)

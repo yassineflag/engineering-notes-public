@@ -18,6 +18,7 @@ Every note aims to be practical, so you'll find configs and commands you can reu
 
 ## Latest notes
 
+- [The Yocto Project for Embedded Linux](embedded-linux/linux-build-systems/yocto/yocto_v1_2026-11-14.md)
 - [Software-Defined Radio: HackRF One and GNU Radio](hardware/sdr/sdr_v1_2026-11-12.md)
 - [Root Filesystems for Embedded Linux](embedded-linux/fundamentals/rootfs/rootfs_v1_2026-11-11.md)
 - [The Linux Kernel for Embedded Linux](embedded-linux/fundamentals/kernel/kernel_v1_2026-11-10.md)

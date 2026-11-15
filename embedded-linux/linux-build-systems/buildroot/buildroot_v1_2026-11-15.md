@@ -1249,13 +1249,212 @@ $ make graph-build                      # time per package and step
 
 ## 18. Reproducible builds, licenses, vulnerabilities and updates
 
+**Pin everything.** A product build must give the same image in two years:
+
+- **Buildroot at a tag** (section 4), and your external tree at a commit. Release builds come from a tag of the external tree that names the Buildroot version.
+- **Packages at fixed versions.** Every package in Buildroot has a version and a hash. Your own packages must too: a git `_VERSION` set to a branch name, instead of a commit or tag, builds whatever the branch holds that day.
+- **Source archived.** Upstream servers disappear. Keep the download directory, and serve it as a mirror:
+
+```
+BR2_PRIMARY_SITE="https://mirror.example.com/buildroot-sources"
+BR2_PRIMARY_SITE_ONLY=y            # release builds: fail instead of downloading from upstream
+```
+
+`make source` downloads everything a configuration needs; `make external-deps` lists the files. Buildroot's own mirror, `sources.buildroot.net`, is the default backup site (`BR2_BACKUP_SITE`), for the versions Buildroot packages.
+- **The build machine in a container.** The host distribution is the one input the defconfig doesn't pin. Buildroot ships the Dockerfile of its own test infrastructure in `support/docker/`, a starting point.
+- **`BR2_REPRODUCIBLE=y`** removes timestamps and build paths from the output where it can, so two builds of the same configuration give the same files. It's marked experimental: compare two builds (`diffoscope`) before relying on it.
+
+**Licenses.** Every package declares its license, so the build can report them:
+
+```sh
+$ make legal-info
+```
+
+It writes `output/legal-info/`:
+
+| File | Contents |
+|---|---|
+| `manifest.csv` | Every target package: version, license, license files, source archive |
+| `host-manifest.csv` | The same for host packages |
+| `licenses/` | The license texts of each package |
+| `sources/` | The source archives and patches of each package, for GPL compliance |
+| `buildroot.config` | The configuration used |
+| `legal-info.sha256` | Checksums of all the above |
+
+Packages that can't be redistributed set `_REDISTRIBUTE = NO`, so their source is left out. Review the manifest before every release; switching on one package can bring in a GPLv3 library.
+
+**SBOM.** `make show-info` writes JSON with every package's version, license, source, patches and CPE identifier. Recent releases ship `utils/generate-cyclonedx`, which turns it into a CycloneDX software bill of materials (**From memory**: check your release):
+
+```sh
+$ make show-info | utils/generate-cyclonedx > bbb-sbom.cdx.json
+```
+
+It's the input for vulnerability scanners and what customers and regulations (the EU Cyber Resilience Act) ask for.
+
+**Vulnerabilities.**
+
+```sh
+$ make pkg-stats
+```
+
+It writes `output/pkg-stats.html` and `pkg-stats.json`: for each package, the known CVEs from the NVD database (matched through the package's CPE identifier), and whether a newer upstream version exists. The first run downloads the NVD data, which takes a while. A CVE fixed by a patch in the package is listed in `_IGNORE_CVES` (section 11). Fixes come with the point releases of the LTS branch: moving to the latest point release (section 19) is the regular security maintenance of a product.
+
+**Hardening the image.** The development settings must not ship:
+
+| Development | Product |
+|---|---|
+| Root without a password | A password hash in `BR2_TARGET_GENERIC_ROOT_PASSWD`, or root login off and SSH keys only |
+| Clear-text passwords in users tables | Hashes, or `!` (login disabled) |
+| `gdb`, `strace`, debug options | Off, or in a separate debug defconfig |
+| A writable root | `BR2_TARGET_GENERIC_REMOUNT_ROOTFS_RW` off, a squashfs or EROFS root, data on its own partition |
+| Default compiler flags | The Build options menu: stack protector (`BR2_SSP_STRONG`), RELRO (`BR2_RELRO_FULL`), `_FORTIFY_SOURCE` (`BR2_FORTIFY_SOURCE_2` or `_3`), position-independent executables (`BR2_PIC_PIE`) |
+
+`BR2_TARGET_GENERIC_ROOT_PASSWD` accepts a hash; a hash starting with `$` must be written with `$$` in the defconfig, because the value goes through `make`. The rootfs note (section 17) covers the rest: services, file permissions and dm-verity.
+
+**A read-only root**, with the rootfs note's approach (section 15): turn off the remount, choose a read-only image type, mount writable directories as `tmpfs` or from a data partition in the overlay's `fstab`, and point the files that change (`/etc/resolv.conf`, `/var/lib`) there. Buildroot already makes `/tmp` and `/run` `tmpfs` in its default `fstab`.
+
+**Updates.** Buildroot builds the images; an update framework installs them in the field. Each one is a Buildroot package:
+
+| Framework | Package | Model |
+|---|---|---|
+| SWUpdate | `swupdate` | A/B or rescue system, flexible handlers |
+| RAUC | `rauc` (and `host-rauc` to make bundles) | A/B slots, signed bundles |
+| Mender | `mender` | A/B with a management server |
+
+The rootfs note (section 16) covers the A/B principle and the bootloader's part in it; the genimage layout of section 13 is the partition side.
+
+**Size.** A BusyBox image with glibc is **typically** 5 to 10 MiB without kernel modules. To go lower: musl or uClibc-ng in the toolchain, fewer BusyBox applets (fragment), `BR2_STRIP_strip` (on by default), `BR2_OPTIMIZE_S`, only the kernel modules you need, and no locales (`BR2_ENABLE_LOCALE_WHITELIST`). `make graph-size` (section 17) shows where the space goes.
+
 ## 19. Releases and upgrades
+
+Buildroot releases every three months, in February, May, August and November, named after the year and month: `2026.02`, `2026.05`. A regular release gets point releases (`2026.05.1`, `2026.05.2`) until about the next release. The February release of some years is a long-term support release:
+
+| Release | Support |
+|---|---|
+| 2025.02 | LTS: three years of point releases, the first LTS with that length (before, LTS releases had one year) |
+| 2026.02, 2026.05, 2026.08... | Regular: about three months |
+| 2027.02 | The next LTS, according to the project's LTS page |
+
+**Start a product on the current LTS**, and take its point releases. They bring security fixes and package version bumps within the same major versions; the configuration doesn't need to change. Commercial support beyond the community LTS is offered by companies that work on Buildroot.
+
+**What changes between releases** is in `CHANGES` at the top of the tree, and in the release announcement on the mailing list. For an upgrade from one LTS to the next:
+
+1. Read every `CHANGES` entry in between, for removed packages and options.
+2. Move Buildroot to the new tag, then load your defconfig: `make BR2_EXTERNAL=... bbb_defconfig`.
+3. Open `menuconfig` and look at the Legacy config options menu. Options removed since the last release are there, switched on if your configuration used them, with help text that names the replacement. Buildroot refuses to build while one is on.
+4. Fix them, `make savedefconfig`, and compare the new defconfig with the old one (`git diff`).
+5. Check your own packages: infrastructures change (Python packages' `_SETUP_TYPE`, for example), and `utils/check-package` reports what's out of date.
+6. `make clean all`, then compare the new image with the old one: `make legal-info` manifests, `make graph-size`, the boot log.
+
+**Other boards.** For a Raspberry Pi 4 in 64-bit mode, start from `raspberrypi4_64_defconfig` and its `board/raspberrypi4-64/` files, in a second defconfig of the same external tree. The `hello` package, the overlay and the users table don't change; the kernel, the bootloader (the Pi's firmware with `config.txt`, not U-Boot by default) and the genimage layout do. The console is `ttyS0` on the GPIO pins once the UART is switched on in `config.txt` (`enable_uart=1`).
 
 ## 20. Troubleshooting by symptom
 
+**Setup and configuration:**
+
+| Symptom | Likely cause | Check, then see |
+|---|---|---|
+| `You seem to have the current working directory in your PATH environment variable` | `PATH` has `.`, an empty entry, or a trailing `:` | `echo $PATH`; fix the shell profile (section 3) |
+| `Your PATH contains spaces, TABs, and/or newline (\n) characters` | Often a Windows path under WSL | Set a clean `PATH` for the build (section 3) |
+| `You must install '<tool>' on your build machine` | A mandatory build machine tool is missing | `apt-get install` it (section 3) |
+| `menuconfig` fails with ncurses errors | `libncurses-dev` missing | Install it (section 3) |
+| A package isn't in the menu | It depends on a toolchain feature that's off | `/` in `menuconfig` shows its dependencies (section 8) |
+| `BR2_EXTERNAL` errors about `external.desc` or a missing name | The tree's three files are missing or the name has invalid characters | Section 9 |
+| My package isn't in "External options" | Not listed in the tree's `Config.in` | Add the `source` line (section 9) |
+| `make savedefconfig` overwrote Buildroot's own defconfig | The configuration was loaded from `configs/` in the Buildroot tree | `git checkout configs/`; load your tree's defconfig (sections 8, 9) |
+| A legacy option stops the build | An option removed in this release is still set | Legacy config options menu (section 19) |
+
+**Downloading:**
+
+| Symptom | Likely cause | Check, then see |
+|---|---|---|
+| `wget` or `git` fails for a package | Network, proxy, or the upstream file is gone | Try the URL by hand; the backup and primary sites (section 18) |
+| `ERROR: <file> has wrong sha256 hash` | The upstream file changed, or a proxy returned an error page | Look at the file in `dl/`; delete it and download again; update the hash only if the change is legitimate |
+| `ERROR: No hash found for <file>` | The package has a hash file without an entry for this file: a custom or bumped version | Add the hash: in the package's `.hash`, or next to the global patches (sections 11, 12) |
+| Builds work at home and fail on the CI | `BR2_PRIMARY_SITE_ONLY` with a file missing from the mirror | `make source` with network access, then fill the mirror (section 18) |
+
+**Building:**
+
+| Symptom | Likely cause | Check, then see |
+|---|---|---|
+| `Error 2` with no visible reason | The real error is higher in the log | `make 2>&1 \| tee build.log`, search for the first `error:` (section 17) |
+| `fatal error: foo.h: No such file or directory` | Missing dependency, or the library isn't installed in staging | `_DEPENDENCIES`, `_INSTALL_STAGING` (section 17) |
+| `c++: fatal error: Killed signal terminated program cc1plus` | Out of memory | Lower `BR2_JLEVEL`; don't use top-level `-j`; add swap (sections 3, 14) |
+| `No space left on device` | `output/` and `dl/` filled the disk | `make clean`; move `O=` and `BR2_DL_DIR` to a larger disk (section 6) |
+| A build works on one machine and not another | A build machine tool or library leaking in, or different Buildroot versions | `make show-info` on both; build in a container (section 18) |
+| The kernel build stops on `openssl/...h`, `gelf.h` or `pahole` | A kernel option needs a host library | `BR2_LINUX_KERNEL_NEEDS_HOST_OPENSSL`, `_LIBELF`, `_PAHOLE` (section 12) |
+| The U-Boot build stops on a missing Python module, `dtc` or header | Recent U-Boot needs host tools | The `BR2_TARGET_UBOOT_NEEDS_*` options (section 12) |
+| `Incorrect selection of kernel headers` | The external toolchain's headers differ from what the Toolchain menu declares | Section 8 |
+| Random failures with `make -j` | Top-level parallel build without per-package directories | Plain `make`, or `BR2_PER_PACKAGE_DIRECTORIES` (section 14) |
+| A package fails to patch after a version change | The patches were written for the old version | Rebase them; per-version directories in the global patch directory (section 12) |
+
+**Changes that have no effect:**
+
+| Symptom | Likely cause | Check, then see |
+|---|---|---|
+| A package option changed in `menuconfig` isn't applied | `make` doesn't rebuild packages already built | `make <pkg>-reconfigure` (section 14) |
+| A switched-off package is still in the image | Files stay in `output/target/` | `make clean all` (section 14) |
+| My kernel or BusyBox fragment isn't applied | Fragment added after the package was configured, or the option's dependencies aren't met | `make linux-dirclean all`; check the `.config` (section 12) |
+| My kernel patch isn't applied | Wrong directory name in the global patch directory, or `OVERRIDE_SRCDIR` is set (patches are skipped) | `patches/linux/`; `local.mk` (sections 12, 15) |
+| A change to my source isn't in the image | `local` and override packages aren't rebuilt by `make` | `make <pkg>-rebuild all` (sections 14, 15) |
+| A file edited in `output/target/` is gone | `make clean`, or an overlay replaced it | Put it in the overlay or a post-build script (sections 6, 10) |
+| A file from my overlay has the wrong owner or mode on the board | Overlays don't carry ownership | A permission table (section 10) |
+
+**On the board:**
+
+| Symptom | Likely cause | Check, then see |
+|---|---|---|
+| Nothing on the serial console | The card doesn't hold `sdcard.img`, or the board booted from eMMC | Write `sdcard.img`, not `rootfs.ext4`; hold S2 (section 7) |
+| U-Boot runs, doesn't start the kernel | No `extlinux.conf` or `uEnv.txt` it reads, or wrong file names in it | `ls mmc 0:1` at the U-Boot prompt; section 13; bootloader note |
+| The kernel boots, no login prompt | `BR2_TARGET_GENERIC_GETTY_PORT` isn't the real console | `ttyS0` (section 10; rootfs note, section 7) |
+| `VFS: Unable to mount root fs` | `root=` names the wrong partition, or the filesystem isn't in the kernel | `mmcblk0p2` for the SD card (section 13); kernel note, section 13 |
+| `can't run '/etc/init.d/rcS'` or `/sbin/init` not found | The image doesn't match the init choice, or the root partition holds an old image | Rewrite the card; check `BR2_INIT_*` (section 10) |
+| `root` can't log in | Root login off, or a password hash written with a single `$` | Section 18 |
+| The root filesystem is full or read-only | `BR2_TARGET_ROOTFS_EXT2_SIZE` too small; `ro` without remount | Sections 13, 18 |
+| A program fails with `not found` | Built with another toolchain: a missing dynamic loader | Build it as a package or with the SDK (sections 11, 16) |
+| `GLIBC_2.xx not found` | Built with a newer glibc than the image's | The SDK of the same build (section 16) |
+| `modprobe` fails with `Exec format error` or `invalid module format` | A module built against another kernel | Build it as a `kernel-module` package (section 12) |
+
 ## 21. Not covered here
 
+- **What the build automates**: toolchains, U-Boot, the kernel and the root filesystem by hand: the [fundamentals notes](../../fundamentals/).
+- **Yocto**: the [Yocto note](../yocto/yocto_v1_2026-11-14.md).
+- **Porting Buildroot to a custom board** in depth: a U-Boot and kernel port, device tree writing.
+- **Graphical systems**: Wayland, Qt, GPU drivers.
+- **Secure boot and signed images** (FIT signatures, dm-verity, OP-TEE, TF-A): the bootloader and rootfs notes cover the principles.
+- **Buildroot's runtime test suite** (`support/testing/`, `run-tests`) and the project's own CI.
+- **Contributing to Buildroot**: patches to the mailing list, `DEVELOPERS`, the review process.
+- **Toolchain internals**: how Buildroot builds GCC and the C library.
+
 ## References
+
+Buildroot documentation (https://buildroot.org/docs.html):
+
+- *The Buildroot user manual* (https://buildroot.org/downloads/manual/manual.html): system requirements, configuration, the output directory, br2-external trees, customization, adding packages and every infrastructure, rebuilding, the SDK, legal information.
+- `docs/manual/` in the source tree: the same manual for your release.
+- `CHANGES` in the source tree: what changed in each release.
+- Buildroot LTS: https://buildroot.org/lts.html
+- Downloads and release tarballs: https://buildroot.org/downloads/
+- Source: https://gitlab.com/buildroot.org/buildroot
+- Mailing list and release announcements: https://lists.buildroot.org
+
+Tools and components:
+
+- genimage: https://github.com/pengutronix/genimage
+- Bootlin toolchains: https://toolchains.bootlin.com
+- Kconfig language: https://docs.kernel.org/kbuild/kconfig-language.html
+
+Update frameworks:
+
+- SWUpdate: https://sbabic.github.io/swupdate/
+- RAUC: https://rauc.io
+- Mender: https://mender.io
+
+Books and courses:
+
+- Chris Simmonds, *Mastering Embedded Linux Programming*: the Buildroot chapters.
+- Bootlin, *Embedded Linux development with Buildroot* training materials (free): https://bootlin.com/training/buildroot/
+- Thomas Petazzoni's and others' conference talks on Buildroot (Embedded Linux Conference, FOSDEM), including the FOSDEM 2026 talk on the LTS program.
 
 ---
 

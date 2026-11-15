@@ -348,9 +348,281 @@ export BR2_DL_DIR=$HOME/br-dl
 
 ## 7. The BeagleBone Black: beaglebone_defconfig
 
+Buildroot has a defconfig for the board, with its files in `board/beaglebone/`:
+
+```sh
+$ cat configs/beaglebone_defconfig
+$ ls board/beaglebone/
+$ cat board/beaglebone/readme.txt
+$ make O=$HOME/br-out/bbb beaglebone_defconfig
+$ make -C $HOME/br-out/bbb
+```
+
+**What the defconfig contains.** The shape of it (**From memory** of earlier releases; versions change, read your copy):
+
+```
+BR2_arm=y
+BR2_cortex_a8=y
+BR2_TARGET_GENERIC_GETTY_PORT="ttyS0"
+BR2_ROOTFS_POST_IMAGE_SCRIPT="support/scripts/genimage.sh"
+BR2_ROOTFS_POST_SCRIPT_ARGS="-c board/beaglebone/genimage.cfg"
+BR2_LINUX_KERNEL=y
+BR2_LINUX_KERNEL_CUSTOM_VERSION=y
+BR2_LINUX_KERNEL_CUSTOM_VERSION_VALUE="<version>"
+BR2_LINUX_KERNEL_DEFCONFIG="omap2plus"
+BR2_LINUX_KERNEL_DTS_SUPPORT=y
+BR2_LINUX_KERNEL_INTREE_DTS_NAME="<am335x-bone, am335x-boneblack and others>"
+BR2_TARGET_ROOTFS_EXT2=y
+BR2_TARGET_ROOTFS_EXT2_4=y
+BR2_TARGET_UBOOT=y
+BR2_TARGET_UBOOT_BUILD_SYSTEM_KCONFIG=y
+BR2_TARGET_UBOOT_BOARD_DEFCONFIG="am335x_evm"
+BR2_TARGET_UBOOT_FORMAT_IMG=y
+BR2_TARGET_UBOOT_SPL=y
+BR2_TARGET_UBOOT_SPL_NAME="MLO"
+BR2_PACKAGE_HOST_GENIMAGE=y
+BR2_PACKAGE_HOST_DOSFSTOOLS=y
+BR2_PACKAGE_HOST_MTOOLS=y
+```
+
+Every line is something done by hand in the fundamentals notes:
+
+| Option | By hand | Note |
+|---|---|---|
+| `BR2_arm`, `BR2_cortex_a8` (with the default NEON and hard-float choices) | `-mcpu=cortex-a8 -mfpu=neon -mfloat-abi=hard` | Toolchain note |
+| `BR2_LINUX_KERNEL_DEFCONFIG`, `BR2_LINUX_KERNEL_INTREE_DTS_NAME` | `make omap2plus_defconfig`, `make zImage dtbs` | Kernel note |
+| `BR2_TARGET_UBOOT_BOARD_DEFCONFIG`, `BR2_TARGET_UBOOT_SPL_NAME` | `make am335x_evm_defconfig`, `MLO` and `u-boot.img` | Bootloader note |
+| `BR2_TARGET_GENERIC_GETTY_PORT` | The `getty` line of `inittab` | Rootfs note, section 7 |
+| `BR2_TARGET_ROOTFS_EXT2_4` | `mkfs.ext4 -d` | Rootfs note, section 10 |
+| `BR2_ROOTFS_POST_IMAGE_SCRIPT` with `genimage.cfg` | The card layout and `genimage` | Rootfs note, section 11 |
+
+Lines not in the defconfig take their default: an internal toolchain (Buildroot builds the cross-compiler, with the default C library), BusyBox init, BusyBox, `devtmpfs` for `/dev`. `make menuconfig` shows them all.
+
+**The output**, in `output/images/` (**Expected**):
+
+| File | What it is |
+|---|---|
+| `MLO`, `u-boot.img` | The two stages of U-Boot |
+| `zImage`, `am335x-boneblack.dtb` and the other DTBs | Kernel and device trees |
+| `boot.vfat` | The FAT boot partition, made by `genimage` |
+| `rootfs.ext4` (and `rootfs.ext2`, a link) | The root partition |
+| `rootfs.tar` | The root filesystem as an archive, for NFS root (on by default) |
+| `sdcard.img` | The whole SD card: partition table, boot partition, root partition |
+
+The boot partition also holds the file U-Boot reads to start the kernel: `uEnv.txt` or `extlinux/extlinux.conf`, depending on the release. `board/beaglebone/genimage.cfg` lists what goes in it. The bootloader note (section 8) explains both; mainline U-Boot doesn't read `uenvcmd` from a `uEnv.txt`.
+
+**Writing the card.** Check the device name first (`lsblk`): the command erases it.
+
+```sh
+$ sudo dd if=output/images/sdcard.img of=/dev/sdX bs=4M conv=fsync status=progress
+```
+
+Or `sudo bmaptool copy --nobmap output/images/sdcard.img /dev/sdX`. Hold the S2 button while powering the board to boot from the SD card instead of the eMMC (bootloader note).
+
+**Expected**, on the serial console:
+
+```
+U-Boot SPL <version>
+...
+U-Boot <version>
+...
+Starting kernel ...
+[    0.000000] Booting Linux on physical CPU 0x0
+...
+Welcome to Buildroot
+buildroot login:
+```
+
+**For other boards** the same steps apply with another defconfig: `raspberrypi4_64_defconfig` for a Raspberry Pi 4 in 64-bit mode, and defconfigs for most boards of NXP, ST, Microchip, Rockchip and others. Read the board's `readme.txt` first. A vendor's own Buildroot tree (a "BSP") is usually an older Buildroot with extra packages; prefer the upstream defconfig when it exists.
+
 ## 8. Configuration: menuconfig, defconfigs and the toolchain
 
+**Changing the configuration:**
+
+```sh
+$ make menuconfig            # or nconfig (ncurses), xconfig (Qt), gconfig (GTK)
+```
+
+The menus, in order:
+
+| Menu | What it holds |
+|---|---|
+| Target options | Architecture, CPU, floating point, ABI |
+| Toolchain | Internal or external toolchain, C library, GCC version, C++, kernel headers |
+| Build options | Download directory, mirrors, parallelism, `ccache`, hardening flags, reproducibility |
+| System configuration | Hostname, init system, `/dev` management, root password, getty, overlays, scripts, tables |
+| Kernel | The Linux package: version, configuration, device trees |
+| Target packages | Every package, in categories |
+| Filesystem images | ext4, squashfs, UBIFS, cpio, tar, EROFS... |
+| Bootloaders | U-Boot and others |
+| Host utilities | Host tools to build, such as `genimage` |
+| Legacy config options | Options removed in this release that your configuration still sets (section 19) |
+
+In `menuconfig`, `/` searches for an option and shows its location, its dependencies and what selects it. That's the answer to "why can't I see package X?": usually it depends on a toolchain feature that is off (C++, threads, `wchar`, a C library).
+
+**`select` and `depends on`.** A package that needs a library *selects* it, so switching on the package switches on the library. A package that needs a toolchain feature *depends on* it, because Buildroot can't change the toolchain behind your back: the package stays hidden until the feature is on.
+
+**Saving the configuration.** `.config` is long and full of defaults. Keep the defconfig instead:
+
+```sh
+$ make savedefconfig
+```
+
+`savedefconfig` writes to the file named by `BR2_DEFCONFIG`, which is set to the defconfig you loaded: after `make beaglebone_defconfig`, it overwrites `configs/beaglebone_defconfig` in the Buildroot tree. To save elsewhere: `make savedefconfig BR2_DEFCONFIG=<path>`. Section 9 makes your own defconfig the one that gets written.
+
+**Kconfig packages** (Linux, U-Boot, BusyBox, uClibc-ng, Barebox) have their own configuration, with their own targets:
+
+| Command | What it does |
+|---|---|
+| `make linux-menuconfig` | Opens the kernel's `menuconfig` on the kernel's `.config` in `output/build/linux-<version>/` |
+| `make linux-update-defconfig` | Writes the kernel configuration to `BR2_LINUX_KERNEL_CUSTOM_CONFIG_FILE` (needs a custom configuration file, section 12) |
+| `make linux-diff-config` | Prints the changes from the base configuration: the start of a fragment |
+| `make uboot-menuconfig`, `uboot-update-defconfig` | The same for U-Boot |
+| `make busybox-menuconfig`, `busybox-update-config` | The same for BusyBox |
+
+Changes made with `linux-menuconfig` alone are lost at the next `make clean`. Save them as a fragment or a configuration file (section 12).
+
+**The toolchain** is the first big decision, because changing it later rebuilds everything:
+
+| Choice | Option | Pros | Cons |
+|---|---|---|---|
+| Internal | `BR2_TOOLCHAIN_BUILDROOT` | Any C library (glibc, musl, uClibc-ng), any GCC version Buildroot offers, built to match | Adds **typically** 15 to 30 minutes to every full build |
+| External, known | `BR2_TOOLCHAIN_EXTERNAL_BOOTLIN`, `BR2_TOOLCHAIN_EXTERNAL_ARM_ARM` | Downloaded prebuilt, no build time | Its versions are fixed by the toolchain release |
+| External, custom | `BR2_TOOLCHAIN_EXTERNAL_CUSTOM` | Any toolchain: a vendor's, your company's, the Arm GNU Toolchain of the toolchain note | You must declare its GCC version, kernel headers version, C library and features; Buildroot checks them |
+
+The Bootlin toolchains (https://toolchains.bootlin.com) are themselves built with Buildroot, in glibc, musl and uClibc-ng versions, "stable" or "bleeding edge", for most architectures; Buildroot downloads the one that matches the target options. For a product, an external toolchain shortens every full build, and the toolchain stays the same when Buildroot's internal one moves to a new GCC.
+
+**Kernel headers** in the toolchain must be the same as or older than the kernel that runs on the board (toolchain note, section 11). With an internal toolchain, set them to the kernel's version (`BR2_KERNEL_HEADERS_AS_KERNEL`, or the matching `BR2_PACKAGE_HOST_LINUX_HEADERS_CUSTOM_<x>_<y>`).
+
 ## 9. Your own tree: br2-external
+
+A **br2-external tree** is a directory outside Buildroot that Buildroot reads as if it were part of it: defconfigs, board files and packages. Everything of yours goes there, in your own git repository. This note calls it `bbb-external`:
+
+```
+bbb-external/
+├── external.desc                        name and description
+├── external.mk                          includes the packages' .mk files
+├── Config.in                            includes the packages' Config.in files
+├── configs/
+│   └── bbb_defconfig                    this section
+├── board/bbb/
+│   ├── rootfs-overlay/                  section 10
+│   ├── users.txt                        section 10
+│   ├── post-build.sh                    section 10
+│   ├── linux.fragment                   section 12
+│   ├── busybox.fragment                 section 12
+│   ├── extlinux.conf                    section 13
+│   ├── genimage.cfg                     section 13
+│   └── post-image.sh                    section 13
+├── patches/
+│   └── linux/0001-<change>.patch        section 12
+└── package/hello/
+    ├── Config.in                        section 11
+    ├── hello.mk
+    ├── S99hello
+    └── src/
+```
+
+**The three files that make it a tree:**
+
+`external.desc`:
+
+```
+name: BBB
+desc: BeagleBone Black product
+```
+
+`external.mk`:
+
+```
+include $(sort $(wildcard $(BR2_EXTERNAL_BBB_PATH)/package/*/*.mk))
+```
+
+`Config.in`:
+
+```
+source "$BR2_EXTERNAL_BBB_PATH/package/hello/Config.in"
+```
+
+| Element | Meaning |
+|---|---|
+| `name: BBB` | The tree's name. Buildroot defines `BR2_EXTERNAL_BBB_PATH`, the tree's absolute path, for use in options, `.mk` files and `Config.in` |
+| `external.mk` | Read by `make`. The `wildcard` line picks up every package without listing them |
+| `Config.in` | Read by Kconfig. Its entries appear under "External options" in `menuconfig`. Each package must be listed by hand |
+
+**Using it.** The tree is named once; Buildroot remembers it in the output directory:
+
+```sh
+$ cd ~/buildroot
+$ make BR2_EXTERNAL=$HOME/bbb-external O=$HOME/br-out/bbb bbb_defconfig
+$ cd $HOME/br-out/bbb
+$ make menuconfig
+$ make savedefconfig          # writes back to bbb-external/configs/bbb_defconfig
+$ make
+```
+
+`make list-defconfigs` now lists the tree's defconfigs too. Several trees can be combined, separated with `:`, each with its own name.
+
+**Starting the defconfig.** Copy the board's defconfig, then move the board files to your tree:
+
+```sh
+$ cp configs/beaglebone_defconfig ~/bbb-external/configs/bbb_defconfig
+$ cp board/beaglebone/genimage.cfg ~/bbb-external/board/bbb/
+```
+
+In the defconfig, refer to your files through the tree's path variable, never with an absolute path, so the tree works wherever it is checked out:
+
+```
+BR2_ROOTFS_OVERLAY="$(BR2_EXTERNAL_BBB_PATH)/board/bbb/rootfs-overlay"
+```
+
+**The defconfig of this note** (**Illustrative**; the version numbers are placeholders and each line is explained in its section):
+
+```
+BR2_arm=y
+BR2_cortex_a8=y
+BR2_TOOLCHAIN_EXTERNAL=y
+BR2_TOOLCHAIN_EXTERNAL_BOOTLIN=y
+BR2_GLOBAL_PATCH_DIR="$(BR2_EXTERNAL_BBB_PATH)/patches"
+BR2_TARGET_GENERIC_HOSTNAME="bbb"
+BR2_TARGET_GENERIC_ISSUE="BBB Linux"
+BR2_TARGET_GENERIC_GETTY_PORT="ttyS0"
+BR2_SYSTEM_DHCP="eth0"
+BR2_ROOTFS_OVERLAY="$(BR2_EXTERNAL_BBB_PATH)/board/bbb/rootfs-overlay"
+BR2_ROOTFS_USERS_TABLES="$(BR2_EXTERNAL_BBB_PATH)/board/bbb/users.txt"
+BR2_ROOTFS_POST_BUILD_SCRIPT="$(BR2_EXTERNAL_BBB_PATH)/board/bbb/post-build.sh"
+BR2_ROOTFS_POST_IMAGE_SCRIPT="$(BR2_EXTERNAL_BBB_PATH)/board/bbb/post-image.sh"
+BR2_LINUX_KERNEL=y
+BR2_LINUX_KERNEL_CUSTOM_VERSION=y
+BR2_LINUX_KERNEL_CUSTOM_VERSION_VALUE="6.12.<N>"
+BR2_LINUX_KERNEL_DEFCONFIG="omap2plus"
+BR2_LINUX_KERNEL_CONFIG_FRAGMENT_FILES="$(BR2_EXTERNAL_BBB_PATH)/board/bbb/linux.fragment"
+BR2_LINUX_KERNEL_DTS_SUPPORT=y
+BR2_LINUX_KERNEL_INTREE_DTS_NAME="ti/omap/am335x-boneblack"
+BR2_LINUX_KERNEL_NEEDS_HOST_OPENSSL=y
+BR2_PACKAGE_BUSYBOX_CONFIG_FRAGMENT_FILES="$(BR2_EXTERNAL_BBB_PATH)/board/bbb/busybox.fragment"
+BR2_PACKAGE_DROPBEAR=y
+BR2_PACKAGE_HELLO=y
+BR2_TARGET_ROOTFS_EXT2=y
+BR2_TARGET_ROOTFS_EXT2_4=y
+BR2_TARGET_ROOTFS_EXT2_SIZE="128M"
+# BR2_TARGET_ROOTFS_TAR is not set
+BR2_TARGET_UBOOT=y
+BR2_TARGET_UBOOT_BUILD_SYSTEM_KCONFIG=y
+BR2_TARGET_UBOOT_CUSTOM_VERSION=y
+BR2_TARGET_UBOOT_CUSTOM_VERSION_VALUE="<version>"
+BR2_TARGET_UBOOT_BOARD_DEFCONFIG="am335x_evm"
+BR2_TARGET_UBOOT_FORMAT_IMG=y
+BR2_TARGET_UBOOT_SPL=y
+BR2_TARGET_UBOOT_SPL_NAME="MLO"
+BR2_PACKAGE_HOST_GENIMAGE=y
+BR2_PACKAGE_HOST_DOSFSTOOLS=y
+BR2_PACKAGE_HOST_MTOOLS=y
+```
+
+With `BR2_TOOLCHAIN_EXTERNAL_BOOTLIN`, `menuconfig` picks the Bootlin toolchain that matches the target options; choose the C library and "stable" there and save. Don't write the toolchain variant by hand in the defconfig: its option name comes from the menu.
+
+**What else a tree can hold:** `board/<name>/` for several boards, `configs/` with one defconfig per product variant, and package patches. Buildroot's own tree is the example to copy: a board directory in `board/` and a package in `package/` look the same in your tree.
 
 ## 10. Customizing the root filesystem
 

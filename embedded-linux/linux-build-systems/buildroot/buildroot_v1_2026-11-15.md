@@ -880,7 +880,193 @@ Prefixing an infrastructure with `host-` (`$(eval $(host-cmake-package))`) build
 
 ## 12. The kernel and the bootloader
 
+**The kernel** is the `linux` package, configured in the Kernel menu. It runs the commands of the kernel note: configure, `zImage`, `dtbs`, `modules`, `modules_install` into the target.
+
+| Option | Meaning | Kernel note |
+|---|---|---|
+| `BR2_LINUX_KERNEL_CUSTOM_VERSION_VALUE` | A kernel.org release, downloaded as a tarball | Section 3 |
+| `BR2_LINUX_KERNEL_CUSTOM_GIT`, `_CUSTOM_REPO_URL`, `_CUSTOM_REPO_VERSION` | A git tree at a commit or tag: a vendor's kernel, or your own branch | Section 16 |
+| `BR2_LINUX_KERNEL_CUSTOM_TARBALL_LOCATION` | Any tarball URL | |
+| `BR2_LINUX_KERNEL_DEFCONFIG` | An in-tree defconfig, without `_defconfig`: `omap2plus` | Section 5 |
+| `BR2_LINUX_KERNEL_USE_CUSTOM_CONFIG`, `_CUSTOM_CONFIG_FILE` | A full configuration file of yours, instead of an in-tree defconfig | Section 5 |
+| `BR2_LINUX_KERNEL_CONFIG_FRAGMENT_FILES` | Fragments merged after the base, in order | Section 5 |
+| `BR2_LINUX_KERNEL_ZIMAGE`, `_UIMAGE`, `_IMAGE`... | The image format | Section 7 |
+| `BR2_LINUX_KERNEL_INTREE_DTS_NAME` | Device trees from the kernel tree, without `.dts`: `ti/omap/am335x-boneblack` since Linux 6.5 moved the Arm ones into vendor directories | Section 12 |
+| `BR2_LINUX_KERNEL_CUSTOM_DTS_PATH` | Your own `.dts` files, built with the kernel's include paths | Section 16 |
+| `BR2_LINUX_KERNEL_INSTALL_TARGET` | Also install the kernel and DTBs in `/boot` of the root filesystem | Section 9 |
+| `BR2_LINUX_KERNEL_NEEDS_HOST_OPENSSL`, `_LIBELF`, `_PAHOLE` | Host libraries the kernel build needs for some options (module signing, BTF) | Section 6 |
+
+**A kernel fragment**, `board/bbb/linux.fragment`, in the same form as the kernel note's `bbb.config` (section 5):
+
+```
+CONFIG_IKCONFIG=y
+CONFIG_IKCONFIG_PROC=y
+# CONFIG_DRM is not set
+```
+
+To write one: `make linux-menuconfig`, change the options, then `make linux-diff-config` and copy what it prints. Check the result as in the kernel note: an option whose dependencies aren't met disappears silently from the `.config` in `output/build/linux-<version>/`.
+
+**BusyBox** works the same: `BR2_PACKAGE_BUSYBOX_CONFIG` for a full configuration, `BR2_PACKAGE_BUSYBOX_CONFIG_FRAGMENT_FILES` for fragments. `board/bbb/busybox.fragment`:
+
+```
+# CONFIG_TELNETD is not set
+CONFIG_FEATURE_VI_COLON=y
+```
+
+**Kernel patches.** The global patch directory holds patches for any package, by package name and, optionally, version:
+
+```
+patches/
+├── linux/
+│   ├── 0001-ARM-dts-am335x-boneblack-add-my-cape.patch
+│   └── linux.hash                  hash of the custom kernel tarball
+└── uboot/
+    └── 0001-<change>.patch
+```
+
+`BR2_GLOBAL_PATCH_DIR="$(BR2_EXTERNAL_BBB_PATH)/patches"` names it. Patches in `patches/linux/<version>/` apply only to that version. Write them with `git format-patch` from the kernel tree (kernel note, section 16). A `.hash` file next to them gives the custom version a checksum; with `BR2_DOWNLOAD_FORCE_CHECK_HASHES`, Buildroot refuses any download without one.
+
+**Out-of-tree modules** combine `kernel-module` with `generic-package`:
+
+```
+MYDRV_VERSION = 1.0
+MYDRV_SITE = $(BR2_EXTERNAL_BBB_PATH)/package/mydrv/src
+MYDRV_SITE_METHOD = local
+MYDRV_LICENSE = GPL-2.0
+
+$(eval $(kernel-module))
+$(eval $(generic-package))
+```
+
+The source holds a `Kbuild` or `Makefile` with `obj-m += mydrv.o`, as in the kernel note (section 15). Buildroot builds it against its own kernel and installs it in `/lib/modules/<release>/updates/`, so the vermagic matches (kernel note, section 8). `Config.in` needs `depends on BR2_LINUX_KERNEL`.
+
+**The bootloader** is the U-Boot package, in the Bootloaders menu:
+
+| Option | Meaning | Bootloader note |
+|---|---|---|
+| `BR2_TARGET_UBOOT_CUSTOM_VERSION_VALUE` | A release: the same choices as for the kernel (version, git, tarball) | Section 4 |
+| `BR2_TARGET_UBOOT_BOARD_DEFCONFIG` | `am335x_evm`, without `_defconfig` | Section 4 |
+| `BR2_TARGET_UBOOT_CONFIG_FRAGMENT_FILES` | Fragments, for example a different boot delay | Section 4 |
+| `BR2_TARGET_UBOOT_FORMAT_IMG`, `BR2_TARGET_UBOOT_SPL`, `_SPL_NAME="MLO"` | Which files to copy to `output/images/` | Section 9 |
+| `BR2_TARGET_UBOOT_NEEDS_DTC`, `_PYLIBFDT`, `_OPENSSL`, `_GNUTLS`, `_UTIL_LINUX` | Host tools recent U-Boot versions need. The build error names the missing one | |
+| `BR2_PACKAGE_UBOOT_TOOLS` | `mkimage` for the build machine, `fw_printenv` and `fw_setenv` for the board | Sections 12, 15 |
+
+A recent U-Boot often needs more host tools than the defconfig of an older Buildroot release switches on: when the U-Boot build stops with a missing Python module or header, switch on the matching `NEEDS` option.
+
+**Using the trees of the fundamentals notes.** To build the kernel or U-Boot from a tree you already work in, point the package to it with `OVERRIDE_SRCDIR` (section 15). Buildroot then builds your checkout, with its configuration options.
+
 ## 13. The card image: genimage
+
+`genimage` builds partition images and a partitioned disk image from a description, without root rights and without loop devices. The rootfs note introduces it (section 11). Buildroot runs it from a post-image script, after the root filesystem images are made.
+
+`board/bbb/genimage.cfg` (**Illustrative**):
+
+```
+image boot.vfat {
+	vfat {
+		files = {
+			"MLO",
+			"u-boot.img",
+			"zImage",
+			"am335x-boneblack.dtb"
+		}
+		file extlinux/extlinux.conf {
+			image = "extlinux.conf"
+		}
+	}
+	size = 32M
+}
+
+image sdcard.img {
+	hdimage {
+	}
+
+	partition boot {
+		partition-type = 0xC
+		bootable = "true"
+		image = "boot.vfat"
+	}
+
+	partition rootfs {
+		partition-type = 0x83
+		image = "rootfs.ext4"
+	}
+}
+```
+
+| Element | Meaning |
+|---|---|
+| `image boot.vfat` | A FAT filesystem image with the boot files, taken from `output/images/` |
+| `file extlinux/extlinux.conf` | A file placed in a subdirectory of the FAT image |
+| `hdimage` | A disk image with an MBR partition table. `partition-table-type = "gpt"` for GPT |
+| `partition-type = 0xC`, `bootable = "true"` | FAT32 with the boot flag: the AM335x ROM code looks for `MLO` on the active FAT partition (bootloader note) |
+| `image = "rootfs.ext4"` | The root filesystem image Buildroot made (`BR2_TARGET_ROOTFS_EXT2_4`) |
+
+`board/bbb/extlinux.conf`, read by U-Boot's standard boot (bootloader note, section 8):
+
+```
+label buildroot
+    kernel /zImage
+    fdt /am335x-boneblack.dtb
+    append console=ttyS0,115200n8 root=/dev/mmcblk0p2 rootwait ro
+```
+
+`ro` mounts the root read-only, then the init scripts remount it read-write unless `BR2_TARGET_GENERIC_REMOUNT_ROOTFS_RW` is off (section 18). `mmcblk0` is the SD card with the mainline device tree; the eMMC is `mmcblk1`.
+
+`board/bbb/post-image.sh` copies the file into place and runs `genimage` through Buildroot's wrapper:
+
+```sh
+#!/bin/sh
+set -e
+BOARD_DIR="$(dirname "$0")"
+
+cp "$BOARD_DIR/extlinux.conf" "$BINARIES_DIR/extlinux.conf"
+support/scripts/genimage.sh -c "$BOARD_DIR/genimage.cfg"
+```
+
+`support/scripts/genimage.sh` sets `genimage`'s input to `output/images/`, its temporary directory and its root path. Many board directories in Buildroot skip the script and set `BR2_ROOTFS_POST_IMAGE_SCRIPT="support/scripts/genimage.sh"` with `BR2_ROOTFS_POST_SCRIPT_ARGS="-c <path>/genimage.cfg"`, as `beaglebone_defconfig` does (section 7). Remember that the arguments go to post-build scripts too.
+
+**A product layout** adds what the rootfs note describes in sections 15 and 16: two root partitions for A/B updates and a data partition (**Illustrative**):
+
+```
+image sdcard.img {
+	hdimage {
+	}
+	partition boot {
+		partition-type = 0xC
+		bootable = "true"
+		image = "boot.vfat"
+	}
+	partition rootfsA {
+		partition-type = 0x83
+		image = "rootfs.ext4"
+		size = 256M
+	}
+	partition rootfsB {
+		partition-type = 0x83
+		image = "rootfs.ext4"
+		size = 256M
+	}
+	partition data {
+		partition-type = 0x83
+		image = "data.ext4"
+	}
+}
+```
+
+An MBR holds four primary partitions, which this layout uses. For more, use GPT (`partition-table-type = "gpt"` in `hdimage`) only if the boot ROM supports it: the AM335x ROM reads an MBR to find `MLO` on an SD card. `data.ext4` is another `image` block with an `ext4` section and a size, made by `genimage` itself.
+
+**Filesystem image types**, in the Filesystem images menu:
+
+| Option | Image | Rootfs note |
+|---|---|---|
+| `BR2_TARGET_ROOTFS_EXT2` with `_EXT2_4`, `_EXT2_SIZE` | ext4, of a fixed size | Section 10 |
+| `BR2_TARGET_ROOTFS_SQUASHFS` | Compressed, read-only | Section 10 |
+| `BR2_TARGET_ROOTFS_EROFS` | Compressed, read-only, faster random reads | Section 10 |
+| `BR2_TARGET_ROOTFS_UBI`, `_UBIFS` | For raw NAND flash | Section 10 |
+| `BR2_TARGET_ROOTFS_CPIO` | An initramfs archive | Section 10 |
+| `BR2_TARGET_ROOTFS_INITRAMFS` | The cpio built into the kernel image | Kernel note, section 13 |
+| `BR2_TARGET_ROOTFS_TAR` | An archive, for NFS root or for unpacking elsewhere | Section 11 |
 
 ## 14. Rebuilding: what make tracks and what it doesn't
 

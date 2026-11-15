@@ -1070,11 +1070,182 @@ An MBR holds four primary partitions, which this layout uses. For more, use GPT 
 
 ## 14. Rebuilding: what make tracks and what it doesn't
 
+`make` remembers which steps of which packages are done (section 6). It does **not** remember what the configuration was when they were done. So:
+
+| Change | What `make` does | What to do |
+|---|---|---|
+| A new package switched on | Builds it | `make` |
+| A file in an overlay, a post-build or post-image script, `genimage.cfg` | Applies it, because these steps run every time | `make` |
+| The source of a `local` package or an `OVERRIDE_SRCDIR` package | Nothing | `make <pkg>-rebuild` then `make` |
+| A package's `.mk` file, or its options in `menuconfig` | Nothing | `make <pkg>-reconfigure` or `make <pkg>-dirclean`, then `make` |
+| A kernel or BusyBox fragment, a kernel patch | Nothing | `make linux-dirclean` (or `busybox-dirclean`), then `make` |
+| A package switched off | Nothing: its files stay in `output/target/` | Full rebuild |
+| A library option that other packages use (switching on a package that others detect, such as `openssl`) | Builds the library; packages already built don't see it | Full rebuild, or `-reconfigure` the packages that care |
+| The toolchain, the architecture, the CPU, the C library, the init system | Wrong results | Full rebuild |
+
+**The per-package targets:**
+
+| Target | Reruns |
+|---|---|
+| `make <pkg>-rebuild` | Build and install steps |
+| `make <pkg>-reconfigure` | Configure, build and install |
+| `make <pkg>-reinstall` | Install only |
+| `make <pkg>-dirclean` | Deletes the build directory; the next `make` starts the package from the extract step |
+| `make <pkg>-source`, `-extract`, `-patch`, `-configure`, `-build` | Up to that step |
+
+After a per-package target, run `make` once more: it puts the new files in the images. `make <pkg>-rebuild all` does both.
+
+**A full rebuild:**
+
+```sh
+$ make clean all
+```
+
+It takes as long as the first build, minus the downloads. That's the price of Buildroot's simplicity, and the reason to keep the toolchain external and the configuration stable.
+
+**Making builds faster:**
+
+| Method | How | Effect |
+|---|---|---|
+| External toolchain | Section 8 | Removes the toolchain build: **typically** a third of a small image |
+| `ccache` | `BR2_CCACHE=y`; cache in `~/.buildroot-ccache` (`BR2_CCACHE_DIR`) | Full rebuilds of unchanged packages go faster. The cache is shared by every Buildroot tree of your user |
+| Top-level parallel build | `BR2_PER_PACKAGE_DIRECTORIES=y`, then `make -j$(nproc)` | Builds independent packages at the same time. Each package gets its own copy of host and staging in `output/per-package/` |
+| Shared downloads | `BR2_DL_DIR` (section 6) | No downloads after the first build |
+| Several output directories | `O=` per configuration (section 4) | Switching between products doesn't need a rebuild |
+
+Per-package directories also catch a class of bugs: a package that uses a library it doesn't list in `_DEPENDENCIES` fails, instead of working only when the library happens to be built first.
+
 ## 15. Working on source code: OVERRIDE_SRCDIR
+
+Changing a package's source inside `output/build/<pkg>-<version>/` works until the next `dirclean`, which deletes it. To work on the source of a package (yours, the kernel, U-Boot) from your own checkout, tell Buildroot to use it.
+
+In `local.mk` in the output directory (or the file named by `BR2_PACKAGE_OVERRIDE_FILE`):
+
+```
+LINUX_OVERRIDE_SRCDIR = $(HOME)/src/linux
+UBOOT_OVERRIDE_SRCDIR = $(HOME)/src/u-boot
+HELLO_OVERRIDE_SRCDIR = $(HOME)/src/hello
+```
+
+```sh
+$ make linux-rebuild all
+```
+
+| Behaviour | Detail |
+|---|---|
+| No download, no patches | Buildroot copies your directory with `rsync` into `output/build/<pkg>-custom/` and builds the copy. Patches from `package/` and the global patch directory are not applied: your tree already has them |
+| Your tree stays clean | Builds happen in the copy, so your checkout has no build products |
+| `-rebuild` resynchronizes | Each `make <pkg>-rebuild` copies the changed files and rebuilds |
+| Configuration still from Buildroot | The kernel's defconfig and fragments still apply |
+
+**The workflow** for a kernel change:
+
+1. Clone the kernel at the version in the defconfig, apply the global patches as commits (`git am`).
+2. Set `LINUX_OVERRIDE_SRCDIR` in `local.mk`.
+3. Edit, `make linux-rebuild all`, test on the board, repeat.
+4. `git format-patch` the new commits into `patches/linux/` of the external tree.
+5. Remove the line from `local.mk`, `make linux-dirclean all`, and check that the build from the patches gives the same result.
+
+`local.mk` is a file of your workstation, not of the product: don't commit it. A release build must use only the defconfig, the patches and the downloads.
 
 ## 16. The SDK: building applications outside Buildroot
 
+The toolchain Buildroot used is in `output/host/`, with the sysroot holding every library of the image. It can build applications for the board directly:
+
+```sh
+$ output/host/bin/arm-buildroot-linux-gnueabihf-gcc -o hello hello.c
+$ cmake -DCMAKE_TOOLCHAIN_FILE=$PWD/output/host/share/buildroot/toolchainfile.cmake ..
+```
+
+The tuple is `arm-buildroot-linux-gnueabihf` with an internal toolchain; an external toolchain keeps its own name (`arm-none-linux-gnueabihf` for the Arm one). The CMake toolchain file sets the compiler, the sysroot and the search paths, as the toolchain note does by hand (section 9). `pkg-config` from `output/host/bin` finds the sysroot's libraries.
+
+**A relocatable SDK** for other developers:
+
+```sh
+$ make sdk
+```
+
+It writes `output/images/<tuple>_sdk-buildroot.tar.gz`. On the other machine:
+
+```sh
+$ tar xf arm-buildroot-linux-gnueabihf_sdk-buildroot.tar.gz -C ~/sdk
+$ ~/sdk/arm-buildroot-linux-gnueabihf_sdk-buildroot/relocate-sdk.sh
+$ source ~/sdk/arm-buildroot-linux-gnueabihf_sdk-buildroot/environment-setup
+$ $CC -o hello hello.c
+```
+
+`relocate-sdk.sh` rewrites the paths recorded at build time; run it once after unpacking, and again after moving the directory. `environment-setup` sets `CC`, `CFLAGS`, `PKG_CONFIG_PATH` and the others (**From memory**: check that your release ships it).
+
+| Toolchain from... | Matches the image | Use |
+|---|---|---|
+| `output/host/` | Always: it's the build itself | Developers who build the image |
+| `make sdk` | When made from the same build as the image on the board | Application developers |
+| The toolchain note's Arm GNU Toolchain | Only if its glibc is not newer than the image's | Avoid for programs that run on a Buildroot image |
+
+A program built with a newer glibc than the image's fails on the board with `GLIBC_2.xx not found` (toolchain note). Rebuild the SDK whenever the toolchain or a library changes, and give it the same version as the image.
+
+**The application in the image.** An SDK is for development. For the product, the application is a package (section 11), so it's built with the image, listed in the license report and rebuilt with every toolchain change.
+
 ## 17. When a build fails
+
+**Read the right line.** Buildroot prints every package's build output in the terminal, and a failure ends with a `make` error that names the step, not the reason:
+
+```
+make[1]: *** [package/pkg-generic.mk:<line>: .../output/build/libfoo-1.2.3/.stamp_built] Error 2
+make: *** [Makefile:<line>: _all] Error 2
+```
+
+The reason is above it: scroll up to the first `error:` of the compiler or of the package's build system. Keep a log of every build:
+
+```sh
+$ make 2>&1 | tee build.log
+$ utils/brmake              # the same as make, output in br.log, only the >>> lines on screen
+```
+
+**Look at one package:**
+
+```sh
+$ make libfoo                               # rebuild only what's needed for it
+$ make libfoo-dirclean libfoo V=1           # from scratch, every command printed
+$ ls output/build/libfoo-1.2.3/             # the source as built, the build system's logs
+$ cat output/build/libfoo-1.2.3/config.log  # autotools; CMakeFiles/CMakeError.log for CMake
+```
+
+In the build directory, rerunning the failing command by hand works when you copy the environment that `V=1` printed: the cross-compiler, `PATH` with `output/host/bin` first, and the flags.
+
+**What did the configuration give a variable?**
+
+```sh
+$ make VARS=LINUX_VERSION printvars
+$ make VARS='HELLO_%' printvars             # every variable of a package
+$ make libfoo-show-depends                  # what it depends on
+$ make libfoo-show-rdepends                 # what depends on it
+$ make show-info > info.json                # every package: version, licenses, source, dependencies
+```
+
+**Why is a package in the image, and what does it cost?**
+
+```sh
+$ make graph-depends                    # output/graphs/graph-depends.pdf
+$ make libfoo-graph-depends             # one package's dependencies
+$ make graph-size                       # output/graphs/graph-size.pdf and file-size-stats.csv
+$ make graph-build                      # time per package and step
+```
+
+`graph-size` shows which package each file of the target belongs to, and their sizes: the place to start shrinking an image. `utils/size-stats-compare` compares two builds.
+
+**Testing a package.** `utils/test-pkg -c <config fragment> -p <package>` builds a package with several toolchains, which catches the missing `depends on` lines of section 11 before they reach other people.
+
+**Common causes:**
+
+| Message | Meaning | Fix |
+|---|---|---|
+| `fatal error: foo.h: No such file or directory` | The library isn't built yet, or isn't installed in staging | Add it to `_DEPENDENCIES`; `_INSTALL_STAGING = YES` in the library's package |
+| `configure: error: ... not found` with the library built | `pkg-config` not used, or not found | `host-pkgconf` in `_DEPENDENCIES` |
+| `cannot find -lfoo` | Same as above, at link time | Same |
+| A build machine path (`/usr/include`, `/usr/lib`) in the error | The package's build system ignored the cross settings and used the build machine's files | Pass the right options in `_CONF_OPTS`; look at how a similar package in `package/` does it |
+| `ERROR: package host-<x> installs executables without proper RPATH` | A host tool links to a build machine library by path | The package's build options; read `support/scripts/check-host-rpath` |
+| `Incorrect selection of kernel headers` | The external toolchain's headers don't match the version declared in the Toolchain menu | Declare the headers the toolchain really has (section 8) |
 
 ## 18. Reproducible builds, licenses, vulnerabilities and updates
 

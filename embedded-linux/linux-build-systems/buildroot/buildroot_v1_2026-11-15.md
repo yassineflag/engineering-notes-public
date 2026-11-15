@@ -626,7 +626,257 @@ With `BR2_TOOLCHAIN_EXTERNAL_BOOTLIN`, `menuconfig` picks the Bootlin toolchain 
 
 ## 10. Customizing the root filesystem
 
+**How the root filesystem is assembled.** At the end of `make`, after every package is installed in `output/target/`:
+
+```
+ skeleton (system/skeleton)  ─┐
+ packages' install steps      ├─> output/target/ ─> overlays ─> post-build scripts
+ init, getty, hostname, DHCP ─┘                                       │
+                                                                      ▼
+ users tables, device and permission tables ─> fakeroot ─> rootfs images ─> post-image scripts
+```
+
+Everything the rootfs note does by hand in sections 3 to 9 comes from this: the directory layout from the skeleton, `inittab` and the startup scripts from the init choice, `passwd` and `group` from the skeleton and the users tables, `/dev` from the device creation choice.
+
+**System configuration options** (`menuconfig`, System configuration):
+
+| Option | Effect | Rootfs note |
+|---|---|---|
+| `BR2_TARGET_GENERIC_HOSTNAME`, `BR2_TARGET_GENERIC_ISSUE` | `/etc/hostname`, the banner before the login | Section 9 |
+| `BR2_INIT_BUSYBOX`, `BR2_INIT_SYSV`, `BR2_INIT_OPENRC`, `BR2_INIT_SYSTEMD`, `BR2_INIT_NONE` | The init system. BusyBox init is the default; systemd needs glibc | Sections 7, 12 |
+| `BR2_ROOTFS_DEVICE_CREATION_DYNAMIC_DEVTMPFS`, `_MDEV`, `_EUDEV`; `_STATIC` | `/dev` management. With systemd, udev comes with it | Section 6 |
+| `BR2_TARGET_GENERIC_GETTY_PORT`, `_BAUDRATE` | The console login | Section 7 |
+| `BR2_TARGET_ENABLE_ROOT_LOGIN`, `BR2_TARGET_GENERIC_ROOT_PASSWD` | Root login and its password (section 18) | Section 8 |
+| `BR2_SYSTEM_DHCP` | An interface configured by DHCP at boot | Section 9 |
+| `BR2_TARGET_GENERIC_REMOUNT_ROOTFS_RW` | Remount the root read-write at boot. Off for a read-only root (section 18) | Section 15 |
+| `BR2_ROOTFS_MERGED_USR` | `/bin`, `/sbin`, `/lib` as links into `/usr`. Required by systemd | Section 3 |
+| `BR2_SYSTEM_BIN_SH_*` | Which shell is `/bin/sh` | Section 4 |
+
+**The rootfs overlay** is a directory copied over `output/target/` at the end of every `make`. Files keep their relative paths:
+
+```
+board/bbb/rootfs-overlay/
+├── etc/
+│   ├── fstab                     replaces the skeleton's
+│   ├── network/interfaces
+│   └── profile.d/bbb.sh
+└── root/.ssh/authorized_keys     needs mode 0700 on .ssh, see below
+```
+
+The overlay replaces whole files. To change one line in a file a package installs, use a post-build script instead. The overlay is applied again by every `make`, so an edit to it reaches the image without any rebuild target.
+
+**A post-build script** runs after the overlays, before the images. Its first argument is the target directory, and Buildroot exports `TARGET_DIR`, `HOST_DIR`, `STAGING_DIR`, `BINARIES_DIR`, `BUILD_DIR`, `BASE_DIR` and `BR2_CONFIG` (the path of `.config`). `board/bbb/post-build.sh` (**Illustrative**):
+
+```sh
+#!/bin/sh
+set -e
+TARGET_DIR="$1"
+BOARD_DIR="$(dirname "$0")"
+
+# Record which version of the external tree built this image
+git -C "$BOARD_DIR" describe --always --dirty > "$TARGET_DIR/etc/bbb-release"
+
+# Don't start telnetd from the default inittab, if a package added it
+sed -i '/telnetd/d' "$TARGET_DIR/etc/inittab"
+```
+
+Make it executable (`chmod +x`). It runs from the Buildroot tree, as your user, not as root. Scripts listed in `BR2_ROOTFS_POST_BUILD_SCRIPT` (separated by spaces) run in order; `BR2_ROOTFS_POST_SCRIPT_ARGS` adds arguments to every post-build and post-image script.
+
+**Users** come from users tables, one line per user, in the `makeusers` format. `board/bbb/users.txt`:
+
+```
+app -1 app -1 =changeme /home/app /bin/sh - Application user
+```
+
+| Field | Value here | Meaning |
+|---|---|---|
+| Username | `app` | |
+| UID | `-1` | Chosen by Buildroot from the free range |
+| Group | `app` | Created if missing |
+| GID | `-1` | Chosen by Buildroot |
+| Password | `=changeme` | `=` prefix: clear text, hashed at build time. `!` prefix: login disabled. An existing hash: used as is |
+| Home | `/home/app` | Created and owned by the user; `-` for none |
+| Shell | `/bin/sh` | |
+| Groups | `-` | Extra groups, separated by commas |
+| Comment | `Application user` | The rest of the line |
+
+A clear-text password in a table ends up in version control: for a product, put a hash (`openssl passwd -6`, rootfs note section 8), or disable password logins.
+
+**Ownership and permissions** of files in the image come from permission tables in the `makedevs` format (`BR2_ROOTFS_DEVICE_TABLE`, default `system/device_table.txt`, which sets `/etc/shadow` and others). Add your own file to the list:
+
+```
+#<name>              <type> <mode> <uid> <gid> <major> <minor> <start> <inc> <count>
+/root/.ssh           d      700    0     0     -       -       -       -     -
+/usr/bin/hello       f      755    0     0     -       -       -       -     -
+```
+
+Types are `f` (file), `d` (directory), `c` and `b` (device nodes, needed only with a static `/dev`), `r` (recursive on a directory). Packages declare their own users and permissions in their `.mk` file (section 11).
+
+**Adding software that Buildroot already packages** is the usual case: switch it on in Target packages. Search with `/`, or read `package/` (`ls package | grep -i <name>`). The package options in `menuconfig` set its build options, the way `PACKAGECONFIG` does in Yocto.
+
 ## 11. Your own package
+
+A package is a directory with two files: the menu entry and the build rules. For the `hello` program of the toolchain note, kept in the external tree:
+
+`package/hello/Config.in`:
+
+```
+config BR2_PACKAGE_HELLO
+	bool "hello"
+	help
+	  Hello program for the BeagleBone Black.
+```
+
+`package/hello/hello.mk`:
+
+```
+################################################################################
+#
+# hello
+#
+################################################################################
+
+HELLO_VERSION = 1.0
+HELLO_SITE = $(BR2_EXTERNAL_BBB_PATH)/package/hello/src
+HELLO_SITE_METHOD = local
+HELLO_LICENSE = MIT
+HELLO_LICENSE_FILES = LICENSE
+
+define HELLO_BUILD_CMDS
+	$(TARGET_MAKE_ENV) $(MAKE) $(TARGET_CONFIGURE_OPTS) -C $(@D)
+endef
+
+define HELLO_INSTALL_TARGET_CMDS
+	$(INSTALL) -D -m 0755 $(@D)/hello $(TARGET_DIR)/usr/bin/hello
+endef
+
+define HELLO_INSTALL_INIT_SYSV
+	$(INSTALL) -D -m 0755 $(HELLO_PKGDIR)/S99hello $(TARGET_DIR)/etc/init.d/S99hello
+endef
+
+$(eval $(generic-package))
+```
+
+And `package/hello/src/` holds `hello.c`, `LICENSE` and a `Makefile` that uses `CC`, `CFLAGS` and `LDFLAGS`:
+
+```
+hello: hello.c
+	$(CC) $(CFLAGS) $(LDFLAGS) -o $@ $<
+```
+
+| Line | Meaning |
+|---|---|
+| `HELLO_` prefix | The package name in upper case, with `-` replaced by `_`. It must match the directory and file name (`hello/hello.mk`) |
+| `HELLO_SITE`, `HELLO_SITE_METHOD = local` | The source is a local directory, copied with `rsync` into `output/build/hello-1.0/` |
+| `HELLO_LICENSE`, `HELLO_LICENSE_FILES` | The license (SPDX identifier) and the files that hold it, for `make legal-info` (section 18) |
+| `HELLO_BUILD_CMDS` | The build step. `$(@D)` is the build directory. `TARGET_CONFIGURE_OPTS` sets `CC`, `CFLAGS`, `LDFLAGS` and the other tools to the cross-toolchain |
+| `HELLO_INSTALL_TARGET_CMDS` | Installs into `TARGET_DIR`, the `DESTDIR` of the rootfs note |
+| `HELLO_INSTALL_INIT_SYSV` | Installs the start script when the init system is BusyBox or SysV init; `HELLO_INSTALL_INIT_SYSTEMD` does the same for systemd |
+| `$(HELLO_PKGDIR)` | The package's directory, for files kept next to the `.mk` |
+| `$(eval $(generic-package))` | Turns the variables into the download, extract, patch, configure, build and install steps |
+
+The lines inside `define` blocks start with a tab, as in any Makefile. `utils/check-package package/hello/*` checks the formatting against Buildroot's coding style.
+
+`package/hello/S99hello`, a start script in the format of the rootfs note (section 7):
+
+```sh
+#!/bin/sh
+case "$1" in
+start)   printf "Starting hello: "; start-stop-daemon -S -b -q -x /usr/bin/hello && echo OK ;;
+stop)    printf "Stopping hello: "; start-stop-daemon -K -q -x /usr/bin/hello && echo OK ;;
+restart) "$0" stop; "$0" start ;;
+*)       echo "Usage: $0 {start|stop|restart}"; exit 1 ;;
+esac
+```
+
+Then list the package in the tree's `Config.in` (section 9), switch it on, and build it:
+
+```sh
+$ make menuconfig            # External options -> hello
+$ make hello
+$ make                       # to get it into the images
+```
+
+**A package for a real project**, downloaded and built with its own build system, uses an infrastructure. `package/libfoo/libfoo.mk` for a CMake project (**Illustrative**):
+
+```
+LIBFOO_VERSION = 1.2.3
+LIBFOO_SITE = https://example.org/releases
+LIBFOO_SOURCE = libfoo-$(LIBFOO_VERSION).tar.gz
+LIBFOO_LICENSE = BSD-3-Clause
+LIBFOO_LICENSE_FILES = LICENSE
+LIBFOO_CPE_ID_VENDOR = example
+LIBFOO_INSTALL_STAGING = YES
+LIBFOO_DEPENDENCIES = host-pkgconf zlib openssl
+LIBFOO_CONF_OPTS = -DBUILD_TESTS=OFF
+
+$(eval $(cmake-package))
+```
+
+`package/libfoo/libfoo.hash`:
+
+```
+# Locally computed
+sha256  <sha256 of the tarball>  libfoo-1.2.3.tar.gz
+sha256  <sha256 of the file>     LICENSE
+```
+
+`package/libfoo/Config.in`:
+
+```
+config BR2_PACKAGE_LIBFOO
+	bool "libfoo"
+	depends on BR2_TOOLCHAIN_HAS_THREADS
+	select BR2_PACKAGE_ZLIB
+	select BR2_PACKAGE_OPENSSL
+	help
+	  Example library.
+
+	  https://example.org/libfoo
+
+comment "libfoo needs a toolchain w/ threads"
+	depends on !BR2_TOOLCHAIN_HAS_THREADS
+```
+
+| Element | Meaning |
+|---|---|
+| `LIBFOO_SITE`, `LIBFOO_SOURCE` | Where to download, and the file name. For git: `LIBFOO_SITE = https://example.org/libfoo.git`, `LIBFOO_SITE_METHOD = git`, `LIBFOO_VERSION = <commit or tag>`. For GitHub: `$(call github,<owner>,<repo>,$(LIBFOO_VERSION))` |
+| `.hash` file | Checked after every download. A package with a hash file and no entry for the downloaded file fails (section 20) |
+| `LIBFOO_INSTALL_STAGING = YES` | Also installs into staging, so other packages can link to the library. Off by default |
+| `LIBFOO_DEPENDENCIES` | Packages to build first. `host-pkgconf` when the build calls `pkg-config` |
+| `LIBFOO_CONF_OPTS` | Options for the infrastructure: CMake `-D` options, `./configure` options, Meson options |
+| `LIBFOO_CPE_ID_*` | The package's name in the vulnerability database, for `make pkg-stats` (section 18) |
+| `select` | Switches on the libraries the package needs |
+| `depends on`, `comment` | Hides the package when a toolchain feature is missing, and says why in the menu |
+
+**A rule that catches everyone:** `select` doesn't follow the selected package's own `depends on`. If `openssl` depends on a toolchain feature, `libfoo` must depend on it too, or the build fails with a broken configuration.
+
+**The infrastructures:**
+
+| Infrastructure | For | Typical variables |
+|---|---|---|
+| `generic-package` | Anything, with your own commands | `_BUILD_CMDS`, `_INSTALL_TARGET_CMDS` |
+| `autotools-package` | `./configure && make` | `_CONF_OPTS`, `_AUTORECONF = YES` |
+| `cmake-package` | CMake | `_CONF_OPTS` |
+| `meson-package` | Meson | `_CONF_OPTS` |
+| `python-package` | Python modules | `_SETUP_TYPE` (`setuptools`, `pep517`, `flit`...) |
+| `cargo-package`, `golang-package` | Rust, Go | Vendored dependencies are downloaded with the source |
+| `kernel-module` | Out-of-tree modules, combined with `generic-package` | `_MODULE_SUBDIRS` (section 12) |
+| `kconfig-package` | Packages configured with Kconfig | `_KCONFIG_FILE`, `_KCONFIG_FRAGMENT_FILES` |
+
+Prefixing an infrastructure with `host-` (`$(eval $(host-cmake-package))`) builds the same package for the build machine.
+
+**What a package can also declare:**
+
+| Variable | Effect |
+|---|---|
+| `HELLO_USERS` | Users and groups, one per line, in the users table format of section 10 |
+| `HELLO_PERMISSIONS` | Permission table lines for the package's files |
+| `HELLO_POST_INSTALL_TARGET_HOOKS` | Extra steps after an install step: `HELLO_POST_INSTALL_TARGET_HOOKS += HELLO_EXTRA_FILES` with a `define HELLO_EXTRA_FILES` block |
+| `HELLO_PRE_CONFIGURE_HOOKS`, `HELLO_POST_PATCH_HOOKS`... | The same for every step |
+| `HELLO_IGNORE_CVES` | Known vulnerabilities that a patch in the package fixes (section 18) |
+
+**Patches** for a package go in its directory as `<number>-<description>.patch`, applied in order. For packages you don't own, use the global patch directory instead (section 12), so Buildroot's own `package/` stays untouched.
 
 ## 12. The kernel and the bootloader
 

@@ -415,7 +415,158 @@ $ apt-file search bin/dtc # which package (installed or not) provides a file: pa
 
 ## 7. Users, groups and sudo
 
+Every process runs as a **user** and belongs to **groups**; the kernel checks those against each file's owner and permissions (section 8). Users and groups are numbers (UID, GID); names are only a lookup in three files:
+
+| File | One line per | Fields |
+|---|---|---|
+| `/etc/passwd` | User | `user:x:1000:1000:Full Name:/home/user:/bin/bash`: name, `x` (password elsewhere), UID, primary GID, comment, home, shell |
+| `/etc/shadow` | User (readable by root only) | Name, password hash, password ageing |
+| `/etc/group` | Group | `dialout:x:20:user`: name, `x`, GID, extra members |
+
+UID 0 is **root**, which the kernel lets do almost anything. UIDs below 1000 are system users for services (`www-data`, `systemd-timesync`); the first human user gets 1000.
+
+```
+$ id
+uid=1000(user) gid=1000(user) groups=1000(user),20(dialout),24(cdrom),27(sudo),46(plugdev),100(users),106(netdev)
+$ whoami
+user
+$ getent passwd user      # works with LDAP and other sources too, not only /etc/passwd
+```
+
+**Becoming root, when needed.** Work as a normal user and raise privileges for one command at a time:
+
+| Command | Effect |
+|---|---|
+| `sudo cmd` | Run one command as root, after your own password (remembered for 15 minutes in that terminal) |
+| `sudo -u www-data cmd` | Run as another user |
+| `sudo -i` | A root login shell (root's environment, in `/root`) |
+| `sudo -s` | A root shell that keeps more of your environment |
+| `su -` | A root login shell with **root's** password, if root has one |
+| `sudo -l` | What you are allowed to run |
+
+`sudo` works for members of the `sudo` group (`wheel` on Fedora and Arch). On Debian, if you gave a root password during installation, the installer didn't add your user to it; fix it once from a root shell, then log out and in again:
+
+```
+$ su -
+# usermod -aG sudo user
+# exit
+```
+
+Ubuntu has no root password by default and puts the first user in `sudo`. Since 25.10, Ubuntu's `sudo` is `sudo-rs`, a rewrite in Rust that takes the same commands and the same `sudoers` files for common uses.
+
+**Managing users:**
+
+| Task | Command |
+|---|---|
+| Add a user with a home and a password (Debian's friendly script) | `sudo adduser alice` |
+| Add a user, low-level and identical everywhere | `sudo useradd -m -s /bin/bash alice`, then `sudo passwd alice` |
+| Change your password | `passwd` |
+| Add a user to a group | `sudo usermod -aG dialout alice` |
+| Remove a user from a group | `sudo gpasswd -d alice dialout` |
+| Lock / unlock an account | `sudo usermod -L alice` / `-U` |
+| Delete a user and their home | `sudo deluser --remove-home alice` |
+| Add a group | `sudo addgroup builders` |
+
+**The `-a` in `usermod -aG` matters:** `usermod -G dialout alice` without it *replaces* all of alice's extra groups with `dialout`, removing `sudo` among others.
+
+**Group changes apply at the next login.** A process gets its groups when the session starts; adding yourself to `dialout` changes nothing for shells that are already open. Log out of the desktop and back in (or reboot). To test in one terminal first: `newgrp dialout` starts a shell with the new group, or `su - $USER` starts a fresh login.
+
+**Groups that matter on a development PC:**
+
+| Group | Gives | Why you'd want it |
+|---|---|---|
+| `sudo` | `sudo` for everything | Administration |
+| `dialout` | Serial ports: `/dev/ttyUSB*`, `/dev/ttyACM*`, `/dev/ttyS*` | Board consoles (section 18) |
+| `plugdev` | Some USB devices whose udev rules use this group | Debug probes, SDRs, programmers |
+| `adm`, `systemd-journal` | Reading all logs without `sudo` | Section 14 |
+| `kvm` | `/dev/kvm` | Fast QEMU virtual machines |
+| `wireshark` | Packet capture without root (if allowed at install) | |
+| `docker` | The Docker daemon | **Equal to root**: anyone in it can mount `/` into a container. Rootless Podman avoids this |
+
+**sudoers.** Rules live in `/etc/sudoers` and in files under `/etc/sudoers.d/`. Edit them only with `visudo`, which checks the syntax before saving: a broken `sudoers` file locks everyone out of `sudo`. A rule that lets the user restart one service without a password (**Illustrative**):
+
+```
+$ sudo visudo -f /etc/sudoers.d/user-tftp
+user ALL=(root) NOPASSWD: /usr/bin/systemctl restart tftpd-hpa
+```
+
+Files in `/etc/sudoers.d/` are ignored if their name contains a `.` or ends in `~`, so don't name it `user.conf`.
+
 ## 8. Permissions and ownership
+
+Every file has an **owner** (a user), a **group**, and a **mode**: three sets of three permission bits, for the owner (`u`), the group (`g`) and everyone else (`o`):
+
+```
+-rwxr-x---  1 user builders  812 Nov 16 10:05 sd-write.sh
+ └┬┘└┬┘└┬┘
+  │  │  └── others:  ---  nothing
+  │  └───── group:   r-x  members of "builders" can read and run it
+  └──────── owner:   rwx  user can read, change and run it
+```
+
+The kernel checks only **one** set: owner if you are the owner, else group if you are in the group, else others. Root skips these checks (except `x`: root can run a file only if someone has `x` on it).
+
+**What r, w and x mean** depends on the type:
+
+| Bit | On a file | On a directory |
+|---|---|---|
+| `r` | Read the contents | List the names in it (`ls`) |
+| `w` | Change the contents | Create, delete and rename entries in it, **whatever the files' own permissions** |
+| `x` | Run it as a program | Enter it and reach anything below (`cd`, open files inside by name) |
+
+So deleting a file depends on the directory's `w`, not on the file's; and a file in a directory without `x` for you is unreachable even if the file is mode 777.
+
+**Octal modes.** Each set is a digit: `r`=4, `w`=2, `x`=1, added up.
+
+| Mode | Symbolic | Typical use |
+|---|---|---|
+| `644` | `rw-r--r--` | Ordinary files |
+| `755` | `rwxr-xr-x` | Programs, scripts, directories |
+| `600` | `rw-------` | Private files: SSH keys, files with passwords |
+| `700` | `rwx------` | Private directories: `~/.ssh` |
+| `664` / `775` | group can write | Files and directories shared in a group |
+
+**Changing modes and owners:**
+
+```
+$ chmod +x sd-write.sh            # add x for everyone (minus the umask, below)
+$ chmod u+x,go-w file             # add x for the owner, remove w for group and others
+$ chmod 600 ~/.ssh/id_ed25519     # octal
+$ chmod -R u+rwX,go+rX shared/    # recursive; capital X adds x only to directories and already-executable files
+$ sudo chown user:user file       # owner and group
+$ sudo chown -R user: ~/work      # owner, and group = the owner's primary group
+$ chgrp builders shared/          # group only (you must be a member)
+```
+
+`chmod -R 755` on a tree makes every file executable; `chmod -R 777` is never the fix for a permission problem. Find which component denies access instead: `namei -l /path/to/file` lists the owner and mode of every directory on the way.
+
+**The umask** removes bits from new files' modes. With the usual `022`, new files are `644` and new directories `755`; with `002`, the group can write too. `umask` prints yours.
+
+**Special bits:**
+
+| Bit | Shown as | On a file | On a directory | Example |
+|---|---|---|---|---|
+| setuid (4000) | `s` in the owner's `x` | Runs as the file's owner | (no effect on Linux) | `/usr/bin/passwd` runs as root to write `/etc/shadow` |
+| setgid (2000) | `s` in the group's `x` | Runs with the file's group | New files inherit the directory's group | A shared project directory: `chmod 2775 shared/` |
+| sticky (1000) | `t` in others' `x` | | Only a file's owner can delete it, even if everyone can write the directory | `/tmp` is `1777` |
+
+**ACLs** give rights to more than one user or group when owner/group/others isn't enough:
+
+```
+$ setfacl -m u:alice:rw report.txt     # alice may read and write
+$ setfacl -d -m g:builders:rwX shared/ # default ACL: inherited by new files in shared/
+$ getfacl report.txt
+```
+
+A `+` after the mode in `ls -l` (`-rw-rw-r--+`) means the file has an ACL.
+
+**Capabilities** split root's powers into pieces (`man 7 capabilities`), so a program can get one of them without being setuid root: `sudo setcap cap_net_raw+ep ./mytool` lets it open raw sockets, `getcap ./mytool` shows it.
+
+**Other reasons for `Permission denied`** when the mode looks right:
+- The filesystem is mounted `noexec` (a USB stick, sometimes `/tmp`): run the script with `bash script.sh`, or copy it elsewhere.
+- The filesystem is FAT or exFAT (SD card boot partitions, USB sticks), which has no Linux owners or modes: the mount options decide for every file (section 17).
+- You were added to the group after logging in (section 7).
+- AppArmor, enabled on Debian and Ubuntu, confines some programs (CUPS, some browsers, snaps): `sudo journalctl -k | grep -i apparmor` shows refusals.
 
 ## 9. Pipes, redirection and text processing
 

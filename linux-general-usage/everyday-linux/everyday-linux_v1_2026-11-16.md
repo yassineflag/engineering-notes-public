@@ -1130,7 +1130,139 @@ This is the first thing to check when a device "doesn't appear": whether the ker
 
 ## 15. Packages with APT and dpkg
 
+A **package** is an archive of files plus a description: its name, version, dependencies and scripts to run on install and removal. Debian packages are `.deb` files. **dpkg** installs a `.deb` and records it; **APT** sits on top: it downloads packages from the **repositories** you configured, verifies their signatures and resolves dependencies.
+
+**Everyday commands:**
+
+| Task | Command |
+|---|---|
+| Refresh the list of available packages | `sudo apt update` |
+| Upgrade everything that can be, without removing anything | `sudo apt upgrade` |
+| Upgrade, removing or adding packages if needed (point releases, kernel changes) | `sudo apt full-upgrade` |
+| Install | `sudo apt install picocom git build-essential` |
+| Install a `.deb` file, with its dependencies | `sudo apt install ./vendor-tool_1.2_amd64.deb` (the `./` matters) |
+| Remove / remove with its system configuration | `sudo apt remove pkg` / `sudo apt purge pkg` |
+| Remove dependencies nothing needs any more | `sudo apt autoremove` |
+| Search names and descriptions | `apt search serial terminal` |
+| Describe a package | `apt show picocom` |
+| Which version would be installed, and from where | `apt policy picocom` |
+| What's installed / upgradable | `apt list --installed`, `apt list --upgradable` |
+| Files of an installed package | `dpkg -L picocom` |
+| Which package owns a file | `dpkg -S /usr/bin/picocom` |
+| Installed packages matching a pattern | `dpkg -l 'linux-image*'` |
+| What changed recently | `less /var/log/apt/history.log` |
+
+`apt` is meant for people: progress bars, colours, output that may change between versions. In scripts use `apt-get` and `apt-cache`, whose output is stable: `sudo apt-get install -y pkg`.
+
+**Repositories** are configured in `/etc/apt/sources.list.d/`. Debian 13 uses the **deb822** format, one `.sources` file per repository (**Expected**, for a standard installation):
+
+```
+# /etc/apt/sources.list.d/debian.sources
+Types: deb
+URIs: http://deb.debian.org/debian
+Suites: trixie trixie-updates
+Components: main contrib non-free non-free-firmware
+Signed-By: /usr/share/keyrings/debian-archive-keyring.gpg
+
+Types: deb
+URIs: http://security.debian.org/debian-security
+Suites: trixie-security
+Components: main contrib non-free non-free-firmware
+Signed-By: /usr/share/keyrings/debian-archive-keyring.gpg
+```
+
+The older one-line format in `/etc/apt/sources.list` (`deb http://deb.debian.org/debian trixie main`) still works; `sudo apt modernize-sources` converts it. **Components:** `main` is free software, `non-free-firmware` holds firmware for Wi-Fi cards and GPUs, `contrib` and `non-free` hold packages that depend on or are non-free software.
+
+**Third-party repositories** (Docker, VS Code, a vendor's tools): put the vendor's signing key in `/etc/apt/keyrings/` and name it in `Signed-By:`, so it's trusted only for that repository (**Illustrative**):
+
+```
+$ curl -fsSL https://example.com/repo/key.asc | sudo gpg --dearmor -o /etc/apt/keyrings/example.gpg
+$ sudo tee /etc/apt/sources.list.d/example.sources > /dev/null <<'EOF'
+Types: deb
+URIs: https://example.com/repo/debian
+Suites: trixie
+Components: main
+Signed-By: /etc/apt/keyrings/example.gpg
+EOF
+$ sudo apt update
+```
+
+`apt-key`, which old instructions still mention, is gone from APT 3.0; and a key trusted for every repository could sign fake Debian packages. Every third-party repository can replace any package on your system: add as few as possible.
+
+**Newer versions without leaving Debian stable.** **Backports** are packages from the next release rebuilt for this one. Add the suite `trixie-backports` to a `.sources` file, then ask for it explicitly; nothing is taken from backports otherwise:
+
+```
+$ sudo apt install -t trixie-backports linux-image-amd64
+```
+
+**Holding a package** at its version: `sudo apt-mark hold linux-image-amd64`, `apt-mark showhold`, `sudo apt-mark unhold ...`. **Automatic security updates:** `sudo apt install unattended-upgrades`, then `sudo dpkg-reconfigure unattended-upgrades`. After upgrades, `needrestart` (installed by default on Ubuntu) lists the services still running old libraries.
+
+**Fixing a stuck package system:**
+
+| Message | Meaning and fix |
+|---|---|
+| `Could not get lock /var/lib/dpkg/lock-frontend` | Another APT is running: often `unattended-upgrades` or a software centre. Wait; `ps aux \| grep -E 'apt\|dpkg'` shows it. Never delete the lock files |
+| `dpkg was interrupted, you must manually run 'sudo dpkg --configure -a'` | An install was cut off: run exactly that |
+| `Unmet dependencies` / `Try 'apt --fix-broken install'` | `sudo apt --fix-broken install` |
+| `The following packages have been kept back` | They need new dependencies or removals: `sudo apt full-upgrade`, after reading what it will remove |
+| `NO_PUBKEY ...` or `is not signed` | A third-party key is missing or expired: fetch the vendor's current key as above |
+| `Release file ... is not valid yet` | The PC's clock is wrong (section 22) |
+
+**Other distributions,** for when you're on someone else's machine:
+
+| Task | Debian, Ubuntu | Fedora | Arch |
+|---|---|---|---|
+| Refresh and upgrade | `apt update && apt full-upgrade` | `dnf upgrade` | `pacman -Syu` |
+| Install / remove | `apt install` / `apt remove` | `dnf install` / `dnf remove` | `pacman -S` / `pacman -R` |
+| Search | `apt search` | `dnf search` | `pacman -Ss` |
+| Owner of a file | `dpkg -S` | `rpm -qf` | `pacman -Qo` |
+| Files of a package | `dpkg -L` | `rpm -ql` | `pacman -Ql` |
+
 ## 16. Software outside APT
+
+Not everything is packaged, or packaged in the version you need. In rough order of preference:
+
+| Source | Use for | Where it goes | Updated by |
+|---|---|---|---|
+| Debian package | Everything that's there | `/usr` | `apt` |
+| Backports | A newer version of a few packages | `/usr` | `apt` |
+| Vendor APT repository | Tools whose vendor maintains one (Docker, VS Code, KiCad PPA on Ubuntu) | `/usr` or `/opt` | `apt` |
+| Flatpak | Desktop applications (`flatpak install flathub org.kicad.KiCad`) | `/var/lib/flatpak`, sandboxed | `flatpak update` |
+| Snap (Ubuntu) | Desktop and some command-line apps; Ubuntu installs Firefox this way | `/snap`, sandboxed | Automatic |
+| Language tools: `pipx`, `cargo`, `npm` | Command-line tools written in Python, Rust, JavaScript | `~/.local`, `~/.cargo` | The tool |
+| A vendor tarball | Toolchains, SDKs, IDEs (the Arm GNU Toolchain of the embedded notes) | `/opt/<name>` | You, by hand |
+| Built from source | Anything else | `/usr/local` or `~/.local` | You, by hand |
+| AppImage | Single-file desktop apps | `~/Applications` | You, or the app |
+
+**Python.** Debian protects its own Python packages: `pip install --user something` fails with `error: externally-managed-environment`. Don't force it with `--break-system-packages`. Instead:
+
+```
+$ sudo apt install python3-serial                # if Debian packages the library
+$ sudo apt install pipx && pipx install esptool  # a command-line tool, in its own environment, on PATH
+$ python3 -m venv .venv                          # a project: its own environment in the project directory
+$ . .venv/bin/activate
+(.venv) $ pip install -r requirements.txt
+(.venv) $ deactivate
+```
+
+`uv` (`pipx install uv`) does the same as `venv` and `pip`, much faster.
+
+**Building from source** usually follows one of these, after installing the build dependencies (`sudo apt install build-essential cmake pkg-config`, plus the `-dev` packages the README lists; `sudo apt build-dep <package>` installs all of them for a program Debian also packages, if `deb-src` lines are enabled):
+
+```
+$ ./configure --prefix=/usr/local && make -j"$(nproc)" && sudo make install          # Autotools
+$ cmake -B build -DCMAKE_INSTALL_PREFIX=/usr/local && cmake --build build -j && sudo cmake --install build
+$ meson setup build --prefix=/usr/local && ninja -C build && sudo ninja -C build install
+```
+
+- `/usr/local` is yours: `apt` never writes there, and `/usr/local/bin` comes before `/usr/bin` in `PATH`, so your build wins over the packaged one. That's the point, and also a trap when you forget it's there: `type -a tool` shows both.
+- With `--prefix="$HOME/.local"`, no `sudo` is needed at all.
+- There is no uninstall: keep the build directory (`sudo make uninstall` works only if the project provides it; CMake writes `build/install_manifest.txt`, the list of installed files).
+- New shared libraries in `/usr/local/lib` need `sudo ldconfig` once, or programs fail with `error while loading shared libraries`.
+
+**Several versions of one tool.** Debian's `update-alternatives` switches what a generic name points to (`editor`, `java`, `cc`, `x-terminal-emulator`): `update-alternatives --display editor`. For a toolchain in `/opt`, put its `bin` directory in `PATH` only in the shells that need it, through a settings file you source (section 10), rather than globally.
+
+**Containers for build environments.** When a tool needs an older or different distribution (a vendor SDK that wants Ubuntu 22.04, a Yocto release that doesn't support your host), run it in a container instead of changing the PC: `podman run --rm -it -v "$PWD":/work -w /work ubuntu:22.04 bash`. Podman runs rootless (no daemon, no root-equivalent group); Docker is the same idea with a daemon. The toolchain and Buildroot notes of the [embedded Linux notes](../../embedded-linux/) suggest the same for build hosts.
 
 ## 17. Disks, partitions, filesystems and SD cards
 

@@ -845,9 +845,288 @@ echo "done; remove the card"
 
 ## 12. Processes and signals
 
+A **process** is a running program: its code, memory, open files, user and groups, current directory and environment. Each has a number, the **PID**, and a parent, the **PPID**: your shell is the parent of the commands you run, and everything descends from PID 1, systemd.
+
+**Looking at processes:**
+
+```
+$ ps aux                                    # every process, BSD style: user, PID, %CPU, %MEM, state, command
+$ ps -ef                                    # the same, System V style, with PPID
+$ ps -eo pid,ppid,user,%cpu,%mem,etime,cmd --sort=-%cpu | head    # pick columns, sort by CPU
+$ pstree -p                                 # the family tree with PIDs
+$ pgrep -a picocom                          # PIDs and command lines matching a name
+$ top                                       # live view; htop (package htop) is friendlier
+```
+
+**Expected** (`ps aux`, a few lines):
+
+```
+USER         PID %CPU %MEM    VSZ   RSS TTY      STAT START   TIME COMMAND
+root           1  0.0  0.1  23432 13900 ?        Ss   09:41   0:02 /sbin/init
+user        2817  0.2  0.0  10248  5612 pts/1    Ss   10:02   0:00 -bash
+user        3140 98.5  1.2 412000 98000 pts/1    R+   10:20   2:10 cc1 -quiet ...
+user        3302  0.0  0.0   6740  2100 pts/2    S+   10:25   0:00 picocom -b 115200 /dev/ttyUSB0
+```
+
+`RSS` is the memory really in use, in KiB. `STAT` is the state: `R` running, `S` sleeping (waiting for something, the normal state), `D` uninterruptible sleep (waiting for a disk or a device; can't be killed until it returns), `T` stopped, `Z` zombie (finished, waiting for its parent to collect its exit status). `+` means in the foreground of a terminal, `s` a session leader.
+
+In `top` and `htop`: `P` sorts by CPU, `M` by memory, `k` sends a signal, `q` quits; in `htop`, `F4` filters and `F5` shows the tree.
+
+**Load and memory.** `uptime` shows the **load average** over 1, 5 and 15 minutes: the average number of processes running or waiting for a CPU (or in `D` state). Compare it to `nproc`: a load of 8 on an 8-core machine is full, on a 2-core machine it's overloaded.
+
+```
+$ free -h
+```
+
+**Expected:**
+
+```
+               total        used        free      shared  buff/cache   available
+Mem:            31Gi       9.2Gi       1.1Gi       410Mi        21Gi        21Gi
+Swap:          2.0Gi          0B       2.0Gi
+```
+
+Read **available**, not **free**: the kernel uses spare memory as a disk cache (`buff/cache`) and gives it back when programs need it. When even that runs out, the kernel's **OOM killer** kills the process using the most memory; `journalctl -k | grep -i 'out of memory'` shows it. A parallel build (`make -j$(nproc)`) of a big C++ project can need 1 to 2 GB per job; lower `-j` if the OOM killer strikes.
+
+**Signals** are short messages the kernel delivers to a process (`man 7 signal`):
+
+| Signal | Number | Sent by | Default effect |
+|---|---|---|---|
+| `SIGTERM` | 15 | `kill PID` (the default), `systemctl stop` | Ask to terminate; the program can clean up first |
+| `SIGINT` | 2 | `Ctrl+C` | Interrupt |
+| `SIGKILL` | 9 | `kill -9 PID` | Kill at once; can't be caught, no cleanup |
+| `SIGHUP` | 1 | Closing the terminal | Terminate; many daemons reload their configuration on it instead |
+| `SIGTSTP` | 20 | `Ctrl+Z` | Stop (suspend) |
+| `SIGSTOP` / `SIGCONT` | 19 / 18 | `kill -STOP` / `kill -CONT` | Stop / continue; `SIGSTOP` can't be caught |
+
+```
+$ kill 3302                  # polite: SIGTERM
+$ kill -9 3302               # only if SIGTERM didn't work after a few seconds
+$ pkill -f 'http.server'     # by pattern on the full command line (check first with pgrep -af)
+$ killall picocom            # by exact program name
+```
+
+`kill -9` first is a bad habit: the program can't flush files, remove lock files or restore the terminal. A process in `D` state or a zombie ignores even `SIGKILL`; a zombie disappears when its parent collects it or exits.
+
+**Jobs: foreground and background.** A command normally runs in the **foreground**: the shell waits for it.
+
+| Action | Command |
+|---|---|
+| Start in the background | `long-command &` |
+| Suspend the foreground job | `Ctrl+Z` |
+| List the jobs of this shell | `jobs` |
+| Resume a job in the background / foreground | `bg %1` / `fg %1` |
+| Keep a job running after the shell exits | `disown %1`, or start it with `nohup cmd > out.log 2>&1 &` |
+
+For anything long (a build, a download, a serial log) over SSH, `tmux` (section 20) is better than `nohup`: you can reattach and see the output. For a one-off command that should run as a proper service, `systemd-run --user --unit=mylog cmd` starts it under systemd, with its output in the journal.
+
+**Priority.** `nice -n 10 make -j8` starts a command with a lower CPU priority (19 is the lowest); `renice -n 10 -p PID` changes a running one. `ionice -c3 cmd` gives it disk access only when no one else needs it. Both are useful to keep a desktop responsive during a long build.
+
+**Open files and busy resources:**
+
+```
+$ ls -l /proc/3302/fd          # the files a process has open (/proc/PID/ holds everything about it)
+$ sudo lsof /dev/ttyUSB0       # who has the serial port open
+$ sudo lsof -i :8000           # who uses TCP or UDP port 8000
+$ sudo fuser -vm /media/user/BOOT   # who is using a mounted filesystem (section 17)
+```
+
 ## 13. Services with systemd
 
+**systemd** is PID 1 on Debian, Ubuntu, Fedora and Arch. It starts the system, keeps services running, and handles logins, logs, timers, mounts and devices. Everything it manages is a **unit**, described by a small text file:
+
+| Unit type | Describes | Example |
+|---|---|---|
+| `.service` | A program to run and keep running | `ssh.service`, `NetworkManager.service` |
+| `.timer` | When to start a service: like cron | `apt-daily.timer` |
+| `.socket` | A socket that starts its service on the first connection | `cups.socket` |
+| `.target` | A group of units, a state to reach | `multi-user.target`, `graphical.target` |
+| `.mount` | A mounted filesystem, often generated from `/etc/fstab` | `home.mount` |
+| `.device` | A device the kernel announced | `dev-ttyUSB0.device` |
+
+**Everyday commands:**
+
+| Task | Command |
+|---|---|
+| State, recent log lines, PID, memory | `systemctl status ssh` |
+| Start / stop / restart now | `sudo systemctl start ssh` / `stop` / `restart` |
+| Reload the configuration without restarting (if the service supports it) | `sudo systemctl reload ssh` |
+| Start at every boot / stop doing so | `sudo systemctl enable ssh` / `disable` |
+| Both at once: enable and start | `sudo systemctl enable --now ssh` |
+| Make a unit impossible to start, even by a dependency | `sudo systemctl mask ModemManager` (`unmask` to undo) |
+| What has failed | `systemctl --failed` |
+| All services and their state | `systemctl list-units --type=service` |
+| All unit files and whether they're enabled | `systemctl list-unit-files` |
+| Show a unit's file and its overrides | `systemctl cat ssh` |
+| Reread unit files after editing them | `sudo systemctl daemon-reload` |
+
+**Expected** (`systemctl status ssh`):
+
+```
+● ssh.service - OpenBSD Secure Shell server
+     Loaded: loaded (/usr/lib/systemd/system/ssh.service; enabled; preset: enabled)
+     Active: active (running) since Sun 2026-11-16 09:41:12 CET; 1h 2min ago
+ Invocation: 5f0c...
+       Docs: man:sshd(8)
+             man:sshd_config(5)
+   Main PID: 812 (sshd)
+      Tasks: 1 (limit: 38123)
+     Memory: 4.1M
+        CPU: 52ms
+     CGroup: /system.slice/ssh.service
+             └─812 "sshd: /usr/sbin/sshd -D [listener] 0 of 10-100 startups"
+
+Nov 16 09:41:12 pc systemd[1]: Starting ssh.service - OpenBSD Secure Shell server...
+Nov 16 09:41:12 pc sshd[812]: Server listening on 0.0.0.0 port 22.
+Nov 16 09:41:12 pc systemd[1]: Started ssh.service - OpenBSD Secure Shell server.
+```
+
+**Loaded** says where the unit file is and whether it's **enabled** (started at boot); **Active** whether it runs **now**. They are independent: a service can be enabled but stopped, or running but disabled.
+
+**Where unit files live:**
+
+| Directory | Contains | Edit? |
+|---|---|---|
+| `/usr/lib/systemd/system/` | Units installed by packages | No: an upgrade overwrites them |
+| `/etc/systemd/system/` | Your units, and overrides | Yes |
+| `/etc/systemd/system/<unit>.d/*.conf` | Drop-ins: a few lines that change a packaged unit | Yes, with `systemctl edit` |
+| `~/.config/systemd/user/` | Your user units (`systemctl --user`) | Yes |
+
+To change a packaged service, `sudo systemctl edit ssh` opens an empty drop-in; what you write there overrides the matching settings of the original file, and the drop-in survives upgrades. `sudo systemctl edit --full ssh` copies the whole file to `/etc` instead.
+
+**Writing a service.** A unit that serves the build output directory over HTTP, so a board can fetch images with `wget` (**Illustrative**):
+
+```ini
+# /etc/systemd/system/image-server.service
+[Unit]
+Description=HTTP server for board images
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+User=user
+ExecStart=/usr/bin/python3 -m http.server 8000 --directory /srv/images
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
+```
+
+```
+$ sudo systemctl daemon-reload
+$ sudo systemctl enable --now image-server
+$ systemctl status image-server
+$ journalctl -u image-server -f        # its output goes to the journal (section 14)
+```
+
+- `ExecStart=` needs an absolute path, and isn't run by a shell: no `|`, `>`, `&&` or `~`. For those, point it at a script, or use `/bin/sh -c '...'`.
+- The service runs with an almost empty environment and in `/`, not your home. A command that works in your terminal and fails as a service is usually missing a variable (`Environment=NAME=value`) or a working directory (`WorkingDirectory=`).
+- `Restart=on-failure` restarts it if it crashes; `Type=` defaults to `simple`, right for a program that stays in the foreground.
+- `WantedBy=multi-user.target` is what `enable` hooks it into: the normal boot.
+
+**Timers** replace cron jobs. A timer that runs a backup service every night, and catches up after the PC was off (**Illustrative**; the backup script is in section 21):
+
+```ini
+# /etc/systemd/system/backup.service
+[Unit]
+Description=Back up /home to the external disk
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/backup-home.sh
+```
+
+```ini
+# /etc/systemd/system/backup.timer
+[Unit]
+Description=Nightly backup
+
+[Timer]
+OnCalendar=*-*-* 02:30
+Persistent=true
+
+[Install]
+WantedBy=timers.target
+```
+
+```
+$ sudo systemctl enable --now backup.timer     # enable the timer, not the service
+$ systemctl list-timers                        # next and last run of every timer
+$ systemd-analyze calendar '*-*-* 02:30'       # check what an OnCalendar expression means
+$ sudo systemctl start backup.service          # run it once now, to test
+```
+
+`crontab -e` still works if the `cron` package is installed; timers have the advantage of logging to the journal and of `Persistent=true`.
+
+**User services** run as you, without `sudo`, while you're logged in: put the unit in `~/.config/systemd/user/` and use `systemctl --user enable --now unit`. `sudo loginctl enable-linger user` keeps them running when you're logged out.
+
+**Boot, targets and power:**
+
+```
+$ systemctl get-default                        # graphical.target on a desktop
+$ sudo systemctl set-default multi-user.target # boot to a text console next time
+$ systemd-analyze blame | head                 # which units took longest at boot
+$ systemctl reboot                             # or poweroff, suspend
+```
+
 ## 14. Logs: the journal, /var/log and dmesg
+
+Two sources hold most of what you need when something fails: the **journal** of `systemd-journald`, which collects the output of every service, the kernel's messages and what programs send to syslog; and a few classic text files under `/var/log`.
+
+**journalctl:**
+
+| Command | Shows |
+|---|---|
+| `journalctl -b` | Everything since this boot |
+| `journalctl -b -1` | The previous boot (after a crash or a bad shutdown); `--list-boots` lists them |
+| `journalctl -u ssh` | One unit; repeat `-u` for several |
+| `journalctl -f` | Follow new messages, like `tail -f` |
+| `journalctl -e` | Jump to the end |
+| `journalctl -p err -b` | Only errors and worse this boot (`emerg`, `alert`, `crit`, `err`, `warning`, `notice`, `info`, `debug`) |
+| `journalctl -k` | Kernel messages only (like `dmesg`) |
+| `journalctl --since "1 hour ago"`, `--since 09:00 --until 09:30` | A time window |
+| `journalctl _COMM=sshd` | By program name |
+| `journalctl -o short-iso` / `-o cat` | Full timestamps / message text only |
+| `journalctl --disk-usage` | Space used by the journal |
+| `sudo journalctl --vacuum-size=500M` | Delete old entries down to 500 MB |
+
+Members of `adm` or `systemd-journal` (section 7) see every message; others see only their own user's. Since Debian 12, the journal is kept on disk in `/var/log/journal/` across reboots and `rsyslog` isn't installed by default, so `/var/log/syslog` may not exist: use `journalctl`. To limit its size permanently, set `SystemMaxUse=500M` in a drop-in such as `/etc/systemd/journald.conf.d/size.conf`, then `sudo systemctl restart systemd-journald`.
+
+**Text logs still under `/var/log`:**
+
+| File | Holds |
+|---|---|
+| `/var/log/apt/history.log`, `/var/log/dpkg.log` | What was installed, upgraded and removed, and when (section 15) |
+| `/var/log/apt/term.log` | The full output of every APT run |
+| `/var/log/unattended-upgrades/` | Automatic upgrades |
+| `/var/log/Xorg.0.log`, `~/.local/share/xorg/` | X11 graphics, on desktops that still use it |
+| Application logs | Web servers, databases: `/var/log/<name>/` |
+
+`logrotate` compresses and deletes old text logs (`.1`, `.2.gz` ...) on a timer; its rules are in `/etc/logrotate.d/`.
+
+**Kernel messages: `dmesg`.** The kernel's ring buffer holds driver messages: devices plugged in, disk errors, USB problems, the OOM killer. On Debian, reading it needs root:
+
+```
+$ sudo dmesg -T | tail -n 30     # -T: human-readable times
+$ sudo dmesg -w                  # follow: run it, then plug the device in
+$ journalctl -k -f               # the same through the journal, without sudo if you're in adm
+```
+
+**Expected** (plugging in an FTDI USB serial adapter):
+
+```
+[Sun Nov 16 10:31:02 2026] usb 1-2: new full-speed USB device number 7 using xhci_hcd
+[Sun Nov 16 10:31:02 2026] usb 1-2: New USB device found, idVendor=0403, idProduct=6001, bcdDevice= 6.00
+[Sun Nov 16 10:31:02 2026] usb 1-2: Product: FT232R USB UART
+[Sun Nov 16 10:31:02 2026] usb 1-2: SerialNumber: A10KXXXX
+[Sun Nov 16 10:31:02 2026] ftdi_sio 1-2:1.0: FTDI USB Serial Device converter detected
+[Sun Nov 16 10:31:02 2026] usb 1-2: FTDI USB Serial Device converter now attached to ttyUSB0
+```
+
+This is the first thing to check when a device "doesn't appear": whether the kernel saw it, with which IDs, which driver took it, and which `/dev` name it got (section 18).
+
+**Writing to the log** from your own scripts: `logger -t backup "finished, 12 GB"` sends a message to the journal, and `journalctl -t backup` finds it. A systemd service needs nothing: its stdout and stderr already go to the journal.
 
 ## 15. Packages with APT and dpkg
 

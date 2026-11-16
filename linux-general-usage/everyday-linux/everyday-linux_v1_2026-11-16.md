@@ -1266,7 +1266,201 @@ $ meson setup build --prefix=/usr/local && ninja -C build && sudo ninja -C build
 
 ## 17. Disks, partitions, filesystems and SD cards
 
+**Names.** Disks appear as block devices in `/dev`, and their partitions as numbered devices:
+
+| Device | What | Partitions |
+|---|---|---|
+| `/dev/sda`, `/dev/sdb` ... | SATA and USB disks, USB sticks, most USB card readers | `/dev/sda1`, `/dev/sda2` |
+| `/dev/nvme0n1` | NVMe SSD | `/dev/nvme0n1p1` |
+| `/dev/mmcblk0` | SD card in a built-in reader (and the eMMC or SD card on a board) | `/dev/mmcblk0p1` |
+| `/dev/loop0` | A file used as a disk (images, below) | `/dev/loop0p1` |
+
+**The letters are not stable**: the USB stick that is `sdb` today can be `sdc` tomorrow, and the order changes with what's plugged in. Identify a disk by its size, model and contents every time, and in configuration use UUIDs or labels, never `sdX`.
+
+**Seeing what's there:**
+
+```
+$ lsblk -o NAME,SIZE,TYPE,FSTYPE,LABEL,MOUNTPOINTS,MODEL,TRAN,RM
+```
+
+**Expected** (with a 32 GB SD card in a USB reader):
+
+```
+NAME          SIZE TYPE FSTYPE LABEL  MOUNTPOINTS          MODEL         TRAN  RM
+sda          29.7G disk                                    SD Card Reader usb    1
+├─sda1         64M part vfat   BOOT   /media/user/BOOT
+└─sda2       29.6G part ext4   rootfs /media/user/rootfs
+nvme0n1     476.9G disk                                    Samsung SSD    nvme   0
+├─nvme0n1p1   512M part vfat          /boot/efi
+├─nvme0n1p2 475.4G part ext4          /
+└─nvme0n1p3   977M part swap          [SWAP]
+```
+
+| Command | Shows |
+|---|---|
+| `lsblk -f` | Filesystems, labels, UUIDs and use, as a tree |
+| `sudo blkid` | UUID, label and type of every filesystem |
+| `df -h` | Size and free space of every mounted filesystem |
+| `df -i` | Free inodes (a filesystem can be "full" with free space, if it holds millions of small files) |
+| `du -sh dir` | Space used by a directory |
+| `du -h --max-depth=1 / 2>/dev/null \| sort -h` | Which top-level directory is big; `ncdu` (package `ncdu`) is the interactive version |
+| `findmnt` | Every mount, as a tree, with options |
+| `sudo fdisk -l /dev/sda` | The partition table |
+
+**Mounting** attaches a filesystem to a directory, the **mount point**; its files then appear there. On a desktop, removable media are mounted for you under `/media/user/`. By hand:
+
+```
+$ sudo mount /dev/sda1 /mnt                 # the type is detected
+$ ls /mnt
+$ sudo umount /mnt                          # umount, not unmount; the device or the directory
+$ udisksctl mount -b /dev/sda1              # as your user, like the desktop does (mounts under /media/user)
+$ udisksctl power-off -b /dev/sda           # unmount everything and power the device off before unplugging
+```
+
+`umount: /mnt: target is busy` means a process has a file open there, or a shell has its current directory there (yours included): `sudo fuser -vm /mnt` or `sudo lsof +f -- /mnt` shows which one.
+
+**Permanent mounts** go in `/etc/fstab`, one line per filesystem, by UUID (**Illustrative**, for a data disk):
+
+```
+# <device>                                  <mount point>  <type>  <options>                  <dump> <pass>
+UUID=3f0e6a2c-xxxx-xxxx-xxxx-xxxxxxxxxxxx   /data          ext4    defaults,nofail            0      2
+```
+
+- `nofail` lets the PC boot even if the disk is missing. Without it, a missing disk in `fstab` stops the boot in an emergency shell.
+- Test before rebooting: `sudo findmnt --verify`, then `sudo systemctl daemon-reload && sudo mount -a`. No error and the disk mounted means the line is right.
+- For a FAT or exFAT disk, add `uid=1000,gid=1000,umask=022` (or `fmask`/`dmask`): FAT has no owners, so the options decide them (section 8).
+
+**Partitioning and formatting** destroys what's on the disk; check the device name with `lsblk` twice:
+
+```
+$ sudo fdisk /dev/sdX            # interactive: p print, g new GPT table, o new MBR table, n new, t type, w write, q quit
+$ sudo parted /dev/sdX print     # parted and gparted (graphical) do the same
+$ sudo mkfs.ext4 -L data /dev/sdX1
+$ sudo mkfs.vfat -F 32 -n BOOT /dev/sdX1      # FAT32, needed for many boot partitions (package dosfstools)
+$ sudo mkfs.exfat -n STICK /dev/sdX1          # for sticks shared with Windows and macOS (package exfatprogs)
+```
+
+| Filesystem | Use |
+|---|---|
+| ext4 | Linux system and data disks; the default |
+| btrfs, xfs | Linux, with snapshots (btrfs) or for large files (xfs) |
+| vfat (FAT32) | Boot partitions (UEFI, the BeagleBone's and Raspberry Pi's first partition), small sticks; 4 GiB file limit, no permissions |
+| exFAT | Sticks and cards shared with other systems; no file limit, no permissions |
+| NTFS | Windows disks: read and write with the `ntfs3` kernel driver |
+
+**Writing an image to an SD card.** Board images (`.img`, often compressed as `.img.xz`) are a byte-for-byte copy of a whole card, partition table included. They're written to the **whole disk** (`/dev/sdX`), not to a partition (`/dev/sdX1`):
+
+1. Run `lsblk` without the card, insert it, run `lsblk` again: the new disk is the card. Check its size.
+2. Unmount its partitions if the desktop mounted them: `udisksctl unmount -b /dev/sdX1` (and each other partition).
+3. Write:
+
+```
+$ xzcat bbb-image.img.xz | sudo dd of=/dev/sdX bs=4M conv=fsync status=progress
+$ sudo dd if=sdcard.img of=/dev/sdX bs=4M conv=fsync status=progress     # uncompressed
+$ sudo bmaptool copy bbb-image.img.xz /dev/sdX     # faster when a .bmap file exists: skips empty blocks (package bmap-tools)
+$ sync
+```
+
+4. `udisksctl power-off -b /dev/sdX`, then remove the card.
+
+`dd` writes wherever `of=` points, without asking, including your system disk: that's why it's nicknamed "disk destroyer". The script in section 11 adds checks. Graphical tools (GNOME Disks' "Restore Disk Image", balenaEtcher, Raspberry Pi Imager) only offer removable disks.
+
+**Images as disks: loop devices.** To look inside an image without writing it to a card:
+
+```
+$ sudo losetup -fP --show sdcard.img        # attach; -P creates a device per partition; prints /dev/loop0
+$ lsblk /dev/loop0
+$ sudo mount /dev/loop0p2 /mnt
+$ ls /mnt/etc
+$ sudo umount /mnt && sudo losetup -d /dev/loop0
+```
+
+`udisksctl loop-setup -f sdcard.img` does the same as your user, and the desktop then mounts the partitions.
+
+**Checking and swap:**
+- `sudo fsck /dev/sdX2` checks and repairs a filesystem. **Only on an unmounted filesystem**: running it on a mounted one corrupts it. Cards pulled out without unmounting are the usual reason to need it.
+- `swapon --show` lists swap; Debian creates a swap partition by default. A swap file: `sudo fallocate -l 4G /swapfile && sudo chmod 600 /swapfile && sudo mkswap /swapfile && sudo swapon /swapfile`, plus `/swapfile none swap sw 0 0` in `fstab`.
+- `sudo smartctl -a /dev/nvme0n1` (package `smartmontools`) shows a disk's health and wear.
+
 ## 18. Hardware, devices and the serial console
+
+**What hardware is there:**
+
+| Command | Shows |
+|---|---|
+| `lscpu`, `nproc` | CPU model, cores, threads, flags; the number of usable CPUs |
+| `free -h` | Memory (section 12) |
+| `lsusb` | USB devices with vendor:product IDs; `lsusb -t` as a tree with drivers and speeds |
+| `lspci -k` | PCI devices (network, graphics, Wi-Fi) and the driver each one uses |
+| `lsblk` | Disks (section 17) |
+| `ip -br link` | Network interfaces (section 19) |
+| `sensors` | Temperatures and fans (package `lm-sensors`) |
+| `sudo dmidecode -t system` | Maker, model and serial number of the PC |
+| `inxi -Fz` | A summary of everything (package `inxi`; `-z` hides serials and addresses for posting in a forum) |
+| `lsmod`, `modinfo ftdi_sio` | Loaded kernel modules; information on one |
+| `sudo modprobe usbserial`, `sudo modprobe -r ...` | Load / unload a module and its dependencies |
+
+**From device to `/dev` name: udev.** When the kernel finds a device, it announces it; **udev** (`systemd-udevd`) receives the announcement, loads the driver if needed, creates the `/dev` file with the right owner, group and mode, and adds stable names. Rules in `/usr/lib/udev/rules.d/` (from packages) and `/etc/udev/rules.d/` (yours) decide.
+
+```
+$ udevadm monitor --udev --property     # watch events while plugging a device in; Ctrl+C to stop
+$ udevadm info /dev/ttyUSB0             # the properties of one device
+$ udevadm info -a -n /dev/ttyUSB0       # the attributes of it and its parents, to write rules with
+```
+
+**Stable names.** `/dev/ttyUSB0` and `/dev/ttyUSB1` are numbered in the order adapters appear. udev also creates names that don't change:
+
+```
+$ ls -l /dev/serial/by-id/
+```
+
+**Expected:**
+
+```
+lrwxrwxrwx 1 root root 13 Nov 16 10:31 usb-FTDI_FT232R_USB_UART_A10KXXXX-if00-port0 -> ../../ttyUSB0
+```
+
+Use that path in scripts and aliases (section 10). `/dev/disk/by-id/` and `/dev/disk/by-uuid/` do the same for disks.
+
+**Your own udev rule.** A rule that gives a board's adapter a short name and the right group (**Illustrative**; take the IDs and serial number from `udevadm info -a`):
+
+```
+# /etc/udev/rules.d/99-bbb-console.rules
+SUBSYSTEM=="tty", ATTRS{idVendor}=="0403", ATTRS{idProduct}=="6001", ATTRS{serial}=="A10KXXXX", \
+    SYMLINK+="bbb-console", GROUP="dialout", MODE="0660", ENV{ID_MM_DEVICE_IGNORE}="1"
+```
+
+```
+$ sudo udevadm control --reload
+$ sudo udevadm trigger --subsystem-match=tty     # or unplug and replug
+$ ls -l /dev/bbb-console
+```
+
+`==` compares, `=` and `+=` assign. `ATTRS` (plural) matches the device or any of its parents, which is where USB IDs live; all the `ATTRS` of one rule must come from the same parent. `ID_MM_DEVICE_IGNORE` tells ModemManager to leave the port alone (below). The same kind of rule, with `MODE="0660", GROUP="plugdev"`, gives you access to debug probes, SDRs and programmers whose packages don't ship a rule.
+
+**The serial console.** A board's console is a UART; a USB serial adapter makes it a `/dev/ttyUSB*` (FTDI, CP210x, CH340, PL2303) or `/dev/ttyACM*` (CDC ACM devices: many development boards with built-in debuggers). To talk to it you need to be in `dialout` (section 7), and a terminal program:
+
+```
+$ picocom -b 115200 /dev/ttyUSB0                       # exit: Ctrl+A then Ctrl+X
+$ picocom -b 115200 --logfile bbb-boot.log /dev/bbb-console
+$ tio /dev/ttyUSB0                                     # 115200 by default; exit Ctrl+T then Q; reconnects automatically
+$ screen /dev/ttyUSB0 115200                           # exit: Ctrl+A then K, then y
+$ minicom -D /dev/ttyUSB0 -b 115200                    # exit: Ctrl+A then X; turn off hardware flow control in its setup (Ctrl+A O)
+```
+
+Settings for almost every board console, including the BeagleBone Black's: **115200 baud, 8 data bits, no parity, 1 stop bit (8N1), no flow control**. Wiring: the adapter's TX goes to the board's RX and RX to TX, plus ground; the voltage must match (3.3 V for the BeagleBone Black and Raspberry Pi; a 5 V adapter can damage them).
+
+**When the serial port misbehaves:**
+
+| Symptom | Likely cause | Fix |
+|---|---|---|
+| `/dev/ttyUSB0` doesn't exist | Driver not loaded, cable charge-only, adapter dead | `sudo dmesg -w` while plugging in (section 14); try another cable |
+| `Permission denied` | Not in `dialout`, or not logged in again since | `id`; section 7 |
+| `Device or resource busy` | Another program has it open: a second terminal, ModemManager probing it | `sudo lsof /dev/ttyUSB0`; the udev rule above, or `sudo systemctl mask ModemManager` if you have no modem |
+| The device appears, then disappears a second later (Ubuntu, CH340 adapters) | `brltty`, the Braille display service, claims the adapter's IDs | `sudo apt remove brltty` if you don't use a Braille display |
+| Garbage characters | Wrong baud rate | 115200 for most boards; some boot ROMs print at other rates |
+| Nothing at all | TX and RX not crossed, no ground, board not powered, wrong voltage | Check wiring; type `Enter` once the board has booted |
+| Output but typing does nothing | Board's RX not connected, or hardware flow control on | Check the wire on the board's RX; disable flow control |
 
 ## 19. The network from the user's side
 

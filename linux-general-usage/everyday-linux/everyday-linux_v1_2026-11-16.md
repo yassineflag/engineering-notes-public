@@ -203,11 +203,215 @@ Inside `man`, the keys are those of `less` (section 5): `/word` searches, `n` go
 
 ## 3. The directory tree and paths
 
+There are no drive letters: one tree starts at `/` (the **root directory**), and every disk, USB stick and SD card is attached somewhere inside it (section 17). The layout follows the Filesystem Hierarchy Standard (FHS; `man 7 hier`):
+
+| Directory | Holds | Notes |
+|---|---|---|
+| `/` | The top of the tree | Not the same as `/root` |
+| `/usr/bin`, `/usr/sbin` | Programs installed by packages | `/bin`, `/sbin` and `/lib` are links to their `/usr` versions since Debian 12 ("merged /usr") |
+| `/usr/lib` | Libraries, and default configuration installed by packages (systemd units, udev rules) | Don't edit files here; override them in `/etc` |
+| `/usr/local` | Software you installed yourself, outside the package manager | Section 16 |
+| `/usr/share` | Architecture-independent data: man pages, docs, icons | |
+| `/etc` | System-wide configuration, plain text | Back it up; most admin work is editing files here |
+| `/home/user` | Your files and your personal configuration (dotfiles) | `~` is a short name for it |
+| `/root` | The root user's home | |
+| `/boot` | The kernel, initramfs and bootloader files | |
+| `/dev` | Device files: disks, serial ports, terminals | Created by the kernel and udev (section 18) |
+| `/proc`, `/sys` | Kernel information and settings, generated on the fly | Section 1 |
+| `/run` | Runtime state (PID files, sockets), cleared at each boot | In RAM |
+| `/tmp` | Temporary files, anyone can write there | In RAM (tmpfs) and cleared at boot since Debian 13 |
+| `/var` | Data that changes: logs (`/var/log`), caches, spools, databases | Grows over time (section 22) |
+| `/opt` | Self-contained third-party software (vendor toolchains, IDEs) | |
+| `/media/user`, `/mnt` | Mount points: removable media are mounted under `/media/user` by the desktop, `/mnt` is for your own temporary mounts | |
+| `/srv` | Data served by this machine (a web or TFTP root) | |
+
+**Paths.** An **absolute path** starts at `/`: `/etc/ssh/sshd_config`. A **relative path** starts from the current directory: if you are in `/etc`, `ssh/sshd_config` is the same file. Special names:
+
+| Name | Means |
+|---|---|
+| `.` | The current directory: `./build.sh` runs the script here |
+| `..` | The parent directory: `cd ..` goes up one level |
+| `~` | Your home directory; `~alice` is alice's |
+| `-` | With `cd`: the previous directory (`cd -` toggles between two) |
+
+```
+$ pwd                 # print the current directory
+/home/user
+$ cd /var/log         # absolute
+$ cd ../lib           # relative: now in /var/lib
+$ cd                  # alone: back home
+```
+
+**File names** are case-sensitive (`Notes.txt` and `notes.txt` are two files) and may contain anything except `/` and the NUL byte, including spaces, newlines and leading dashes. Extensions mean nothing to the system; `file` tells you what a file really is. Names that start with `.` are **hidden**: `ls` doesn't show them unless asked with `-a`. Your personal configuration lives in such dotfiles: `~/.bashrc`, `~/.ssh/`, `~/.config/`.
+
+**Reading `ls -l`:**
+
+```
+$ ls -la ~/work
+```
+
+**Expected:**
+
+```
+total 24
+drwxr-xr-x  4 user user 4096 Nov 16 10:12 .
+drwx------ 31 user user 4096 Nov 16 09:58 ..
+-rw-r--r--  1 user user  220 Nov 16 10:01 .gitignore
+drwxr-xr-x  2 user user 4096 Nov 16 10:12 images
+-rwxr-xr-x  1 user user  812 Nov 16 10:05 sd-write.sh
+lrwxrwxrwx  1 user user   27 Nov 16 10:07 latest.img -> images/bbb-2026-11-16.img
+│└───┬───┘  │ └┬─┘ └┬─┘ └┬─┘ └────┬─────┘
+│  mode   links owner group size  modified
+type: - file, d directory, l symbolic link, c/b character/block device
+```
+
+The mode (`rwxr-xr-x`) is section 8. `ls -lh` prints sizes as `4.0K`, `1.2G`; `ls -lt` sorts by time, newest first; `ls -ltr` reverses it, so the newest is at the bottom, next to your prompt. For one file in detail:
+
+```
+$ stat sd-write.sh       # size, mode, owner, inode, the three timestamps
+$ file latest.img        # what the contents are
+```
+
 ## 4. Working with files: create, copy, move, delete, link
+
+| Task | Command | Notes |
+|---|---|---|
+| Create a directory | `mkdir images` | `mkdir -p a/b/c` creates the parents too, and doesn't fail if it exists |
+| Create an empty file, or update its time | `touch notes.txt` | |
+| Copy a file | `cp a.txt b.txt` | Overwrites `b.txt` without asking; `-i` asks |
+| Copy into a directory | `cp a.txt b.txt backup/` | The last argument is the destination |
+| Copy a directory | `cp -r src/ dst/` | `-a` (archive) also keeps modes, owners, times and links: use it for anything that matters |
+| Move or rename | `mv old.txt new.txt` | Same as rename when on the same filesystem; instant |
+| Delete a file | `rm file` | **No trash, no undo** |
+| Delete a directory and its contents | `rm -r dir/` | `-f` also silences errors and never asks |
+| Delete an empty directory | `rmdir dir/` | Fails if it isn't empty: a safe check |
+| Symbolic link | `ln -s target linkname` | A small file holding a path; breaks if the target moves |
+| Hard link | `ln target linkname` | A second name for the same data; same filesystem only, not for directories |
+
+**Links.** `latest.img -> images/bbb-2026-11-16.img` above is a symbolic link: programs that open `latest.img` get the image. The target path is stored as written; a relative target is relative to the link's own directory, not to where you were when you made it. `readlink -f latest.img` prints the final absolute path. Deleting a symbolic link (`rm latest.img`, without a trailing `/`) deletes the link, not the target.
+
+**Wildcards (globbing).** The shell, not the command, expands patterns into the matching names before running the command:
+
+| Pattern | Matches | Example |
+|---|---|---|
+| `*` | Any characters, none included (not a leading `.`) | `rm *.o` |
+| `?` | One character | `ls img?.png` |
+| `[abc]`, `[0-9]` | One character from the set | `ls log.[0-9]` |
+| `{a,b}` | Each word in turn (brace expansion: makes names even if they don't exist) | `mkdir -p {src,doc,test}`, `cp file{,.bak}` |
+| `**` | Any depth of directories, after `shopt -s globstar` | `ls **/*.dts` |
+
+If nothing matches, Bash passes the pattern unchanged, so `rm *.tmp` in a directory without such files fails with `No such file or directory` for a file literally named `*.tmp`.
+
+**Quoting** decides what the shell expands:
+
+| Form | Effect | Example |
+|---|---|---|
+| `'...'` | Nothing expanded: the text is taken as written | `echo '$HOME *'` prints `$HOME *` |
+| `"..."` | Variables and `$(...)` expanded; no word splitting, no wildcards | `cp "$file" "$HOME/My Documents/"` |
+| `\` | The next character is taken literally | `ls My\ Documents` |
+
+Always put variables in double quotes: `rm $file` with `file="my notes.txt"` deletes `my` and `notes.txt`.
+
+**Habits that prevent disasters:**
+- Run the glob with `ls` before you run it with `rm`: `ls build/*.img`, then `rm build/*.img`. Or put `echo` in front of a command to see what it would do.
+- Never `rm -rf "$DIR/"` with a variable that might be empty: it becomes `rm -rf /`. Write `rm -rf "${DIR:?}/"`; Bash stops with an error if `DIR` is empty or unset.
+- Prefer `mv` to a `~/trash` directory, or `gio trash file` on a desktop, for anything you might want back.
+- `cp -a` and `rsync -a` (section 20) keep permissions and ownership; plain `cp -r` doesn't, which matters for root filesystem trees.
 
 ## 5. Reading and editing text
 
+Most configuration on Linux is plain text, so reading and editing text files is the main skill.
+
+| Command | Use |
+|---|---|
+| `cat file` | Print the whole file; good for short ones |
+| `less file` | Page through a long file (keys below) |
+| `head -n 20 file` | The first 20 lines |
+| `tail -n 20 file` | The last 20 lines |
+| `tail -f file` | Follow a growing file (a log) until `Ctrl+C`; `-F` keeps following when the file is rotated or recreated |
+| `wc -l file` | Count lines (`-w` words, `-c` bytes) |
+| `diff -u old new` | Differences in unified format, the same as `git diff` |
+| `cmp a.bin b.bin` | Whether two binary files differ, and where |
+| `xxd file \| head`, `hexdump -C file \| head` | Bytes in hex, for binary files and images |
+
+**`less` keys:**
+
+| Key | Effect |
+|---|---|
+| `Space` / `b` | Page down / up |
+| `g` / `G` | Start / end of the file |
+| `/text` / `?text` | Search forwards / backwards; `n` and `N` for next and previous |
+| `&text` | Show only lines containing `text` |
+| `F` | Follow the file like `tail -f`; `Ctrl+C` stops following |
+| `-S` then `Enter` | Toggle wrapping of long lines |
+| `q` | Quit |
+
+**Editors.** Learn one terminal editor well enough to change a configuration file over SSH or on a board's serial console:
+- **nano** is installed on Debian and Ubuntu and shows its keys at the bottom: `Ctrl+O` saves, `Ctrl+X` quits, `Ctrl+W` searches, `Alt+U` undoes. `^` in the help means `Ctrl`, `M-` means `Alt`.
+- **vim** (or **vi**, which is often the only editor on a board: BusyBox has one) is modal: keys are commands until you press `i`. The minimum:
+
+| Keys | Effect |
+|---|---|
+| `i` | Insert mode: type text |
+| `Esc` | Back to command mode |
+| `:w` `Enter` / `:q` / `:wq` / `:q!` | Save / quit / save and quit / quit without saving |
+| `/text` `Enter`, then `n` | Search, then next match |
+| `dd` / `u` / `Ctrl+R` | Delete the line / undo / redo |
+| `gg` / `G` / `:42` | Start / end / line 42 |
+
+Your editor for `git commit`, `crontab -e`, `visudo` and the like comes from the `EDITOR` and `VISUAL` variables (section 10), then from Debian's `editor` alternative: `sudo update-alternatives --config editor` sets it for the system, `select-editor` for your user.
+
+**Editing system files.** Files in `/etc` belong to root. `sudoedit /etc/hosts` (or `sudo -e`) copies the file, opens your editor as **you**, and writes it back as root when you quit; your editor settings apply and the editor itself doesn't run as root. Before changing an important file, keep a copy: `sudo cp -a /etc/fstab /etc/fstab.orig`.
+
+**Text that comes from Windows** has `\r\n` line endings, which break shell scripts with errors such as `/bin/bash^M: bad interpreter`. `file script.sh` shows `with CRLF line terminators`; `dos2unix script.sh` (package `dos2unix`) or `sed -i 's/\r$//' script.sh` fixes it.
+
 ## 6. Finding files and text
+
+**`find` walks the tree** and tests each name; its arguments read as "where, then which tests, then what to do":
+
+```
+$ find ~/work -name '*.dtb'                       # by name (quote the pattern so the shell doesn't expand it)
+$ find . -iname 'readme*'                         # case-insensitive
+$ find /var/log -type f -mtime -1                 # files modified in the last 24 hours
+$ find ~ -type f -size +500M                      # files over 500 MiB
+$ find . -type f -newer build.stamp               # changed since that file was touched
+$ find . -name '*.o' -delete                      # delete what matched (run without -delete first)
+$ find . -name '*.sh' -exec chmod +x {} +         # run a command on the matches, many per call
+$ find /etc -name '*.conf' 2>/dev/null            # hide "Permission denied" for directories you can't read
+```
+
+`find ... -print0 | xargs -0 cmd` passes names safely to another command, even names with spaces or newlines (section 9).
+
+**`locate` searches a database** of every file name, so it's instant but only as fresh as the last update. On Debian it's the `plocate` package; the database is updated daily by a timer, or now with `sudo updatedb`.
+
+```
+$ locate sshd_config
+```
+
+**`grep` searches inside files:**
+
+| Command | Finds |
+|---|---|
+| `grep ttyS0 /etc/inittab` | Lines that contain `ttyS0` |
+| `grep -i error log.txt` | Ignoring case |
+| `grep -rn 'CONFIG_USB' .` | Recursively, with file names and line numbers |
+| `grep -rl 'TODO' src/` | Only the names of files that match |
+| `grep -w eth0 file` | Whole words only: not `veth0` |
+| `grep -v '^#' file` | Lines that **don't** match: here, without comment lines |
+| `grep -E 'error\|fail'` or `grep -E '(error\|fail)'` | Extended regular expressions: `\|`, `+`, `?`, `()` without backslashes |
+| `grep -r --include='*.c' 'ioctl' .` | Only in files matching a pattern |
+| `grep -A 3 -B 1 'Oops' dmesg.txt` | With 3 lines after and 1 before each match |
+
+Faster alternatives for source trees: `rg` (ripgrep, package `ripgrep`), which skips files ignored by `.gitignore`, and `fdfind` (package `fd-find`; `fd` on other distributions) for names.
+
+**Finding programs and their packages:**
+
+```
+$ type -a python3          # what the shell will run, and every match in PATH
+$ command -v picocom       # just the path; empty and status 1 if missing (good in scripts)
+$ dpkg -S /usr/bin/scp    # which installed package owns a file
+$ apt-file search bin/dtc # which package (installed or not) provides a file: package apt-file, then apt-file update
+```
 
 ## 7. Users, groups and sudo
 

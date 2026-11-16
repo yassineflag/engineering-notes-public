@@ -1681,11 +1681,180 @@ logger -t backup "home backed up to $dest/$today"
 
 ## 22. Housekeeping: time, names, updates and disk space
 
+**Time.** A wrong clock breaks more than it seems: TLS certificates look "not yet valid", APT refuses repositories (section 15), `make` rebuilds everything or nothing.
+
+```
+$ timedatectl                                  # local time, UTC, time zone, whether NTP is synchronized
+$ sudo timedatectl set-timezone Europe/Paris   # timedatectl list-timezones for the names
+$ sudo timedatectl set-ntp true                # synchronize with systemd-timesyncd (or chrony, if installed)
+$ date -u +%FT%TZ                              # the time in UTC, ISO format
+```
+
+`System clock synchronized: no` with `NTP service: active` usually means the NTP servers are unreachable (a firewall, no network yet). Boards without a battery-backed clock start in 1970 or 2000 until they reach an NTP server, which is why their first `apt update` or HTTPS download can fail.
+
+**Names and language:**
+
+```
+$ hostnamectl                                  # host name, OS, kernel, hardware
+$ sudo hostnamectl set-hostname pc2            # also update the 127.0.1.1 line of /etc/hosts
+$ localectl                                    # language and keyboard layouts
+$ locale                                       # the LANG and LC_* values of this shell
+$ sudo dpkg-reconfigure locales                # generate more locales, choose the default
+$ sudo dpkg-reconfigure keyboard-configuration # keyboard layout for the consoles
+```
+
+A `perl: warning: Setting locale failed` or `cannot change locale` over SSH means your PC sends a `LANG` the far side hasn't generated: generate it there, or remove `SendEnv LANG LC_*` from the client's `/etc/ssh/ssh_config`.
+
+**An update routine.**
+
+```
+$ sudo apt update && sudo apt full-upgrade     # read the list before answering yes
+$ sudo apt autoremove                          # old kernels and unneeded dependencies
+$ uname -r; dpkg -l 'linux-image-*' | grep ^ii # running kernel vs installed ones: reboot when they differ
+```
+
+Ubuntu writes `/var/run/reboot-required` when an upgrade needs a reboot; on Debian, `needrestart` (if installed) says so. **Moving to the next release** is a different operation: on Debian, read the release notes, change the codename in the `.sources` files (`trixie` to the next one), then `apt update`, `apt upgrade --without-new-pkgs`, `apt full-upgrade`, as the release notes describe; on Ubuntu, `sudo do-release-upgrade`. Back up first (section 21).
+
+**Disk space.** When `df -h` shows a filesystem nearly full:
+
+| Where | Check | Free it |
+|---|---|---|
+| Biggest directories | `sudo du -xh --max-depth=1 / \| sort -h`, then descend; or `sudo ncdu -x /` | |
+| The journal | `journalctl --disk-usage` | `sudo journalctl --vacuum-size=500M` |
+| APT's downloaded packages | `du -sh /var/cache/apt` | `sudo apt clean` |
+| Old kernels | `dpkg -l 'linux-image-*'` | `sudo apt autoremove` |
+| Your caches | `du -sh ~/.cache` | Delete what you recognize; it's rebuilt as needed |
+| Build trees | Yocto `tmp/` and `sstate-cache/`, Buildroot `output/`, kernel trees: tens of GB | `make clean`, or delete the build directories you don't need |
+| Containers | `docker system df`, `podman system df` | `docker system prune`, `podman system prune` |
+| Flatpak / Snap | `flatpak list`, `snap list --all` | `flatpak uninstall --unused`; old snap revisions with `snap remove --revision` |
+| Deleted but still open files | `sudo lsof +L1` | Restart the process that holds them: the space is freed only when the file is closed |
+
+**When the PC doesn't boot properly:**
+- Hold `Shift` (BIOS) or press `Esc` (UEFI) at power-on for the GRUB menu, then **Advanced options** to boot the previous kernel. If it works, the last kernel or driver update is the cause.
+- An **emergency shell** after "Give root password for maintenance" usually means an `/etc/fstab` line names a missing disk: log in, `mount -o remount,rw /`, fix or comment out the line (or add `nofail`), reboot.
+- Graphical session broken: `Ctrl+Alt+F3` for a text console, log in, read `journalctl -b -p err`.
+- Nothing works: boot a live USB of the same distribution, mount the system disk and fix files, or copy your data off.
+
 ## 23. Troubleshooting by symptom
+
+**Shell and files:**
+
+| Symptom | Likely cause | Check, then see |
+|---|---|---|
+| `command not found` | Not installed, or not in `PATH` | `apt-file search bin/<name>`, `echo "$PATH"` (sections 6, 10) |
+| A script in the current directory: `command not found` | `.` isn't in `PATH` | `./script.sh` (section 10) |
+| `bash: ./script.sh: Permission denied` | No `x` bit, or a `noexec` filesystem | `chmod +x`, or `bash script.sh` (section 8) |
+| `/bin/bash^M: bad interpreter` | Windows line endings | `dos2unix` (section 5) |
+| `[[: not found` or `Syntax error: "(" unexpected` | A Bash script run by `sh` (dash) | `#!/usr/bin/env bash`, run it as `./script.sh` or `bash script.sh` (section 11) |
+| A variable set in a script isn't there afterwards | The script ran in a child process | `source script.sh` (section 10) |
+| A change to `~/.bashrc` or `~/.profile` has no effect | Not reloaded, or a `~/.bash_profile` shadows `~/.profile` | `source ~/.bashrc`; log in again (section 10) |
+| `Argument list too long` | A glob with too many matches | `find ... -print0 \| xargs -0` (section 9) |
+| A file with spaces is "not found" | Unquoted variable or name | `"$file"` (section 4) |
+| An output file is empty after `cmd file > file` | The redirection emptied it first | Write to a new file (section 9) |
+| The terminal shows garbage or stops echoing | A binary file was printed, or a program crashed in raw mode | Type `reset` and `Enter`, even blind |
+
+**Users, permissions and sudo:**
+
+| Symptom | Likely cause | Check, then see |
+|---|---|---|
+| `user is not in the sudoers file` | Not in the `sudo` group | `su -`, then `usermod -aG sudo user`; log in again (section 7) |
+| `Permission denied` on `/dev/ttyUSB0` or a USB device | Not in `dialout` / `plugdev`, or not logged in since | `id`, `ls -l /dev/ttyUSB0` (sections 7, 18) |
+| `Permission denied` with `sudo echo ... > /etc/file` | The redirection runs as you | `\| sudo tee` (section 9) |
+| `Permission denied` although the file is `rw` for you | A directory on the path lacks `x` | `namei -l /path` (section 8) |
+| Can't change modes or owners on a USB stick or SD boot partition | FAT/exFAT has none | Mount options `uid=`, `umask=` (section 17) |
+| Lost all your groups after `usermod` | `-G` without `-a` | `usermod -aG` each group back, from root (section 7) |
+
+**Processes, services and logs:**
+
+| Symptom | Likely cause | Check, then see |
+|---|---|---|
+| The PC is slow | A process using CPU, memory or disk | `top` / `htop` sorted by CPU and memory; `uptime` against `nproc` (section 12) |
+| A program was killed with no error | The OOM killer | `journalctl -k \| grep -i 'out of memory'`; lower `make -j` (section 12) |
+| A process won't die | `D` state or zombie | `ps -o stat`; wait for the device, or kill the parent (section 12) |
+| A service fails to start | Error in its configuration or command | `systemctl status unit`, `journalctl -u unit -b` (sections 13, 14) |
+| Works in the terminal, fails as a service | Different environment, user or directory | `Environment=`, `WorkingDirectory=`, `User=` (section 13) |
+| Unit file changes ignored | No `daemon-reload` | `sudo systemctl daemon-reload` (section 13) |
+| A service starts by hand but not at boot | Not enabled, or started before the network | `systemctl is-enabled`; `After=`/`Wants=network-online.target` (section 13) |
+| `/var/log/syslog` doesn't exist | No `rsyslog` on Debian 12 and later | `journalctl` (section 14) |
+| `dmesg: read kernel buffer failed: Operation not permitted` | Debian restricts it to root | `sudo dmesg`, or `journalctl -k` (section 14) |
+
+**Packages:**
+
+| Symptom | Likely cause | Check, then see |
+|---|---|---|
+| `Could not get lock` | Another APT running | Wait; find it with `ps` (section 15) |
+| `Unable to locate package` | No `apt update` yet, wrong name, or a missing component | `apt update`, `apt search`; `contrib`/`non-free` in sources (section 15) |
+| `externally-managed-environment` from `pip` | Debian protects the system Python | `apt install python3-...`, `pipx`, or a venv (section 16) |
+| `error while loading shared libraries` after `make install` | The linker cache doesn't know `/usr/local/lib` | `sudo ldconfig` (section 16) |
+| The wrong version of a tool runs | A copy in `/usr/local/bin` or `~/.local/bin` shadows the package | `type -a tool`, `hash -r` (sections 10, 16) |
+| `Release file is not valid yet` or TLS errors | Wrong clock | `timedatectl` (section 22) |
+
+**Disks and devices:**
+
+| Symptom | Likely cause | Check, then see |
+|---|---|---|
+| `No space left on device` | A full filesystem, or no free inodes | `df -h`, `df -i`; section 22 |
+| `df` shows full but `du` finds nothing | A deleted file still open | `sudo lsof +L1` (section 22) |
+| `target is busy` on `umount` | A process or shell inside it | `fuser -vm`, `cd` elsewhere (section 17) |
+| A card has a strange size or partitions after `dd` | Written to a partition (`sdX1`) instead of the disk, or a fake-capacity card | Rewrite to `/dev/sdX`; test the card with `f3` (section 17) |
+| Boot stops in an emergency shell | An `fstab` entry for a missing disk | `nofail`; fix `fstab` (sections 17, 22) |
+| The serial adapter appears and vanishes, or is busy | ModemManager or brltty | Section 18 |
+| A device isn't seen at all | Cable, power, driver | `dmesg -w` while plugging in (sections 14, 18) |
+
+**Network and SSH:**
+
+| Symptom | Likely cause | Check, then see |
+|---|---|---|
+| Can ping an IP, not a name | DNS | `resolvectl status`, `getent hosts name` (section 19) |
+| `Connection refused` | Nothing listens on that port, or it listens on `127.0.0.1` only | `ss -tlpn` on the server (section 19) |
+| `Connection timed out` / `No route to host` | Host down, wrong subnet, firewall | Ping step by step (section 19) |
+| `REMOTE HOST IDENTIFICATION HAS CHANGED` | The board was reflashed | `ssh-keygen -R host` (section 20) |
+| SSH still asks for a password with a key installed | Permissions on `~/.ssh` or `authorized_keys`, wrong user | `chmod 700/600`; `ssh -v` shows which keys are offered (section 20) |
+| `scp` fails to a small board | No SFTP server on the board | `scp -O`, or `rsync`/`cat` over `ssh` (section 20) |
+| A long command died when SSH dropped | The shell's `SIGHUP` | Run it in `tmux` (section 20) |
 
 ## 24. Not covered here
 
+- **Bash as a language** (arrays, parameter expansion in depth, `getopts`, traps): the [Bash folder](../../software/bash/).
+- **How programs talk to the kernel** (system calls, processes and threads from C, IPC): [Linux systems programming](../../linux-systems-programming/).
+- **Networking in depth**, routing, firewalls and gateways: the [networking notes](../../networking/).
+- **Building and booting Linux for a board**: the [embedded Linux notes](../../embedded-linux/).
+- **Security hardening**: AppArmor and SELinux profiles, auditd, intrusion detection.
+- **Storage in depth**: LVM, RAID, LUKS disk encryption, btrfs and ZFS snapshots.
+- **Desktop environments**, Wayland and X11, graphics drivers.
+- **Containers and virtual machines** in depth: Docker, Podman, QEMU/KVM, libvirt.
+- **Other init systems** (BusyBox init, OpenRC, runit): the rootfs note covers BusyBox init.
+
 ## References
+
+Manuals on your system:
+
+- `man bash`, `man 7 hier`, `man 7 signal`, `man 7 capabilities`, `man 5 fstab`, `man 5 sudoers`, `man 5 sshd_config`, `man ssh_config`, `man systemd.unit`, `man systemd.service`, `man systemd.timer`, `man journalctl`, `man udev`, `man apt`, `man sources.list`.
+- GNU coreutils: `info coreutils`, or https://www.gnu.org/software/coreutils/manual/
+
+Debian and Ubuntu:
+
+- *The Debian Administrator's Handbook*: https://debian-handbook.info
+- *Debian Reference*: https://www.debian.org/doc/manuals/debian-reference/
+- Debian 13 release notes: https://www.debian.org/releases/trixie/releasenotes
+- Debian Wiki: https://wiki.debian.org (SourcesList, sudo, systemd, UnattendedUpgrades)
+- Ubuntu Server documentation: https://documentation.ubuntu.com/server/
+
+Shell and tools:
+
+- *Bash Reference Manual*: https://www.gnu.org/software/bash/manual/
+- William Shotts, *The Linux Command Line* (free): https://linuxcommand.org/tlcl.php
+- Greg's Wiki, *Bash Pitfalls* and *Bash FAQ*: https://mywiki.wooledge.org/BashPitfalls
+- ShellCheck: https://www.shellcheck.net
+- tldr pages: https://tldr.sh
+- tmux wiki: https://github.com/tmux/tmux/wiki
+
+System components:
+
+- systemd documentation: https://systemd.io and https://www.freedesktop.org/software/systemd/man/
+- Filesystem Hierarchy Standard 3.0: https://refspecs.linuxfoundation.org/fhs.shtml
+- OpenSSH manuals: https://www.openssh.com/manual.html
+- The Arch Wiki (much of it applies to every distribution): https://wiki.archlinux.org
 
 ---
 

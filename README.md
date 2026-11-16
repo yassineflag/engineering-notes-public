@@ -18,6 +18,7 @@ Every note aims to be practical, so you'll find configs and commands you can reu
 
 ## Latest notes
 
+- [Everyday Linux: The Shell, Files, Users, Packages and Services](linux-general-usage/everyday-linux/everyday-linux_v1_2026-11-16.md)
 - [Buildroot for Embedded Linux](embedded-linux/linux-build-systems/buildroot/buildroot_v1_2026-11-15.md)
 - [The Yocto Project for Embedded Linux](embedded-linux/linux-build-systems/yocto/yocto_v1_2026-11-14.md)
 - [Software-Defined Radio: HackRF One and GNU Radio](hardware/sdr/sdr_v1_2026-11-12.md)

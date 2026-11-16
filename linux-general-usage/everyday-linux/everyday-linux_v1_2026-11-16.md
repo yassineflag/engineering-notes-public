@@ -1464,9 +1464,220 @@ Settings for almost every board console, including the BeagleBone Black's: **115
 
 ## 19. The network from the user's side
 
+The [networking fundamentals note](../../networking/fundamentals/fundamentals_v1_2026-10-29.md) explains how all of this works. This section is the set of commands to answer "is the network OK, and if not, where does it stop?".
+
+**What do I have:**
+
+```
+$ ip -br addr          # interfaces and addresses, one line each
+$ ip route             # routes; "default via" is the gateway
+$ resolvectl status    # DNS servers, if systemd-resolved is used (Ubuntu; optional on Debian)
+$ cat /etc/resolv.conf # DNS servers otherwise
+$ nmcli device status  # NetworkManager's view, on desktops
+```
+
+**Expected:**
+
+```
+lo               UNKNOWN        127.0.0.1/8 ::1/128
+enp3s0           UP             192.168.0.10/24 fe80::xxxx:xxxx:xxxx:xxxx/64
+wlp2s0           DOWN
+enx001122334455  UP             192.168.7.1/24
+default via 192.168.0.1 dev enp3s0 proto dhcp src 192.168.0.10 metric 100
+192.168.0.0/24 dev enp3s0 proto kernel scope link src 192.168.0.10 metric 100
+192.168.7.0/24 dev enx001122334455 proto kernel scope link src 192.168.7.1
+```
+
+The `enx...` interface is what a BeagleBone Black running the BeagleBoard Debian image looks like over its USB cable: a USB network gadget, with the board at `192.168.7.2`.
+
+**Where does it stop?** Test from the bottom up, and stop at the first failure:
+
+| Step | Command | If it fails |
+|---|---|---|
+| 1. Link | `ip -br link`: the interface is `UP` | Cable, Wi-Fi not connected, interface down |
+| 2. Address | `ip -br addr`: an address in the right subnet | DHCP failed: `nmcli`, `journalctl -u NetworkManager` |
+| 3. Gateway | `ping -c 3 192.168.0.1` | Wrong subnet, router down, Wi-Fi isolation |
+| 4. Internet by IP | `ping -c 3 9.9.9.9` | The router has no uplink; firewall |
+| 5. DNS | `getent hosts debian.org`, `dig debian.org` (package `bind9-dnsutils`) | Wrong or unreachable DNS server |
+| 6. The service | `curl -I https://debian.org`, `nc -zv 192.168.0.50 22` | The service, a firewall, a proxy |
+
+**Ports and connections:**
+
+```
+$ ss -tulpn             # sockets listening for TCP (t) and UDP (u), with the process (p; needs sudo for others' processes)
+$ ss -tnp               # established TCP connections
+$ curl -fLO https://example.com/file.tar.xz   # download, keeping the name; -f fails on HTTP errors, -L follows redirects
+$ wget -c https://example.com/big.img.xz      # download, resuming (-c) an interrupted one
+```
+
+`0.0.0.0:8000` or `*:8000` in `ss` means the service accepts connections on every interface; `127.0.0.1:8000` means only from this PC, which is why a board can't reach a development server that listens on localhost.
+
+**NetworkManager from the command line** (desktops; Debian servers often use `ifupdown` and `/etc/network/interfaces` instead, Ubuntu servers `netplan`):
+
+```
+$ nmcli device wifi list
+$ nmcli device wifi connect "MySSID" --ask
+$ nmcli connection show
+$ nmcli connection modify "Wired connection 1" ipv4.method manual ipv4.addresses 192.168.0.10/24 \
+      ipv4.gateway 192.168.0.1 ipv4.dns 192.168.0.1
+$ nmcli connection up "Wired connection 1"
+```
+
+`nmtui` is a text menu for the same settings.
+
+**Names for your boards.** `/etc/hosts` maps names to addresses on this PC: a line `192.168.0.50 bbb` lets you type `ssh bbb` and `ping bbb`. Devices that run Avahi (mDNS) answer to `<hostname>.local` without any configuration.
+
+**Firewall.** Debian installs none by default; Ubuntu has `ufw`, inactive by default. `sudo nft list ruleset` shows the kernel's rules whatever tool wrote them; `sudo ufw status verbose` on Ubuntu. If a board can't reach a service on the PC that `ss` shows listening on `0.0.0.0`, the firewall is the next suspect. The [gateway note](../../networking/gateway/gateway_v1_2026-10-26.md) covers nftables.
+
 ## 20. SSH, file transfer and tmux
 
+**SSH** gives you a shell on another machine, encrypted, and carries file transfers and tunnels. The client is installed everywhere; the server is the package `openssh-server` (`sudo systemctl enable --now ssh`).
+
+```
+$ ssh debian@192.168.0.50                 # user@host
+$ ssh -p 2222 user@host                   # another port
+$ ssh bbb 'uname -a; df -h /'             # run commands and come back
+```
+
+**The first connection** shows the server's key fingerprint and asks to trust it; the answer is saved in `~/.ssh/known_hosts`. When you reflash a board, it gets a new key, and SSH refuses:
+
+```
+@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@
+@    WARNING: REMOTE HOST IDENTIFICATION HAS CHANGED!     @
+@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@
+```
+
+That's expected after reflashing: remove the old key with `ssh-keygen -R 192.168.0.50` (and `ssh-keygen -R bbb`) and connect again. If you didn't change anything on the other side, don't: it's what an attack looks like.
+
+**Keys instead of passwords:**
+
+```
+$ ssh-keygen -t ed25519 -C "user@pc"       # creates ~/.ssh/id_ed25519 (private) and id_ed25519.pub (public)
+$ ssh-copy-id debian@192.168.0.50          # appends the public key to the board's ~/.ssh/authorized_keys
+$ ssh debian@192.168.0.50                  # no password now; asks for the key's passphrase, if you set one
+```
+
+Give the key a passphrase; the agent (`ssh-add`, started automatically by desktops) remembers it for the session. The private key never leaves your PC; the public one can go anywhere. SSH refuses keys and directories that others can read: `chmod 700 ~/.ssh`, `chmod 600 ~/.ssh/id_ed25519 ~/.ssh/authorized_keys ~/.ssh/config`.
+
+**`~/.ssh/config`** saves typing (**Illustrative**):
+
+```
+Host bbb
+    HostName 192.168.0.50
+    User debian
+
+Host bbb-usb
+    HostName 192.168.7.2
+    User debian
+
+Host lab-*
+    User user
+    ProxyJump gateway.example.com
+```
+
+Now `ssh bbb`, `scp file bbb:`, `rsync ... bbb:/tmp/` all use these settings.
+
+**Copying files:**
+
+| Command | Does |
+|---|---|
+| `scp app bbb:/tmp/` | Copy to the board |
+| `scp bbb:/var/log/messages .` | Copy from it |
+| `rsync -avP build/ bbb:/opt/app/` | Synchronize a directory: only what changed, with progress, resumable |
+| `rsync -avP --delete build/ bbb:/opt/app/` | Also delete on the far side what's gone here: run with `-n` (dry run) first |
+| `sshfs bbb:/ ~/mnt/bbb` | Mount the board's files on the PC (package `sshfs`); `fusermount -u ~/mnt/bbb` to undo |
+
+**The trailing slash in `rsync`** changes the meaning: `rsync -a build/ dest/` copies the *contents* of `build` into `dest`; `rsync -a build dest/` creates `dest/build`. `rsync` must be installed on both sides; BusyBox systems often lack it, and `scp` (which uses SFTP since OpenSSH 9) then needs the board's SFTP server, or `scp -O` for the old protocol.
+
+**Tunnels:**
+
+```
+$ ssh -L 8080:localhost:80 bbb       # http://localhost:8080 on the PC reaches port 80 on the board
+$ ssh -R 8000:localhost:8000 bbb     # port 8000 on the board reaches port 8000 on the PC
+$ ssh -J gateway user@10.0.0.5       # reach a machine behind a gateway
+```
+
+**Hardening a server** once key login works: a drop-in file such as `/etc/ssh/sshd_config.d/10-keys.conf` with `PasswordAuthentication no`, then `sudo sshd -t` (checks the configuration) and `sudo systemctl reload ssh`. Keep the current session open and test from a second terminal before you log out.
+
+**tmux** keeps shells running on a machine after you disconnect, and splits one terminal into several. Start it on the far side of an SSH session before a long build:
+
+| Action | Keys or command |
+|---|---|
+| New session named `build` | `tmux new -s build` |
+| Detach (it keeps running) | `Ctrl+B` then `d` |
+| List / reattach | `tmux ls` / `tmux attach -t build` |
+| New window / next / previous | `Ctrl+B` then `c` / `n` / `p` |
+| Split side by side / top and bottom | `Ctrl+B` then `%` / `"` |
+| Move between panes | `Ctrl+B` then an arrow key |
+| Scroll back (`q` to leave) | `Ctrl+B` then `[` |
+
+If the SSH connection drops, the build goes on; `ssh` back and `tmux attach`.
+
 ## 21. Archives, checksums and backups
+
+**tar** packs a directory tree into one file, keeping names, modes, owners, times and links; a compressor makes it smaller. The letters: `c` create, `x` extract, `t` list, `f` the archive's file name, `v` verbose, and a compressor: `z` gzip, `J` xz, `--zstd` zstd. Modern GNU tar detects the compression on extraction.
+
+```
+$ tar czf work.tar.gz work/                    # create, gzip
+$ tar cJf rootfs.tar.xz -C rootfs .            # -C: change into rootfs first, so paths start with ./
+$ tar --zstd -cf backup.tar.zst ~/projects
+$ tar tf rootfs.tar.xz | head                  # list without extracting
+$ tar xf work.tar.gz                           # extract here
+$ tar xf rootfs.tar.xz -C /mnt                 # extract into /mnt
+$ tar czf src.tar.gz --exclude=build --exclude=.git project/
+```
+
+To unpack a root filesystem archive for a board, run tar as root with `--numeric-owner`, so the files keep the UIDs written in the archive (root and the board's users) rather than being mapped to your PC's names: `sudo tar xpf rootfs.tar.xz --numeric-owner -C /mnt`. The rootfs note of the [embedded Linux notes](../../embedded-linux/) explains why ownership inside a root filesystem matters.
+
+| Compressor | Speed | Size | Use |
+|---|---|---|---|
+| gzip (`.gz`) | Fast | Larger | Everywhere; the safe default |
+| xz (`.xz`) | Slow to compress, multi-threaded with `-T0` | Smallest | Release images, archives kept long |
+| zstd (`.zst`) | Very fast, adjustable | Close to xz at high levels | Backups, everyday archives |
+| zip (`zip -r`, `unzip`) | Fast | Larger | Exchange with Windows; doesn't keep Unix owners |
+
+Compress one file alone: `xz -T0 -k sdcard.img` (keeps the original with `-k`), `unxz`, `zstd`, `gunzip`.
+
+**Checksums** prove a download or a copy is intact:
+
+```
+$ sha256sum bbb-image.img.xz                        # print the hash; compare it to the one published
+$ sha256sum -c SHA256SUMS --ignore-missing          # check against a published list
+$ sha256sum images/*.img > SHA256SUMS               # make your own list
+```
+
+A matching hash says the file wasn't damaged; to know it comes from the right person, the list itself must be signed (`gpg --verify SHA256SUMS.sign SHA256SUMS`).
+
+**Backups.** A disk will fail, a command will delete the wrong directory, a laptop will be stolen. The rule of thumb is **3-2-1**: three copies, on two different media, one of them elsewhere. And a backup you've never restored is a hope, not a backup.
+
+| What | How |
+|---|---|
+| Your files, to an external disk | `rsync` (below), or `restic` / `borg`, which deduplicate, encrypt and keep versions |
+| Your files, off-site | `restic` to a remote server or cloud storage |
+| The system configuration | `/etc`, the list of packages (`dpkg --get-selections > packages.txt`, or `apt-mark showmanual`), your unit files and scripts |
+| The whole system, to roll back an upgrade | Timeshift (btrfs or rsync snapshots), or a disk image from a live USB |
+| Work in progress | `git push` to a remote: the cheapest backup of all |
+
+A simple dated backup with `rsync`, where unchanged files are hard links to the previous backup, so each copy looks complete but takes only the space of what changed (**Illustrative**; run by the timer of section 13):
+
+```bash
+#!/usr/bin/env bash
+# /usr/local/sbin/backup-home.sh: dated copy of /home on the disk labelled "backup".
+set -euo pipefail
+
+dest=/media/backup/home
+[[ -d "$dest" ]] || { echo "backup disk not mounted" >&2; exit 1; }
+
+today=$(date +%F)
+rsync -aAXH --delete \
+      --exclude='.cache/' --exclude='*/build/' \
+      --link-dest="$dest/latest" \
+      /home/ "$dest/$today/"
+ln -sfn "$today" "$dest/latest"
+logger -t backup "home backed up to $dest/$today"
+```
+
+`-aAXH` keeps permissions, ACLs, extended attributes and hard links. To restore a file, copy it back from any dated directory. Delete old dated directories by hand or with a `find "$dest" -maxdepth 1 -mtime +90` you've checked first.
 
 ## 22. Housekeeping: time, names, updates and disk space
 

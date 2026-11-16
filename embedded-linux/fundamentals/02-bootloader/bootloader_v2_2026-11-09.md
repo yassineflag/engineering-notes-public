@@ -2,7 +2,7 @@
 
 A beginner's path from power-on to a running Linux kernel: what a bootloader does, how to build U-Boot, how to use its command line in QEMU, and how to put it on a BeagleBone Black or a Raspberry Pi 4.
 
-**You need:** the PC, toolchains and settings files from the [cross-compilation note](../cross-compilation-toolchain/cross-compilation-toolchain_v2_2026-11-08.md) (sections 3 and 4). No board is needed until section 9. For a board, you also need a 3.3 V USB-to-serial cable.
+**You need:** the PC, toolchains and settings files from the [cross-compilation note](../01-cross-compilation-toolchain/cross-compilation-toolchain_v2_2026-11-08.md) (sections 3 and 4). No board is needed until section 9. For a board, you also need a 3.3 V USB-to-serial cable.
 
 **How to read it:**
 - **Parts 1 and 2 are essential.** Read them in order and type the commands.
@@ -337,7 +337,7 @@ On QEMU the variables are stored in `envstore.img`. On a board they're usually a
 
 ## 7. Boot Linux from U-Boot
 
-The [kernel note](../kernel/) builds a kernel. Until then, we use Debian's installer kernel and initramfs. They're built for many Arm machines, including QEMU's `virt` and the BeagleBone Black.
+The [kernel note](../03-kernel/) builds a kernel. Until then, we use Debian's installer kernel and initramfs. They're built for many Arm machines, including QEMU's `virt` and the BeagleBone Black.
 
 ```sh
 mkdir -p $BOOTDIR/tftp
@@ -711,7 +711,7 @@ Nothing in this table was reproduced for this note.
 | `Bad Linux ARM64 Image magic!` | Not a 64-bit Image: a zImage, a compressed Image without `kernel_comp_addr_r`, or the wrong file | Use the matching command and file (section 12) |
 | `Wrong Ramdisk Image Format` | The initramfs was given without its size | `${ramdisk_addr_r}:${filesize}`, with `filesize` from the initramfs load |
 | `Starting kernel ...` and then nothing | Wrong `console=` for this kernel, or the wrong device tree | Use `ttyAMA0` on QEMU, `ttyS0` on the BBB. Add `earlycon` to `bootargs` to see early messages |
-| `Kernel panic - not syncing: VFS: Unable to mount root fs` | No initramfs and a wrong or missing `root=`, or the kernel lacks the driver for that disk | Check `bootargs`. The [root filesystem](../rootfs/) note covers this |
+| `Kernel panic - not syncing: VFS: Unable to mount root fs` | No initramfs and a wrong or missing `root=`, or the kernel lacks the driver for that disk | Check `bootargs`. The [root filesystem](../04-rootfs/) note covers this |
 | `*** Warning - bad CRC, using default environment` | Nothing saved yet, or the saved copy was erased | Normal on a first boot. `saveenv` |
 | `saveenv` fails in QEMU | QEMU started without the `-drive if=pflash,index=1` option | Use `run-qemu.sh` |
 | `Retry count exceeded; starting again` during `tftp` or `dhcp` | No answer from the server | `printenv serverip ipaddr`. On a board, check the cable and the PC's firewall |
@@ -886,7 +886,7 @@ echo '/srv/nfs/bbb *(rw,sync,no_subtree_check,no_root_squash)' | sudo tee -a /et
 sudo exportfs -ra
 ```
 
-`/srv/tftp` is the folder the `tftpd-hpa` package serves. `/srv/nfs/bbb` holds a root filesystem, which the [root filesystem](../rootfs/) note builds.
+`/srv/tftp` is the folder the `tftpd-hpa` package serves. `/srv/nfs/bbb` holds a root filesystem, which the [root filesystem](../04-rootfs/) note builds.
 
 The BeagleBone's default environment already has a `netboot` variable that does all of it: `dhcp`, `tftp` of `${bootfile}` and `${fdtfile}`, then `bootz` with an NFS root. Connect the board's Ethernet port to your network. **Expected (board)**, with the PC at `192.168.1.10`:
 
@@ -976,8 +976,8 @@ Breakpoints and backtraces then work as usual. U-Boot's [GDB guide](https://docs
 
 ## 18. Where the rest is covered
 
-- **Building the kernel and device trees** (`zImage`, `Image`, `.dtb`): the [kernel](../kernel/) note.
-- **Root filesystems, initramfs, and an NFS root:** the [root filesystem](../rootfs/) note.
+- **Building the kernel and device trees** (`zImage`, `Image`, `.dtb`): the [kernel](../03-kernel/) note.
+- **Root filesystems, initramfs, and an NFS root:** the [root filesystem](../04-rootfs/) note.
 - **U-Boot built for you as part of a whole system:** the [Buildroot](../../linux-build-systems/buildroot/) and [Yocto](../../linux-build-systems/yocto/) notes.
 - **Not covered here:** Trusted Firmware-A and OP-TEE, which many 64-bit chips run before U-Boot; UEFI boot with GRUB; other bootloaders such as barebox; porting U-Boot to a new board.
 

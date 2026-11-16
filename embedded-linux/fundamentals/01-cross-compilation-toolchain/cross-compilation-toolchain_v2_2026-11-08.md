@@ -822,8 +822,8 @@ gdb-multiarch -q ./dbg -ex 'set sysroot /path/to/sysroot' -ex 'target remote BOA
 
 ## 17. Where the rest is covered
 
-- **Cross-compiling the kernel and U-Boot** (`ARCH=` and `CROSS_COMPILE=`): the [kernel](../kernel/) and [bootloader](../bootloader/bootloader_v2_2026-11-09.md) notes.
-- **Root filesystems, and full-system emulation in QEMU:** the [root filesystem](../rootfs/) note.
+- **Cross-compiling the kernel and U-Boot** (`ARCH=` and `CROSS_COMPILE=`): the [kernel](../03-kernel/) and [bootloader](../02-bootloader/bootloader_v2_2026-11-09.md) notes.
+- **Root filesystems, and full-system emulation in QEMU:** the [root filesystem](../04-rootfs/) note.
 - **Toolchains and SDKs from build systems:** the [Buildroot](../../linux-build-systems/buildroot/) and [Yocto](../../linux-build-systems/yocto/) notes.
 - **How a toolchain is built, bare-metal toolchains, Go and Rust:** not covered here.
 

@@ -570,9 +570,278 @@ A `+` after the mode in `ls -l` (`-rw-rw-r--+`) means the file has an ACL.
 
 ## 9. Pipes, redirection and text processing
 
+Every process starts with three open files, numbered:
+
+| Number | Name | Default |
+|---|---|---|
+| 0 | stdin, standard input | The keyboard |
+| 1 | stdout, standard output | The terminal |
+| 2 | stderr, standard error (messages, errors) | The terminal |
+
+The shell can point each one somewhere else before the command starts; the command doesn't know or care.
+
+**Redirection:**
+
+| Syntax | Effect |
+|---|---|
+| `cmd > file` | stdout to `file`, replacing it |
+| `cmd >> file` | stdout appended to `file` |
+| `cmd 2> errors.txt` | stderr to a file |
+| `cmd > out.txt 2>&1` | stdout to the file, then stderr to where stdout goes (order matters) |
+| `cmd &> all.txt` | Both, in Bash |
+| `cmd 2>/dev/null` | Discard errors; `/dev/null` swallows everything |
+| `cmd < file` | stdin from a file |
+| `cmd <<'EOF'` ... `EOF` | stdin from the following lines (a here-document) |
+| `cmd <<< "text"` | stdin from a string |
+
+`> file` empties the file before the command runs, so `sort data.txt > data.txt` leaves an empty file. Write to a new file and rename it, or use `sponge` (package `moreutils`).
+
+**`sudo` and redirection.** `sudo echo "192.168.0.50 bbb" >> /etc/hosts` fails with `Permission denied`: the redirection is done by *your* shell before `sudo` starts. Let a root process open the file instead:
+
+```
+$ echo "192.168.0.50 bbb" | sudo tee -a /etc/hosts      # -a appends; without it, tee replaces
+$ sudo tee /etc/modules-load.d/i2c.conf > /dev/null <<'EOF'
+i2c-dev
+EOF
+```
+
+**Pipes.** `cmd1 | cmd2` connects stdout of the first to stdin of the second; both run at the same time. Most text tools read stdin when no file is given, so they chain:
+
+| Tool | Does | Example |
+|---|---|---|
+| `sort` | Sort lines; `-n` numeric, `-h` human sizes (`2K`, `1G`), `-r` reverse, `-k2` by field 2, `-u` unique | `du -sh * \| sort -h` |
+| `uniq` | Collapse **adjacent** duplicate lines; `-c` counts. Sort first | `sort \| uniq -c \| sort -rn` |
+| `cut` | Pick fields or columns | `cut -d: -f1,7 /etc/passwd` |
+| `tr` | Translate or delete characters | `tr 'a-z' 'A-Z'`, `tr -d '\r'` |
+| `wc` | Count lines, words, bytes | `ls \| wc -l` |
+| `head`, `tail` | First, last lines | `... \| head -n 10` |
+| `tee` | Copy stdin to a file **and** stdout | `make 2>&1 \| tee build.log` |
+| `column -t` | Align columns | `mount \| column -t` |
+| `sed` | Edit a stream (below) | |
+| `awk` | Process fields, compute (below) | |
+| `xargs` | Turn input lines into arguments | below |
+
+**sed, the minimum:**
+
+```
+$ sed 's/old/new/' file           # replace the first match on each line, print the result
+$ sed 's/old/new/g' file          # every match
+$ sed -n '10,20p' file            # print lines 10 to 20 only
+$ sed '/^#/d' file                # delete comment lines
+$ sed -i.bak 's/^#\?PasswordAuthentication .*/PasswordAuthentication no/' sshd_config
+                                  # edit in place, keeping sshd_config.bak
+```
+
+**awk, the minimum.** awk splits each line into fields `$1`, `$2` ... (on spaces by default, or on `-F`):
+
+```
+$ awk -F: '$7 ~ /bash$/ {print $1}' /etc/passwd     # users whose shell is bash
+$ ls -l | awk '{sum += $5} END {print sum}'         # total size of the files listed
+$ df -h | awk 'NR > 1 && $5+0 > 80'                 # filesystems over 80 % full (NR = line number)
+```
+
+**xargs** reads names and runs a command with them as arguments, avoiding `Argument list too long`:
+
+```
+$ find . -name '*.log' -print0 | xargs -0 gzip      # -print0 / -0: names separated by NUL, safe with spaces
+$ cat hosts.txt | xargs -n 1 -P 4 ping -c 1         # one name per command, 4 in parallel
+```
+
+**Exit status and chaining.** Every command returns a number: 0 for success, anything else for failure. `$?` holds the last one.
+
+| Syntax | Runs the second command |
+|---|---|
+| `a ; b` | Always |
+| `a && b` | Only if `a` succeeded: `make && ./app` |
+| `a \|\| b` | Only if `a` failed: `ping -c1 bbb \|\| echo "board down"` |
+
+**Substitution:**
+- `$(cmd)` is replaced by the command's output: `echo "Kernel $(uname -r)"`, `cd "$(dirname "$script")"`. The old form with backquotes does the same but doesn't nest.
+- `<(cmd)` is replaced by a file name that reads the command's output: `diff <(ssh bbb cat /etc/fstab) fstab.new`.
+
+**Worked examples:**
+
+```
+$ du -h --max-depth=1 ~ 2>/dev/null | sort -h | tail -n 10        # the 10 biggest directories in home
+$ journalctl -b -p err --no-pager | awk '{sub(/\[.*/, "", $5); print $5}' | sort | uniq -c | sort -rn | head
+                                                                    # which programs logged the most errors this boot
+$ grep -rh '^CONFIG_' .config | cut -d= -f1 | sort > opts.txt      # the option names of a kernel config
+$ history | awk '{print $2}' | sort | uniq -c | sort -rn | head    # your most used commands
+```
+
 ## 10. Variables, the environment and shell startup files
 
+**Shell variables** live in one shell; **environment variables** are passed to every program it starts:
+
+```
+$ BOARD=bbb                    # a shell variable: no spaces around =
+$ echo "$BOARD"
+bbb
+$ export BOARD                 # now also in the environment of child processes
+$ export CROSS=arm-linux-gnueabihf-    # set and export at once
+$ printenv BOARD               # read one from the environment; printenv or env alone lists them all
+$ unset BOARD
+$ LANG=C ls /nonexistent       # set a variable for one command only
+```
+
+A child process gets a **copy**: a script can't change its parent's variables. That's why a settings file is *sourced* (`source ./settings.sh`, or `. ./settings.sh`), which runs it in the current shell, rather than executed.
+
+**Variables you'll meet:**
+
+| Variable | Holds |
+|---|---|
+| `PATH` | Directories searched for commands, separated by `:`, in order |
+| `HOME`, `USER`, `SHELL` | Your home, name and login shell |
+| `PWD` | The current directory |
+| `EDITOR`, `VISUAL` | The editor other programs open |
+| `LANG`, `LC_*` | Language and formats (section 22). `LC_ALL=C` gives English messages and byte sorting: use it when you paste errors into a search engine |
+| `PS1` | The prompt |
+| `TERM` | The terminal type, for colours and keys |
+
+**PATH.** When you type `picocom`, the shell tries each `PATH` directory in turn and runs the first match; it never looks in the current directory, which is why a script there is run as `./build.sh`. To add a directory for your tools:
+
+```
+$ export PATH="$HOME/.local/bin:$PATH"       # first in the list: found before system programs
+$ export PATH="$PATH:/opt/arm-gnu-toolchain/bin"   # last: system programs win on name clashes
+$ hash -r                                    # forget remembered locations after installing or moving a program
+```
+
+Debian's default `~/.profile` already adds `~/bin` and `~/.local/bin` if they exist when you log in.
+
+**Startup files.** Which ones Bash reads depends on how it starts:
+
+| File | Read by | Put here |
+|---|---|---|
+| `/etc/profile`, `/etc/profile.d/*.sh` | Login shells, for all users | System-wide environment |
+| `~/.profile` | Login shells (desktop login, SSH, `su -`) if there is no `~/.bash_profile` | Environment: `PATH`, `EDITOR`, `export`s |
+| `~/.bash_profile` | Login shells, **instead of** `~/.profile` if it exists | Avoid creating it on Debian, or make it source `~/.profile` |
+| `/etc/bash.bashrc` | Interactive shells, all users | |
+| `~/.bashrc` | Interactive non-login shells (each new terminal tab); Debian's `~/.profile` also sources it | Aliases, functions, prompt, shell options |
+| `/etc/environment` | PAM at login, for every program (not a shell script: `NAME=value` lines only) | Proxy settings, system-wide variables |
+| `~/.config/environment.d/*.conf` | The systemd user manager: desktop apps and user services | Variables for graphical programs |
+
+After editing `~/.bashrc`, `source ~/.bashrc` applies it to the current shell. Changes to `~/.profile` apply at the next login.
+
+**Aliases and functions** go in `~/.bashrc`:
+
+```bash
+alias ll='ls -alF'
+alias serial='picocom -b 115200 /dev/serial/by-id/usb-FTDI*'
+
+# a function takes arguments; an alias doesn't
+mkcd() { mkdir -p -- "$1" && cd -- "$1"; }
+```
+
+`\ls` or `command ls` runs the real command, bypassing an alias.
+
 ## 11. Small shell scripts
+
+A script is a file of shell commands. When a task takes more than one command and you'll do it again, write it down as a script.
+
+**The skeleton:**
+
+```bash
+#!/usr/bin/env bash
+# What this script does, in one line.
+set -euo pipefail
+
+main() {
+    echo "Hello from $0 with $# arguments: $*"
+}
+
+main "$@"
+```
+
+- The first line, the **shebang**, names the interpreter. Without it, or with `#!/bin/sh`, the script may run under `dash` (Debian's `/bin/sh`), which lacks Bash features such as `[[ ]]` and arrays.
+- `chmod +x script.sh`, then `./script.sh`. Or `bash script.sh` without the `x` bit.
+- `set -e` stops at the first failing command, `-u` treats an unset variable as an error, `-o pipefail` makes a pipe fail if any part fails. They catch many mistakes but have exceptions (a failing command inside `if` or before `||` doesn't stop the script); they don't replace checking what matters.
+- `"$@"` passes the arguments on unchanged, each one quoted. `$1`, `$2` ... are the arguments, `$#` their number, `$0` the script's name.
+
+**The building blocks:**
+
+```bash
+# condition: [[ ]] is Bash's test; spaces inside the brackets are required
+if [[ -f "$file" && -r "$file" ]]; then
+    echo "readable file"
+elif [[ -d "$file" ]]; then
+    echo "directory"
+else
+    echo "missing" >&2      # messages for the user go to stderr
+    exit 1
+fi
+
+# loops
+for img in images/*.img; do
+    sha256sum "$img"
+done
+
+while read -r host; do
+    ping -c 1 -W 1 "$host" > /dev/null && echo "$host up"
+done < hosts.txt
+
+# a command's success as a condition
+if ! command -v bmaptool > /dev/null; then
+    echo "install bmap-tools" >&2
+    exit 1
+fi
+
+# default value for an argument
+dev=${1:-/dev/sdX}
+
+# clean up a temporary directory whatever happens
+tmp=$(mktemp -d)
+trap 'rm -rf "$tmp"' EXIT
+```
+
+| Test | True when |
+|---|---|
+| `-e path` / `-f` / `-d` / `-L` | It exists / is a regular file / a directory / a symbolic link |
+| `-r` / `-w` / `-x` | You can read / write / run it |
+| `-b path` | It is a block device (a disk) |
+| `-z "$s"` / `-n "$s"` | The string is empty / not empty |
+| `"$a" == "$b"`, `"$a" != "$b"` | Strings equal / different; `==` with an unquoted right side matches a pattern: `[[ $f == *.img ]]` |
+| `$a -eq $b`, `-lt`, `-gt` ... | Numbers compared; or `(( a < b ))` |
+
+**An example with safety checks** (**Illustrative**): write a board image to an SD card, refusing anything that isn't a removable, unmounted disk. Section 17 explains the commands.
+
+```bash
+#!/usr/bin/env bash
+# sd-write.sh IMAGE DEVICE: write a disk image to an SD card, with checks.
+set -euo pipefail
+
+img=${1:?usage: $0 IMAGE DEVICE}
+dev=${2:?usage: $0 IMAGE DEVICE}
+
+[[ -f "$img" ]] || { echo "no such image: $img" >&2; exit 1; }
+[[ -b "$dev" ]] || { echo "not a block device: $dev" >&2; exit 1; }
+[[ "$(lsblk -dno TYPE "$dev")" == disk ]] || { echo "$dev is a partition, give the whole disk" >&2; exit 1; }
+
+# Card readers usually report removable (RM=1); some built-in readers don't.
+if [[ "$(lsblk -dno RM "$dev" | tr -d ' ')" != 1 ]]; then
+    echo "$dev is not removable; refusing" >&2
+    exit 1
+fi
+
+if lsblk -no MOUNTPOINTS "$dev" | grep -q .; then
+    echo "$dev has mounted partitions; unmount them first:" >&2
+    lsblk -o NAME,MOUNTPOINTS "$dev" >&2
+    exit 1
+fi
+
+lsblk -o NAME,SIZE,MODEL,TRAN "$dev"
+read -r -p "Write $img to $dev, erasing it? Type yes: " answer
+[[ "$answer" == yes ]] || exit 1
+
+case "$img" in
+    *.xz) xzcat "$img" | sudo dd of="$dev" bs=4M conv=fsync status=progress ;;
+    *.gz) zcat "$img" | sudo dd of="$dev" bs=4M conv=fsync status=progress ;;
+    *)    sudo dd if="$img" of="$dev" bs=4M conv=fsync status=progress ;;
+esac
+sync
+echo "done; remove the card"
+```
+
+**Check every script with ShellCheck** (package `shellcheck`): `shellcheck sd-write.sh` finds missing quotes, unused variables and the classic Bash traps, with a wiki page for each warning. When a script grows past a page, or needs data structures, error handling or parsing, Python is usually the better tool. The [Bash folder](../../software/bash/) is the place for the language in depth.
 
 ## 12. Processes and signals
 

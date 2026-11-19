@@ -143,7 +143,7 @@ Three habits make the loop fast and safe:
 
 **Verification status.** In November 2026, on an x86_64 Ubuntu 22.04 machine:
 
-- **Compiled:** every C example of this note (`hellop`, `mychar`, `mycdev`, `mydebugfs`, `myip`, `ledbtn`, `mytmp102`, `myspi`, `deferred`, `mydma`) and the userspace test program, against mainline Linux 7.3 (commit `c03c1a145`, 18 October 2026), with `W=1` and the tree's `-Werror`, using gcc 11.4. The kernel was an **x86_64** `defconfig` with `OF`, `GPIOLIB`, `I2C`, `SPI`, `HWMON` and `IIO` added, prepared with `make modules_prepare` only. The drivers are architecture-independent, so this checks their API use; it isn't an Arm build. The `modinfo` and `modpost` messages marked **Real output** come from this build.
+- **Compiled:** every C example of this note (`hellop`, `mychar`, `mycdev`, `mydebugfs`, `myip`, `ledbtn`, `mytmp102`, `myspi`, `deferred`, `mydma`) and the userspace test program, against mainline Linux 7.3 (commit `c03c1a145`, 18 October 2026), with `W=1` and `CONFIG_WERROR=y` (warnings are errors), using gcc 11.4. The kernel was an **x86_64** `defconfig` with `OF`, `GPIOLIB`, `I2C`, `SPI`, `HWMON` and `IIO` added, prepared with `make modules_prepare` only. The drivers are architecture-independent, so this checks their API use; it isn't an Arm build. The `modinfo` and `modpost` messages marked **Real output** come from this build.
 - **Checked:** every example passes `scripts/checkpatch.pl` with no warnings. The device tree of section 11 was compiled with the 7.3 tree's `dtc` on top of `am335x-boneblack.dts` and adds no warnings to the 13 the board's own tree produces. The API names and signatures were read in the 7.3 headers, and their presence was checked again at the `v7.1-rc1` tag.
 - **Not done:** nothing was cross-compiled for Arm, loaded into a kernel, or run on a board or in an emulator. Console output from the board is **Expected**.
 
@@ -1544,7 +1544,7 @@ static int myspi_probe(struct spi_device *spi)
 - **`spi_w8r8()`** writes one byte and reads one back in a single chip-select assertion; `spi_write_then_read()` does the same for any lengths, and `spi_sync()` runs a `struct spi_message` of several `spi_transfer`s for everything else. All of them sleep. `devm_regmap_init_spi()` gives the same regmap interface as I2C.
 - **The chip ID check** is the SPI version of the I2C "one read in probe": an SPI read from nothing returns all ones or all zeros, never an error.
 - **The table types**: `spi_device_id` and `MODULE_DEVICE_TABLE(spi, ...)`. Without an `of_match_table` entry, an SPI device from the device tree is matched by the part after the comma of its `compatible`, against `id_table`; keep both tables.
-- **A real bug the compile found:** the first version of this driver printed `spi->mode & SPI_MODE_X_MASK` with `%u`. The mask is built from `_BITUL()`, so the expression is an `unsigned long`, and the build failed (**Real output**: `error: format '%u' expects argument of type 'unsigned int', but argument 4 has type 'long unsigned int' [-Werror=format=]`). Kernel builds treat warnings as errors (`CONFIG_WERROR`, on by default), and a format mismatch that's harmless on 32-bit Arm breaks the build on 64-bit.
+- **A real bug the compile found:** the first version of this driver printed `spi->mode & SPI_MODE_X_MASK` with `%u`. The mask is built from `_BITUL()`, so the expression is an `unsigned long`, and the build failed (**Real output**: `error: format '%u' expects argument of type 'unsigned int', but argument 4 has type 'long unsigned int' [-Werror=format=]`). The compile-check build had `CONFIG_WERROR=y`, which `x86_64_defconfig` sets; `omap2plus_defconfig` doesn't (the option defaults to on only with `COMPILE_TEST`, `init/Kconfig`), so the same mistake is only a warning in the board's build. The mismatch is harmless on 32-bit Arm, where `unsigned long` and `unsigned int` have the same size, and a real bug on 64-bit: compile-check drivers with `W=1` on a 64-bit configuration too (section 20).
 
 **spidev** gives userspace raw access through `/dev/spidev0.0`, for testing a chip before writing a driver. It refuses to bind from a node whose only compatible is `"spidev"` (**From source**: `drivers/spi/spidev.c`). Bind it by hand instead:
 
@@ -1554,3 +1554,202 @@ static int myspi_probe(struct spi_device *spi)
 ```
 
 then use `spidev_test` from `tools/spi/` in the kernel tree.
+
+## 17. Use a subsystem, not a character device
+
+The `mychar` device of Part 2 invents its own interface: its own ioctls, its own read format. Nothing in userspace knows it. For most hardware, the kernel already has a **subsystem** that defines the interface, provides the userspace ABI, and handles the generic parts (sysfs files, units, events, permissions). The driver then only implements a few callbacks. This is the most important design decision in a driver, and it's made before writing any code.
+
+| The hardware | Subsystem | Userspace sees | Driver implements |
+|---|---|---|---|
+| Temperature, voltage, fan, power monitors | **hwmon** (`drivers/hwmon/`) | `/sys/class/hwmon/hwmonN/temp1_input`; `sensors` (lm-sensors) | `read()` and `write()` per channel |
+| ADCs, DACs, accelerometers, gyroscopes, light, pressure, humidity | **IIO** (`drivers/iio/`) | `/sys/bus/iio/devices/iio:deviceN/in_*_raw`, `*_scale`; buffered capture in `/dev/iio:deviceN` | Channel descriptions and `read_raw()` |
+| Buttons, keyboards, touchscreens, joysticks | **input** (`drivers/input/`) | `/dev/input/eventN`; evtest, libinput | Report events with `input_report_key()` |
+| LEDs | **LED class** (`drivers/leds/`) | `/sys/class/leds/<name>/brightness`, `trigger` | `brightness_set()` |
+| GPIO expanders | **gpiolib** (`drivers/gpio/`) | Other drivers' GPIOs; `/dev/gpiochipN` | `get()`, `set()`, `direction_*()` |
+| PWM controllers | **PWM** | Other drivers; `/sys/class/pwm/` | `apply()` |
+| Real-time clocks | **RTC** | `/dev/rtcN`; `hwclock` | `read_time()`, `set_time()` |
+| Watchdogs | **watchdog** | `/dev/watchdogN`; systemd | `start()`, `stop()`, `ping()` |
+| Displays | **DRM** (`drivers/gpu/drm/`); small panels with `drm_mipi_dbi` or the `solomon` driver for SSD130x | `/dev/dri/cardN`; fbdev emulation | Mode setting, plane updates |
+| Serial-attached chips (GPS, Bluetooth, modems) on a UART | **serdev** | No tty; the device's own subsystem | `receive_buf()` |
+| EEPROMs, OTP, fuses | **nvmem** | `/sys/bus/nvmem/devices/*/nvmem` | `reg_read()` |
+| Network interfaces | **netdev** ([networking fundamentals](../../networking/fundamentals/fundamentals_v1_2026-10-29.md), [Wi-Fi](../../../wireless-protocols-and-connectivity/wifi/wifi_v1_2026-11-01.md)) | `eth0`, `wlan0` | `ndo_start_xmit()`, NAPI |
+
+A character device is right only when nothing in this table fits.
+
+**hwmon for the TMP102.** The rest of `mytmp102.c` (**Real**: compiled):
+
+```c
+static int mytmp102_read(struct device *dev, enum hwmon_sensor_types type,
+			 u32 attr, int channel, long *val)
+{
+	struct regmap *map = dev_get_drvdata(dev);
+	unsigned int raw;
+	int ret;
+
+	if (type != hwmon_temp || attr != hwmon_temp_input)
+		return -EOPNOTSUPP;
+
+	ret = regmap_read(map, TMP102_TEMP_REG, &raw);
+	if (ret)
+		return ret;
+
+	/* millidegrees Celsius, as hwmon expects */
+	*val = DIV_ROUND_CLOSEST(sign_extend32(raw >> 4, 11) * 1000, 16);
+	return 0;
+}
+
+static const struct hwmon_ops mytmp102_ops = {
+	.visible	= 0444,
+	.read		= mytmp102_read,
+};
+
+static const struct hwmon_channel_info * const mytmp102_info[] = {
+	HWMON_CHANNEL_INFO(temp, HWMON_T_INPUT),
+	NULL
+};
+
+static const struct hwmon_chip_info mytmp102_chip = {
+	.ops	= &mytmp102_ops,
+	.info	= mytmp102_info,
+};
+```
+
+- **`HWMON_CHANNEL_INFO(temp, HWMON_T_INPUT)`** declares one temperature channel with an `input` attribute. The hwmon core creates `temp1_input` from it; adding `HWMON_T_MAX | HWMON_T_MIN` would create `temp1_max` and `temp1_min`, served by the same `read()` with a different `attr`.
+- **Units are fixed by the ABI**: millidegrees Celsius for temperatures (`Documentation/hwmon/sysfs-interface.rst`). The conversion uses integers only: `sign_extend32(raw >> 4, 11)` turns the 12-bit field into a signed number, and multiplying by 1000/16 gives millidegrees. 0x1900 (25 °C) gives 25000; 0xE700 (−25 °C) gives −25000.
+- **`.visible = 0444`** sets one mode for every attribute; drivers with mixed read-only and writable attributes provide an `is_visible()` callback instead.
+- **The private data** passed to `devm_hwmon_device_register_with_info()` (here the regmap) comes back through `dev_get_drvdata()` on the hwmon device in `read()`.
+
+On the board (**Expected**):
+
+```
+# cat /sys/class/hwmon/hwmon0/name
+mytmp102
+# cat /sys/class/hwmon/hwmon0/temp1_input
+23562
+# sensors
+mytmp102-i2c-2-48
+Adapter: OMAP I2C adapter
+temp1:        +23.6°C
+```
+
+Everything that reads hwmon (monitoring agents, `sensors`, thermal policies) now works with this chip, with no new code in userspace.
+
+**The best driver is no driver.** The `ledbtn` driver of section 11 was an exercise. An LED and a button on GPIOs need no new code at all: the generic `gpio-leds` and `gpio-keys` drivers do it from the device tree (**Real**: this file was compiled with the 7.3 `dtc` on top of `am335x-boneblack.dts`, with no new warnings):
+
+```dts
+// SPDX-License-Identifier: GPL-2.0
+/dts-v1/;
+#include "am335x-boneblack.dts"
+#include <dt-bindings/input/input.h>
+#include <dt-bindings/leds/common.h>
+
+/ {
+	ext-leds {
+		compatible = "gpio-leds";
+		pinctrl-names = "default";
+		pinctrl-0 = <&ext_led_pins>;
+
+		led-0 {
+			gpios = <&gpio1 28 GPIO_ACTIVE_HIGH>;		/* P9_12 */
+			function = LED_FUNCTION_STATUS;
+			color = <LED_COLOR_ID_GREEN>;
+			linux,default-trigger = "heartbeat";
+		};
+	};
+
+	ext-keys {
+		compatible = "gpio-keys";
+		pinctrl-names = "default";
+		pinctrl-0 = <&ext_key_pins>;
+
+		key-enter {
+			label = "P9_15 button";
+			gpios = <&gpio1 16 GPIO_ACTIVE_LOW>;		/* P9_15 */
+			linux,code = <KEY_ENTER>;
+			debounce-interval = <20>;			/* ms */
+		};
+	};
+};
+
+&am33xx_pinmux {
+	ext_led_pins: ext-led-pins {
+		pinctrl-single,pins = <
+			AM33XX_PADCONF(AM335X_PIN_GPMC_BEN1, PIN_OUTPUT, MUX_MODE7)
+		>;
+	};
+
+	ext_key_pins: ext-key-pins {
+		pinctrl-single,pins = <
+			AM33XX_PADCONF(AM335X_PIN_GPMC_A0, PIN_INPUT_PULLUP, MUX_MODE7)
+		>;
+	};
+};
+```
+
+The LED appears as `/sys/class/leds/green:status/` (the name is built from `color` and `function`) with every LED trigger available: `heartbeat`, `timer` with its `delay_on` and `delay_off`, `netdev`, `mmc0`. The button becomes an input device that sends `KEY_ENTER`, readable with `evtest /dev/input/event0`, and it can wake the board from suspend with `wakeup-source;`. Both drivers are in `omap2plus_defconfig` as modules (`CONFIG_LEDS_GPIO=m`, `CONFIG_KEYBOARD_GPIO=m`, `CONFIG_LEDS_TRIGGER_HEARTBEAT=m`). Before writing a driver, search `Documentation/devicetree/bindings/` for the device's function: a generic binding often already exists.
+
+## 18. Memory and DMA
+
+**Allocating memory:**
+
+| Call | Gives | Use |
+|---|---|---|
+| `kmalloc(size, gfp)`, `kzalloc()` (zeroed), `kcalloc(n, size, gfp)` (zeroed, checks `n * size` for overflow) | Physically contiguous memory from the slab allocator | The default for structures and buffers. Free with `kfree()` |
+| `devm_kzalloc(dev, size, gfp)` | The same, freed when the driver unbinds | Per-device structures in `probe()` |
+| `vmalloc(size)`, `kvmalloc(size, gfp)` | Virtually contiguous memory, possibly many scattered pages | Large tables that the CPU only uses. `kvmalloc()` tries `kmalloc()` first. Free with `vfree()` or `kvfree()` |
+| `kmem_cache_create()` + `kmem_cache_alloc()` | Many objects of one size | A driver that allocates the same structure thousands of times |
+| `alloc_pages(gfp, order)` | 2^order physical pages | Rarely in drivers |
+| `dma_alloc_coherent()`, `dmam_alloc_coherent()` | Memory a device can access with DMA | Below |
+
+**GFP flags** say what the allocator may do to find memory:
+
+- **`GFP_KERNEL`**: may sleep, reclaim memory, write pages back. The normal case in process context.
+- **`GFP_ATOMIC`**: never sleeps, may dip into emergency reserves, fails more easily. Only where sleeping isn't allowed: interrupt handlers, timer callbacks, code holding a spinlock. Always check for `NULL`.
+- **`GFP_NOWAIT`**: never sleeps, no reserves. For allocations that have a fallback.
+
+Every allocation can fail: check the result, return `-ENOMEM`. A `kmalloc()` above a few pages may fail on a fragmented system even when there is free memory, because it needs physically contiguous pages; allocate large buffers once at probe time, not on every request. `KMALLOC_MAX_SIZE` (`include/linux/slab.h`) is the hard limit.
+
+**Why DMA needs its own API.** A DMA-capable device reads and writes RAM by physical (bus) address, without the CPU. Two things go wrong if the driver hands it an ordinary pointer:
+
+- **The address.** The device needs a *DMA address*, which may differ from the physical address (an IOMMU, a bus offset) and must be within what the device can reach.
+- **The caches.** The Cortex-A8 has data caches that DMA doesn't see. A buffer the CPU just wrote may still be in the cache when the device reads RAM; a buffer the device just wrote may be shadowed by stale cache lines when the CPU reads it. On the AM3358 nothing keeps them coherent in hardware, so the DMA API does cache maintenance.
+
+**The two styles** (`mydma.c`, **Real**: compiled):
+
+```c
+	ret = dma_set_mask_and_coherent(dev, DMA_BIT_MASK(32));
+	if (ret)
+		return dev_err_probe(dev, ret, "no usable DMA\n");
+
+	/* Coherent: CPU and device share it for the driver's lifetime. */
+	ring = dmam_alloc_coherent(dev, RING_BYTES, &ring_dma, GFP_KERNEL);
+	if (!ring)
+		return -ENOMEM;
+
+	/* Streaming: map an ordinary buffer for one transfer. */
+	buf = devm_kzalloc(dev, BUF_BYTES, GFP_KERNEL);
+	if (!buf)
+		return -ENOMEM;
+	buf_dma = dma_map_single(dev, buf, BUF_BYTES, DMA_TO_DEVICE);
+	if (dma_mapping_error(dev, buf_dma))
+		return -ENOMEM;
+	/* ... write buf_dma into a descriptor, start the device, wait ... */
+	dma_unmap_single(dev, buf_dma, BUF_BYTES, DMA_TO_DEVICE);
+
+	dev_info(dev, "ring at %pad, buffer was at %pad\n", &ring_dma, &buf_dma);
+```
+
+| | Coherent | Streaming |
+|---|---|---|
+| Allocated with | `dma_alloc_coherent()` | Any `kmalloc()` buffer, then `dma_map_single()`, or `dma_map_sg()` for a scatterlist |
+| Cache behavior | Uncached (on this SoC) or hardware-coherent: CPU and device always agree | The map and unmap calls clean or invalidate the cache for that buffer |
+| Ownership | Shared at all times | The device owns the buffer between map and unmap. The CPU must not touch it then, unless it calls `dma_sync_single_for_cpu()` and gives it back with `dma_sync_single_for_device()` |
+| Use for | Descriptor rings, mailboxes, small control structures | Data buffers: packets, audio periods, sensor samples |
+
+- **`dma_set_mask_and_coherent()`** declares how many address bits the device can drive. 32 bits is the default for platform devices; call it anyway, since it documents the device's limit and checks it.
+- **The direction** (`DMA_TO_DEVICE`, `DMA_FROM_DEVICE`, `DMA_BIDIRECTIONAL`) decides which cache operation runs. Get it right: a wrong direction is a data corruption that appears only under load.
+- **Never map stack memory, `vmalloc()` memory or a structure that shares cache lines with other data.** Allocate DMA buffers on their own with `kmalloc()`.
+- **`%pad`** prints a `dma_addr_t` (pass a pointer to it).
+- **Large buffers**: `dma_alloc_coherent()` of more than a few pages comes from CMA, the contiguous memory allocator, enabled in `omap2plus_defconfig` (`CONFIG_CMA=y`, `CONFIG_DMA_CMA=y`). Its size is set with `cma=` on the command line.
+
+**DMA engines.** Many peripherals (McSPI, UART, McASP on the AM3358) don't do DMA themselves: a shared DMA controller moves the data, here TI's EDMA (`ti,edma3-tpcc` in `am33xx.dtsi`, `drivers/dma/ti/edma.c`). A peripheral driver asks for a channel with `dma_request_chan(dev, "rx")`, matching a `dmas`/`dma-names` pair in its node, prepares a transfer with `dmaengine_prep_slave_sg()`, and submits it. Bus drivers such as SPI already do this, so an SPI device driver gets DMA for large transfers without writing any of it.

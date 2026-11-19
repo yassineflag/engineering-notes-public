@@ -841,7 +841,7 @@ sync
 echo "done; remove the card"
 ```
 
-**Check every script with ShellCheck** (package `shellcheck`): `shellcheck sd-write.sh` finds missing quotes, unused variables and the classic Bash traps, with a wiki page for each warning. When a script grows past a page, or needs data structures, error handling or parsing, Python is usually the better tool. The [Bash folder](../../software/bash/) is the place for the language in depth.
+**Check every script with ShellCheck** (package `shellcheck`): `shellcheck sd-write.sh` finds missing quotes, unused variables and the classic Bash traps, with a wiki page for each warning. When a script grows past a page, or needs data structures, error handling or parsing, Python is usually the better tool. The [Bash folder](../../../software/bash/) is the place for the language in depth.
 
 ## 12. Processes and signals
 
@@ -1815,7 +1815,7 @@ Ubuntu writes `/var/run/reboot-required` when an upgrade needs a reboot; on Debi
 
 ## 24. Not covered here
 
-- **Bash as a language** (arrays, parameter expansion in depth, `getopts`, traps): the [Bash folder](../../software/bash/).
+- **Bash as a language** (arrays, parameter expansion in depth, `getopts`, traps): the [Bash folder](../../../software/bash/).
 - **How programs talk to the kernel** (system calls, processes and threads from C, IPC): [Linux systems programming](../../linux-systems-programming/).
 - **Networking in depth**, routing, firewalls and gateways: the [networking notes](../../networking/).
 - **Building and booting Linux for a board**: the [embedded Linux notes](../../embedded-linux/).

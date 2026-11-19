@@ -1432,7 +1432,7 @@ The kernel names interfaces by type and probe order; on systemd images, udev ren
 | Name | Created by | Notes |
 |---|---|---|
 | `eth0`, `end0`, `enp1s0` | NIC drivers; renamed by systemd-udevd | `end0`: device-tree based controller (naming scheme v252 and later). `enp1s0`: PCIe NIC |
-| `wlan0` | Wi-Fi driver | See [Wi-Fi for Embedded Linux Engineers](../../wireless-protocols-and-connectivity/wifi/wifi_v1_2026-11-01.md) |
+| `wlan0` | Wi-Fi driver | See [Wi-Fi for Embedded Linux Engineers](../../../wireless-protocols-and-connectivity/wifi/wifi_v1_2026-11-01.md) |
 | `wwan0` | `qmi_wwan`, `cdc_mbim` (USB modems), or links of the kernel's WWAN framework | Cellular data, often raw-IP |
 | `qmimux0` | `qmi_wwan` with QMAP multiplexing enabled | One per multiplexed data session |
 | `rmnet_data0` (name chosen at creation; a Qualcomm convention) | `rmnet` on top of `qmi_wwan`, MHI or IPA | Qualcomm MAP sessions |
@@ -1586,7 +1586,7 @@ IPv6 has no NAT to hide mismatches. Each upstream provides its own prefix, the c
 
 In a cellular product, two processors run separate software. The **application processor** (AP) runs Linux and the product's applications. The **modem** (baseband processor) runs vendor firmware, often an RTOS, sometimes its own Linux, that handles the radio, the cellular protocol stack and the data sessions with the carrier. To Linux, the modem is a peripheral that offers two kinds of interfaces: one to **control** it, one to carry **data**.
 
-This section covers the networking architecture and packet paths, not the radio. Hands-on modem commands for one module (a Quectel EC25 over QMI) are in the [gateway note](../gateway/gateway_v1_2026-10-26.md#method-2-cellular-modem-quectel-ec25); deeper modem integration (USB compositions, QMI/MBIM details, firmware) belongs in a dedicated note. The cellular protocols themselves (registration, sessions, reject causes, power saving) are in [Cellular Protocols](../../wireless-protocols-and-connectivity/cellular/cellular_v1_2026-11-02.md).
+This section covers the networking architecture and packet paths, not the radio. Hands-on modem commands for one module (a Quectel EC25 over QMI) are in the [gateway note](../gateway/gateway_v1_2026-10-26.md#method-2-cellular-modem-quectel-ec25); deeper modem integration (USB compositions, QMI/MBIM details, firmware) belongs in a dedicated note. The cellular protocols themselves (registration, sessions, reject causes, power saving) are in [Cellular Protocols](../../../wireless-protocols-and-connectivity/cellular/cellular_v1_2026-11-02.md).
 
 ### Who does what
 
@@ -2030,9 +2030,9 @@ Topics for separate, more advanced notes:
 - **USB gadget in depth**: composite gadgets, Windows driver binding (OS descriptors), fixed MAC addresses, gadget and OTG controllers.
 - **Socket programming**: the `socket()` API, blocking vs non-blocking I/O, framing TCP streams, `epoll` ([linux-systems-programming/](../../linux-systems-programming/)).
 - **Kernel network stack internals**: `sk_buff`, NAPI, GRO/GSO, XDP and eBPF, socket buffers and their sysctls.
-- **Network driver development**: MAC drivers, PHY and MDIO, `phylink`, DSA switch drivers, WWAN drivers ([linux-kernel-device-driver-development/](../../linux-kernel-device-driver-development/)).
+- **Network driver development**: MAC drivers, PHY and MDIO, `phylink`, DSA switch drivers, WWAN drivers ([linux-kernel-device-driver-development/](../../embedded-linux/linux-kernel-device-driver-development/)).
 - **Network boot**: U-Boot networking, TFTP, NFS root, `ip=` in detail.
-- **Wireless links**: Wi-Fi (now in [its own note](../../wireless-protocols-and-connectivity/wifi/wifi_v1_2026-11-01.md)), cellular radio protocols, GNSS ([wireless-protocols-and-connectivity/](../../wireless-protocols-and-connectivity/)).
+- **Wireless links**: Wi-Fi (now in [its own note](../../../wireless-protocols-and-connectivity/wifi/wifi_v1_2026-11-01.md)), cellular radio protocols, GNSS ([wireless-protocols-and-connectivity/](../../../wireless-protocols-and-connectivity/)).
 - **IPv6 in depth**: privacy addresses, DHCPv6 details, MLD, multicast routing.
 - **QoS design**: HTB hierarchies, DSCP marking, `cake` tuning for variable-rate links.
 - **Device security**: TLS client certificates and provisioning, WireGuard, hardening network services.

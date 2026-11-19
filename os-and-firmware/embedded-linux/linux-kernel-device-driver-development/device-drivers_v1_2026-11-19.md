@@ -1374,3 +1374,183 @@ What it shows:
 | Can't sleep | `udelay(us)`, `ndelay(ns)` | Busy-waits: burns the CPU. Keep it to a few microseconds |
 
 `jiffies` counts timer ticks since boot; compare them with `time_after(a, b)`, never with `>`, because the counter wraps. For timestamps and durations, `ktime_get()` gives a monotonic time in nanoseconds (`ledbtn` uses it for debouncing).
+
+## 15. Concurrency and locking
+
+Every driver of this note is entered from several places at once. `ledbtn` alone has the interrupt thread, the blink work, and sysfs reads and writes from any number of processes, on a single-core BeagleBone as well as on a multi-core board: preemption interrupts a task in the middle of a function and runs another one. Any data touched by two of them, with at least one writing, needs protection.
+
+**Find the shared state first.** For each field, list who reads and who writes it, and from which context (section 3). `ledbtn`:
+
+| Field | Written by | Read by | Contexts |
+|---|---|---|---|
+| `led_on`, `blink_ms` | sysfs `store`, blink work, IRQ thread | sysfs `show`, blink work, IRQ thread | All process context |
+| `presses`, `last_press` | IRQ thread | sysfs `show` | Process context |
+
+Everything is in process context, so one **mutex** per device protects all of it, and it may be held across `gpiod_set_value_cansleep()`, which can sleep.
+
+**Which lock:**
+
+| Lock | Waiting task | Allowed when held | Use it when |
+|---|---|---|---|
+| `struct mutex` | Sleeps | Sleeping calls | Every user is in process context. The default |
+| `spinlock_t` with `spin_lock()` | Spins | Nothing that sleeps; keep it short | Data shared with a softirq or hard IRQ user, or very short critical sections |
+| `spin_lock_bh()` | Spins, softirqs disabled | Same | Shared between process context and a timer or tasklet |
+| `spin_lock_irqsave(&l, flags)` / `spin_lock_irq()` | Spins, local interrupts disabled | Same | Shared with a hard interrupt handler or an hrtimer callback |
+| `atomic_t`, `atomic_long_t`, `refcount_t` | None | | A single counter or flag, not a group of fields |
+| `rw_semaphore`, `rwlock_t`, `seqlock_t` | | | Many readers, rare writers; measure before using them |
+| RCU | Readers never wait | | Read-mostly data structures; read `Documentation/RCU/` first |
+
+The rule behind the spinlock variants: **if a context can interrupt you while you hold the lock, and that context takes the same lock, disable it first.** Otherwise the interrupt spins forever on a lock its own CPU holds. That's why `demo_work_fn()` of section 14 uses `spin_lock_irq()` (the hrtimer callback runs in hard interrupt context and takes the lock), while the callbacks themselves use plain `spin_lock()`: interrupts are already disabled there. `spin_lock_irqsave()` saves and restores the interrupt state, and is the safe choice when you don't know whether interrupts are on.
+
+**Scope-based guards** (`include/linux/cleanup.h`) release the lock when the scope ends, including on every early `return`:
+
+```c
+	guard(mutex)(&lb->lock);		/* until the end of the function */
+	if (lb->blink_ms)
+		return -EBUSY;			/* unlocked here */
+	ledbtn_set_led(lb, on);
+	return count;				/* and here */
+
+	scoped_guard(spinlock_irqsave, &d->lock) {	/* until the closing brace */
+		d->hr_ticks = 0;
+	}
+```
+
+They exist for mutexes, every spinlock variant, RCU and others. They remove the "forgot to unlock on the error path" bug class; the cost is that the end of the critical section is less visible. Don't mix `guard()` and `goto` in the same function.
+
+**Rules that prevent deadlocks:**
+
+- **Never sleep with a spinlock held**: no `mutex_lock()`, `kmalloc(GFP_KERNEL)`, `copy_to_user()`, `msleep()` or I2C transfer.
+- **Take locks in a fixed order.** Two locks taken in opposite orders by two paths deadlock eventually. Document the order next to the lock.
+- **Don't wait for something that needs the lock you hold**: `cancel_work_sync()` on a work item that takes your mutex, `free_irq()` on a handler that takes it, `kthread_stop()` on a thread that waits for it (section 14).
+- **Hold locks briefly**, and never across a call back into userspace.
+
+**Let the kernel check.** `CONFIG_PROVE_LOCKING` (lockdep) records the order in which every lock class is taken and reports a possible deadlock the first time two paths disagree, long before it actually happens. `CONFIG_DEBUG_ATOMIC_SLEEP` reports sleeping in atomic context. Enable both in development kernels (section 19). In code, `lockdep_assert_held(&lb->lock)` documents and checks that a helper like `ledbtn_set_led()` is called with the lock held.
+
+**Atomics** are for single values. `atomic_inc(&d->count)` and `atomic_read()` are safe from any context without a lock, but two atomic operations in a row aren't atomic together, and code like "if counter is 0 then set it to 1" needs `atomic_cmpxchg()` or a lock. For reference counts, use `refcount_t`, which saturates instead of wrapping around.
+
+## 16. I2C and SPI device drivers
+
+I2C and SPI devices are children of their bus controller. The controller's driver (`i2c-omap`, `spi-omap2-mcspi` on the AM3358) registers an **adapter** (I2C) or **controller** (SPI) and creates one device per child node in the device tree. Your driver binds to those devices and calls the bus core to transfer data; it never touches the controller's registers.
+
+```
+ /sys/bus/i2c/devices/i2c-2            the adapter: I2C2 controller, i2c-omap driver
+ /sys/bus/i2c/devices/2-0048           a client: bus 2, address 0x48, mytmp102 driver
+ /sys/bus/spi/devices/spi0.0           a device: SPI0, chip select 0, myspi driver
+```
+
+(The names follow `i2c-core-base.c`, `"%d-%04x"`, and `spi.c`, `"%s.%u"`. The bus numbers come from the `i2c2` and `spi0` aliases in `am33xx.dtsi`.)
+
+**An I2C driver for the TMP102.** The TMP102's temperature register (0x00) holds a 12-bit two's complement value in bits 15 to 4, at 0.0625 °C per bit, sent most significant byte first (TI's TMP102 datasheet, SBOS397). regmap handles the bus (`mytmp102.c`, **Real**: compiled; the hwmon part is explained in section 17):
+
+```c
+#define TMP102_TEMP_REG		0x00
+#define TMP102_CONF_REG		0x01
+#define TMP102_TLOW_REG		0x02
+#define TMP102_THIGH_REG	0x03
+
+static const struct regmap_config mytmp102_regmap = {
+	.reg_bits	= 8,
+	.val_bits	= 16,	/* sent most significant byte first */
+	.max_register	= TMP102_THIGH_REG,
+};
+
+static int mytmp102_probe(struct i2c_client *client)
+{
+	struct device *dev = &client->dev;
+	struct device *hwmon;
+	struct regmap *map;
+	unsigned int conf;
+	int ret;
+
+	map = devm_regmap_init_i2c(client, &mytmp102_regmap);
+	if (IS_ERR(map))
+		return dev_err_probe(dev, PTR_ERR(map), "regmap init failed\n");
+
+	/* One read proves the chip answers at this address. */
+	ret = regmap_read(map, TMP102_CONF_REG, &conf);
+	if (ret)
+		return dev_err_probe(dev, ret, "no answer at 0x%02x\n",
+				     client->addr);
+	dev_dbg(dev, "configuration register 0x%04x\n", conf);
+
+	hwmon = devm_hwmon_device_register_with_info(dev, "mytmp102", map,
+						     &mytmp102_chip, NULL);
+	return PTR_ERR_OR_ZERO(hwmon);
+}
+
+static const struct i2c_device_id mytmp102_id[] = {
+	{ "mytmp102" },
+	{ }
+};
+MODULE_DEVICE_TABLE(i2c, mytmp102_id);
+
+static const struct of_device_id mytmp102_of_match[] = {
+	{ .compatible = "mycompany,mytmp102" },
+	{ }
+};
+MODULE_DEVICE_TABLE(of, mytmp102_of_match);
+
+static struct i2c_driver mytmp102_driver = {
+	.driver = {
+		.name		= "mytmp102",
+		.of_match_table	= mytmp102_of_match,
+	},
+	.probe		= mytmp102_probe,
+	.id_table	= mytmp102_id,
+};
+module_i2c_driver(mytmp102_driver);
+```
+
+- **`probe()` takes only the client** in 7.3 (section 3). `client->addr` is the 7-bit address from `reg`, `client->irq` the interrupt if the node has one, `client->adapter` the bus.
+- **The device is created whether or not the chip is there**: I2C can't detect devices. Reading one register in `probe()` turns a wiring error into a clear probe failure instead of a hwmon device that returns errors. With nothing at 0x48, the transfer isn't acknowledged and returns `-ENXIO` or `-EREMOTEIO`, depending on the controller driver.
+- **Both tables**: `of_match_table` for the device tree, `id_table` for devices created by name, including from userspace (below). `modinfo` shows both as aliases (**Real output**: `i2c:mytmp102` and `of:N*T*Cmycompany,mytmp102`).
+- **Why not `ti,tmp102`?** The mainline `tmp102` driver (`drivers/hwmon/tmp102.c`) already matches it, and `omap2plus_defconfig` builds it as a module (`CONFIG_SENSORS_TMP102=m`): udev would load it and it would take the device. For a chip that has a mainline driver, use that driver; this one exists to show the shape.
+
+**regmap or raw transfers.** Without regmap, the same read is `i2c_smbus_read_word_swapped(client, TMP102_TEMP_REG)` (SMBus "read word", byte-swapped because SMBus sends the low byte first and the TMP102 sends the high byte first), or a full `i2c_transfer()` with two `struct i2c_msg` for arbitrary write-then-read sequences. regmap adds register caching (`.cache_type = REGCACHE_MAPLE` and a list of volatile registers), `regmap_update_bits()` for read-modify-write, range checks against `max_register`, and the debugfs register dump. It's the usual choice for anything with a register map.
+
+**Testing without a device tree change**, on a running board: the adapter can create a client from userspace, matched against `id_table`:
+
+```
+# echo mytmp102 0x48 > /sys/bus/i2c/devices/i2c-2/new_device
+# echo 0x48 > /sys/bus/i2c/devices/i2c-2/delete_device
+```
+
+**i2c-tools** (`i2cdetect`, `i2cget`, `i2cset`, `i2cdump`) check the wiring before any driver exists, through `/dev/i2c-2` (`CONFIG_I2C_CHARDEV`). `i2cdetect -y -r 2` scans the bus; an address shows as `48` if a chip answers and nobody has claimed it, and as `UU` once a driver is bound to it. `i2cget -y 2 0x48 0x00 w` reads the temperature register, byte-swapped (SMBus order). On I2C2, the cape EEPROMs answer at 0x54 to 0x57 when capes are fitted (`am335x-bone-common.dtsi`).
+
+**An SPI driver.** SPI has no addresses: each device has a chip select, set by `reg`, plus a maximum clock (`spi-max-frequency`) and a mode (`spi-cpol`, `spi-cpha` properties; the BMP280 accepts modes 0 and 3, and 0 is the default). The driver's `probe()` gets a `struct spi_device` (`myspi.c`, **Real**: compiled):
+
+```c
+#define BMP280_REG_ID	0xd0	/* bit 7 set: a read in SPI mode */
+#define BMP280_CHIP_ID	0x58
+
+static int myspi_probe(struct spi_device *spi)
+{
+	int id;
+
+	id = spi_w8r8(spi, BMP280_REG_ID);
+	if (id < 0)
+		return dev_err_probe(&spi->dev, id, "SPI transfer failed\n");
+	if (id != BMP280_CHIP_ID)
+		return dev_err_probe(&spi->dev, -ENODEV,
+				     "unexpected chip ID 0x%02x\n", id);
+
+	dev_info(&spi->dev, "BMP280 found, %u Hz, mode bits %#x\n",
+		 spi->max_speed_hz, spi->mode);
+	return 0;
+}
+```
+
+- **`spi_w8r8()`** writes one byte and reads one back in a single chip-select assertion; `spi_write_then_read()` does the same for any lengths, and `spi_sync()` runs a `struct spi_message` of several `spi_transfer`s for everything else. All of them sleep. `devm_regmap_init_spi()` gives the same regmap interface as I2C.
+- **The chip ID check** is the SPI version of the I2C "one read in probe": an SPI read from nothing returns all ones or all zeros, never an error.
+- **The table types**: `spi_device_id` and `MODULE_DEVICE_TABLE(spi, ...)`. Without an `of_match_table` entry, an SPI device from the device tree is matched by the part after the comma of its `compatible`, against `id_table`; keep both tables.
+- **A real bug the compile found:** the first version of this driver printed `spi->mode & SPI_MODE_X_MASK` with `%u`. The mask is built from `_BITUL()`, so the expression is an `unsigned long`, and the build failed (**Real output**: `error: format '%u' expects argument of type 'unsigned int', but argument 4 has type 'long unsigned int' [-Werror=format=]`). Kernel builds treat warnings as errors (`CONFIG_WERROR`, on by default), and a format mismatch that's harmless on 32-bit Arm breaks the build on 64-bit.
+
+**spidev** gives userspace raw access through `/dev/spidev0.0`, for testing a chip before writing a driver. It refuses to bind from a node whose only compatible is `"spidev"` (**From source**: `drivers/spi/spidev.c`). Bind it by hand instead:
+
+```
+# echo spidev > /sys/bus/spi/devices/spi0.0/driver_override
+# echo spi0.0 > /sys/bus/spi/drivers/spidev/bind
+```
+
+then use `spidev_test` from `tools/spi/` in the kernel tree.

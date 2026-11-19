@@ -124,7 +124,7 @@ $ scp ledbtn.ko root@192.168.0.50:/tmp/
 The `Makefile` lists every example of this note:
 
 ```make
-obj-m := hellop.o mychar.o mycdev.o ledbtn.o mytmp102.o myspi.o deferred.o mydma.o
+obj-m := hellop.o mychar.o mycdev.o mydebugfs.o ledbtn.o mytmp102.o myspi.o deferred.o mydma.o
 
 KDIR ?= $(HOME)/bbb/build
 
@@ -143,7 +143,7 @@ Three habits make the loop fast and safe:
 
 **Verification status.** In November 2026, on an x86_64 Ubuntu 22.04 machine:
 
-- **Compiled:** every C example of this note (`hellop`, `mychar`, `mycdev`, `ledbtn`, `mytmp102`, `myspi`, `deferred`, `mydma`) and the userspace test program, against mainline Linux 7.3 (commit `c03c1a145`, 18 October 2026), with `W=1` and the tree's `-Werror`, using gcc 11.4. The kernel was an **x86_64** `defconfig` with `OF`, `GPIOLIB`, `I2C`, `SPI`, `HWMON` and `IIO` added, prepared with `make modules_prepare` only. The drivers are architecture-independent, so this checks their API use; it isn't an Arm build. The `modinfo` and `modpost` messages marked **Real output** come from this build.
+- **Compiled:** every C example of this note (`hellop`, `mychar`, `mycdev`, `mydebugfs`, `ledbtn`, `mytmp102`, `myspi`, `deferred`, `mydma`) and the userspace test program, against mainline Linux 7.3 (commit `c03c1a145`, 18 October 2026), with `W=1` and the tree's `-Werror`, using gcc 11.4. The kernel was an **x86_64** `defconfig` with `OF`, `GPIOLIB`, `I2C`, `SPI`, `HWMON` and `IIO` added, prepared with `make modules_prepare` only. The drivers are architecture-independent, so this checks their API use; it isn't an Arm build. The `modinfo` and `modpost` messages marked **Real output** come from this build.
 - **Checked:** every example passes `scripts/checkpatch.pl` with no warnings. The device tree of section 11 was compiled with the 7.3 tree's `dtc` on top of `am335x-boneblack.dts` and adds no warnings to the 13 the board's own tree produces. The API names and signatures were read in the 7.3 headers, and their presence was checked again at the `v7.1-rc1` tag.
 - **Not done:** nothing was cross-compiled for Arm, loaded into a kernel, or run on a board or in an emulator. Console output from the board is **Expected**.
 
@@ -302,3 +302,449 @@ EXPORT_SYMBOL_GPL(mylib_compute);
 ```
 
 Only exported symbols are visible to other modules. `EXPORT_SYMBOL_GPL` restricts users to GPL-compatible modules, and is what new code uses. `EXPORT_SYMBOL_NS_GPL(sym, "MYLIB")` puts the symbol in a **namespace**; users must declare `MODULE_IMPORT_NS("MYLIB");`. Without it, `modpost` stops with `module uses symbol '...' from namespace 'MYLIB', but does not import it.`, and a module built anyway is refused at load time with the same message (**From source**: `scripts/mod/modpost.c`, `kernel/module/main.c`). Out of tree, the user module needs the provider's `Module.symvers` (`KBUILD_EXTRA_SYMBOLS`, kernel note section 15), and `modprobe` loads the provider first once both are installed and `depmod` has run.
+
+## 5. Character devices: numbers, cdev and the misc shortcut
+
+A **character device** is a file in `/dev` whose operations go to a driver. "Character" means a stream of bytes, as opposed to a block device (fixed-size blocks behind a page cache, for storage) or a network interface (no file at all).
+
+**Device numbers.** The file in `/dev` is only a name. What connects it to the driver is the pair of numbers it carries:
+
+```
+# ls -l /dev/ttyS0 /dev/mychar
+crw-rw----    1 root     dialout     4,  64 ... /dev/ttyS0
+crw-rw-rw-    1 root     root       10, 123 ... /dev/mychar
+```
+
+The `c` is "character device"; `4, 64` is the **major** and **minor** number. The kernel finds the driver from the major (and the minor range it registered), and the driver uses the minor to tell its devices apart. `/proc/devices` lists the registered majors. The kernel stores both in a `dev_t`, built with `MKDEV(major, minor)` and split with `MAJOR()` and `MINOR()`.
+
+Nobody creates these files by hand on a current system. When a driver registers a device with the driver core (`device_create()` or `misc_register()`), the kernel creates the node in **devtmpfs** (mounted on `/dev` by the kernel, `CONFIG_DEVTMPFS_MOUNT`), and sends a uevent so that udev or mdev can fix permissions and add symbolic links ([rootfs note](../fundamentals/04-rootfs/rootfs_v1_2026-11-11.md)).
+
+**The shortcut: a misc device.** For a driver that needs one device file, the misc subsystem does all the registration: major 10, a minor chosen dynamically, the `/dev` node, and the class entry under `/sys/class/misc/`. The complete `mychar` driver of sections 5 to 8 registers itself with these lines (**Real**: compiled in the build of section 2):
+
+```c
+static const struct file_operations mychar_fops = {
+	.owner		= THIS_MODULE,
+	.read		= mychar_read,
+	.write		= mychar_write,
+	.poll		= mychar_poll,
+	.unlocked_ioctl	= mychar_ioctl,
+	.compat_ioctl	= compat_ptr_ioctl,
+};
+
+static struct miscdevice mychar_misc = {
+	.minor	= MISC_DYNAMIC_MINOR,
+	.name	= "mychar",
+	.fops	= &mychar_fops,
+	.mode	= 0666,
+};
+
+module_misc_device(mychar_misc);
+```
+
+`module_misc_device()` generates the init and exit functions that call `misc_register()` and `misc_deregister()`. `.mode` sets the permissions of the node in devtmpfs (**From source**: `drivers/char/misc.c`); `0666` lets any user open it, which is fine for an example and rarely right for a product, where a udev rule should decide.
+
+**The full way: a region, a cdev, a class and a device.** Use it when the driver needs several minors, a major of its own, or its own class name in `/sys/class/`. Four objects, each undone in reverse order (`mycdev.c`, **Real**: compiled):
+
+```c
+#define MYCDEV_COUNT	2		/* /dev/mycdev0 and /dev/mycdev1 */
+#define MYCDEV_BUFSZ	256
+
+struct mycdev {
+	struct cdev cdev;
+	struct device *dev;
+	char buf[MYCDEV_BUFSZ];
+	size_t len;
+};
+
+static dev_t mycdev_base;
+static struct class *mycdev_class;
+static struct mycdev *mycdevs;
+
+static int __init mycdev_init(void)
+{
+	int i, ret;
+
+	ret = alloc_chrdev_region(&mycdev_base, 0, MYCDEV_COUNT, "mycdev");
+	if (ret)
+		return ret;
+
+	mycdev_class = class_create("mycdev");
+	if (IS_ERR(mycdev_class)) {
+		ret = PTR_ERR(mycdev_class);
+		goto err_region;
+	}
+
+	mycdevs = kcalloc(MYCDEV_COUNT, sizeof(*mycdevs), GFP_KERNEL);
+	if (!mycdevs) {
+		ret = -ENOMEM;
+		goto err_class;
+	}
+
+	for (i = 0; i < MYCDEV_COUNT; i++) {
+		dev_t devt = MKDEV(MAJOR(mycdev_base), MINOR(mycdev_base) + i);
+
+		cdev_init(&mycdevs[i].cdev, &mycdev_fops);
+		mycdevs[i].cdev.owner = THIS_MODULE;
+		ret = cdev_add(&mycdevs[i].cdev, devt, 1);
+		if (ret)
+			goto err_devices;
+
+		mycdevs[i].dev = device_create(mycdev_class, NULL, devt, NULL,
+					       "mycdev%d", i);
+		if (IS_ERR(mycdevs[i].dev)) {
+			ret = PTR_ERR(mycdevs[i].dev);
+			cdev_del(&mycdevs[i].cdev);
+			goto err_devices;
+		}
+	}
+
+	pr_info("major %d, minors %d-%d\n", MAJOR(mycdev_base),
+		MINOR(mycdev_base), MINOR(mycdev_base) + MYCDEV_COUNT - 1);
+	return 0;
+
+err_devices:
+	while (--i >= 0) {
+		device_destroy(mycdev_class, mycdevs[i].cdev.dev);
+		cdev_del(&mycdevs[i].cdev);
+	}
+	kfree(mycdevs);
+err_class:
+	class_destroy(mycdev_class);
+err_region:
+	unregister_chrdev_region(mycdev_base, MYCDEV_COUNT);
+	return ret;
+}
+```
+
+| Call | Does | Undone by |
+|---|---|---|
+| `alloc_chrdev_region(&base, first_minor, count, name)` | Reserves `count` minors under a free major, chosen counting down from 254 (then from 511) (`include/linux/fs.h`, `fs/char_dev.c`). The name appears in `/proc/devices` | `unregister_chrdev_region()` |
+| `class_create(name)` | Creates `/sys/class/<name>/` | `class_destroy()` |
+| `cdev_init()` + `cdev_add()` | Connects the numbers to the `file_operations`. From this call on, `open()` can reach the driver | `cdev_del()` |
+| `device_create(class, parent, devt, drvdata, fmt, ...)` | Creates the device object, its sysfs directory, and the `/dev` node | `device_destroy()` |
+
+Two orders matter. Call `cdev_add()` only when the driver is ready for an `open()`, because one can arrive immediately. And on removal, remove the device node first and free the memory last; an open file can still call `read()` until it's closed, which is why `cdev.owner = THIS_MODULE` keeps the module from being unloaded while a file is open. A driver whose per-device structure lives as long as a `struct device` uses `cdev_device_add()`, which adds both in the right order.
+
+**Fixed majors** (`register_chrdev_region()` with a number from `Documentation/admin-guide/devices.txt`) are for devices with an official number. New drivers allocate dynamically.
+
+## 6. File operations: open, read, write and release
+
+`struct file_operations` is the table of functions the VFS calls for each system call on the device file:
+
+| System call | Callback | Notes |
+|---|---|---|
+| `open()` | `int (*open)(struct inode *, struct file *)` | Optional. Allocate per-open state here, store it in `file->private_data` |
+| `close()` (last reference) | `int (*release)(struct inode *, struct file *)` | Called once per `struct file`, after the last `close()` of every duplicated descriptor. Free per-open state here |
+| `read()` | `ssize_t (*read)(struct file *, char __user *, size_t, loff_t *)` | Return bytes copied, 0 for end of file, or a negative errno |
+| `write()` | `ssize_t (*write)(struct file *, const char __user *, size_t, loff_t *)` | Return bytes consumed, or a negative errno |
+| `ioctl()` | `long (*unlocked_ioctl)(struct file *, unsigned int, unsigned long)` | Section 7 |
+| `poll()`, `select()`, `epoll` | `__poll_t (*poll)(struct file *, struct poll_table_struct *)` | Section 8 |
+| `lseek()` | `loff_t (*llseek)(struct file *, loff_t, int)` | Unset: `lseek()` fails with `ESPIPE`. `default_llseek` for a file with positions |
+| `mmap()` | `int (*mmap)(struct file *, struct vm_area_struct *)` | Map device memory or a buffer into the process (not covered) |
+
+**Finding your data.** Three ways, from the simplest:
+
+- **One device, global state:** the `mychar` example keeps its FIFO in static variables.
+- **A misc device:** `misc_open()` sets `file->private_data` to the `struct miscdevice` before calling your `open` (**From source**: `drivers/char/misc.c`). Embed the `miscdevice` in your structure and use `container_of()` to get back to it.
+- **A cdev:** the inode points to the cdev, and the cdev is embedded in your structure, so `open` does
+
+  ```c
+  static int mycdev_open(struct inode *inode, struct file *file)
+  {
+  	/* Find our structure from the cdev embedded in it. */
+  	file->private_data = container_of(inode->i_cdev, struct mycdev, cdev);
+  	return 0;
+  }
+  ```
+
+  and every other callback reads `file->private_data`. `container_of(ptr, type, member)` is the kernel's way of going from a member to the structure that contains it; it's everywhere.
+
+**User memory.** `buf` in `read()` and `write()` is an address in the calling process. Dereferencing it directly is a bug, even when it seems to work: the page may be absent (the access must be allowed to fault and sleep), the address may point into the kernel (a security hole), and on systems with privileged-access protection the CPU traps the access. Always copy:
+
+| Function | Returns |
+|---|---|
+| `copy_to_user(to, from, n)`, `copy_from_user(to, from, n)` | The number of bytes **not** copied; 0 on success. Return `-EFAULT` when it isn't 0 |
+| `get_user(x, ptr)`, `put_user(x, ptr)` | One value of the pointer's type; 0 or `-EFAULT` |
+| `simple_read_from_buffer()`, `simple_write_to_buffer()` | Bytes copied, handling `*ppos` and the bounds. Ideal for a device that is a small buffer |
+| `kfifo_to_user()`, `kfifo_from_user()` | Copy between a kfifo and userspace; the byte count in their last argument |
+
+All of them can sleep, so never call them with a spinlock held.
+
+**The `mychar` read path.** Section 8 explains the loop; the copy itself is one call, done with the mutex held so that two readers can't take the same bytes (**Real**: compiled):
+
+```c
+	ret = kfifo_to_user(&fifo, buf, count, &copied);
+	mutex_unlock(&fifo_lock);
+	if (ret)
+		return ret;
+
+	wake_up_interruptible(&writeq);
+	return copied;
+```
+
+**Return values that userspace understands.** A `read()` that returns fewer bytes than asked is normal; `cat` calls again. A `read()` that returns 0 means end of file and stops `cat`. `-EAGAIN` with `O_NONBLOCK`, `-EFAULT` for a bad pointer, `-EINVAL` for a bad argument, `-ERESTARTSYS` when a signal interrupted a wait (the kernel turns it into `EINTR` or restarts the call). `write()` must not return 0 for a non-zero count, or a well-behaved program loops forever.
+
+**`*ppos`** is the file position. A stream device like `mychar` ignores it. A device that represents a fixed buffer (`mycdev`) uses it, and then sets `.llseek = default_llseek` so that `lseek()` works.
+
+## 7. ioctl
+
+`ioctl()` carries commands that aren't reads or writes: reset the device, get statistics, set a mode. Each command is a 32-bit number that encodes its direction, the size of its argument, a "magic" type byte and a sequence number, built with macros from `<linux/ioctl.h>` (**From source**: `include/uapi/asm-generic/ioctl.h`, 8 bits of number, 8 of type, 14 of size, 2 of direction).
+
+**The commands go in a UAPI header** that both the driver and userspace include (`mychar.h`, **Real**: compiled into both):
+
+```c
+/* SPDX-License-Identifier: GPL-2.0 WITH Linux-syscall-note */
+#ifndef _UAPI_MYCHAR_H
+#define _UAPI_MYCHAR_H
+
+#include <linux/ioctl.h>
+#include <linux/types.h>
+
+struct mychar_stats {
+	__u32 used;	/* bytes waiting in the FIFO */
+	__u32 size;	/* FIFO capacity in bytes */
+};
+
+#define MYCHAR_IOC_MAGIC	0xBB
+#define MYCHAR_IOC_RESET	_IO(MYCHAR_IOC_MAGIC, 0)
+#define MYCHAR_IOC_GET_STATS	_IOR(MYCHAR_IOC_MAGIC, 1, struct mychar_stats)
+
+#endif /* _UAPI_MYCHAR_H */
+```
+
+- **`_IO`** has no argument, **`_IOR`** returns data to userspace ("read" from the caller's point of view), **`_IOW`** sends data to the driver, **`_IOWR`** both. The size of the third argument becomes part of the number, so changing the structure changes the command, which is what you want.
+- **Pick a magic number nobody uses.** `Documentation/userspace-api/ioctl/ioctl-number.rst` lists the registered ones; `0xBB` isn't in the 7.3 list. A collision doesn't break your driver, but it lets a program that opened the wrong file run another driver's command.
+- **Use fixed-size types** (`__u32`, `__u64`) and lay out structures so they have no padding and the same layout on 32-bit and 64-bit userspace. Then `.compat_ioctl = compat_ptr_ioctl` is enough for a 32-bit program on a 64-bit kernel.
+- The `Linux-syscall-note` exception lets non-GPL programs include the header.
+
+**The driver side** (**Real**: compiled):
+
+```c
+static long mychar_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
+{
+	struct mychar_stats st = { };
+
+	switch (cmd) {
+	case MYCHAR_IOC_RESET:
+		scoped_guard(mutex, &fifo_lock)
+			kfifo_reset(&fifo);
+		wake_up_interruptible(&writeq);
+		return 0;
+
+	case MYCHAR_IOC_GET_STATS:
+		scoped_guard(mutex, &fifo_lock) {
+			st.used = kfifo_len(&fifo);
+			st.size = kfifo_size(&fifo);
+		}
+		if (copy_to_user((void __user *)arg, &st, sizeof(st)))
+			return -EFAULT;
+		return 0;
+
+	default:
+		return -ENOTTY;
+	}
+}
+```
+
+- **Unknown commands return `-ENOTTY`** ("inappropriate ioctl for device"), which is what userspace tools expect, not `-EINVAL`.
+- **Zero the structure** (`= { }`) before filling it. Any byte you copy to userspace that you didn't set leaks old kernel memory.
+- **Check permissions** for commands that change the device for everyone: `if (!capable(CAP_SYS_ADMIN)) return -EPERM;`.
+- **Prefer something else when it fits.** Every ioctl is new ABI that you must keep forever. A sysfs attribute (section 9) is better for a single value, and a subsystem (section 17) is better than either when one exists.
+
+## 8. Blocking I/O and poll
+
+A `read()` on an empty `mychar` shouldn't return 0, which would mean "end of file", and shouldn't spin. It should put the caller to sleep until data arrives, unless the file was opened with `O_NONBLOCK`. The kernel's mechanism is the **wait queue**: a list of sleeping tasks, woken by whoever makes the condition true.
+
+```c
+static DEFINE_KFIFO(fifo, unsigned char, MYCHAR_FIFO_SIZE);
+static DEFINE_MUTEX(fifo_lock);		/* serializes readers and writers */
+static DECLARE_WAIT_QUEUE_HEAD(readq);	/* readers wait for data */
+static DECLARE_WAIT_QUEUE_HEAD(writeq);	/* writers wait for room */
+
+static ssize_t mychar_read(struct file *file, char __user *buf,
+			   size_t count, loff_t *ppos)
+{
+	unsigned int copied;
+	int ret;
+
+	for (;;) {
+		if (mutex_lock_interruptible(&fifo_lock))
+			return -ERESTARTSYS;
+		if (!kfifo_is_empty(&fifo))
+			break;			/* data, and the lock is held */
+		mutex_unlock(&fifo_lock);
+
+		if (file->f_flags & O_NONBLOCK)
+			return -EAGAIN;
+		if (wait_event_interruptible(readq, !kfifo_is_empty(&fifo)))
+			return -ERESTARTSYS;	/* a signal arrived */
+	}
+
+	ret = kfifo_to_user(&fifo, buf, count, &copied);
+	mutex_unlock(&fifo_lock);
+	if (ret)
+		return ret;
+
+	wake_up_interruptible(&writeq);
+	return copied;
+}
+```
+
+The pattern, which every blocking driver repeats:
+
+1. **Check the condition with the lock held.** If it's true, keep the lock and go on.
+2. **Otherwise drop the lock before sleeping.** Sleeping with the lock held would block the writer that is supposed to wake you.
+3. **`wait_event_interruptible(queue, condition)`** sleeps until `condition` is true, re-checking it after each wake-up. It returns non-zero when a signal arrives, and the driver returns `-ERESTARTSYS` so that Ctrl-C works.
+4. **Loop**, because another reader may have taken the data between the wake-up and the lock.
+5. **The other side wakes the queue** after changing the condition: `mychar_write()` calls `wake_up_interruptible(&readq)` after adding bytes.
+
+The `_interruptible` variants are the right default for anything a user waits on. `wait_event_timeout()` and `wait_event_interruptible_timeout()` add a timeout in jiffies (`msecs_to_jiffies(500)`); `wait_event()` without `interruptible` makes the process unkillable while it waits, so use it only for short waits on hardware.
+
+**poll.** `poll()`, `select()` and `epoll` ask the driver two questions: "which operations would not block right now?" and "which wait queues should wake me when that changes?". The driver answers both in one callback (**Real**: compiled):
+
+```c
+static __poll_t mychar_poll(struct file *file, poll_table *wait)
+{
+	__poll_t mask = 0;
+
+	poll_wait(file, &readq, wait);
+	poll_wait(file, &writeq, wait);
+
+	guard(mutex)(&fifo_lock);
+	if (!kfifo_is_empty(&fifo))
+		mask |= EPOLLIN | EPOLLRDNORM;
+	if (!kfifo_is_full(&fifo))
+		mask |= EPOLLOUT | EPOLLWRNORM;
+	return mask;
+}
+```
+
+`poll_wait()` doesn't sleep: it registers the queues. The kernel sleeps afterwards, if the mask is empty, and calls `->poll()` again after any wake-up of those queues. So the only rule is that whatever changes the answer must wake one of the registered queues, which `mychar_read()` and `mychar_write()` already do. The same callback serves `select`, `poll` and `epoll`.
+
+**Testing it from userspace.** A short program exercises each path (**Real**: compiled with the build machine's gcc; the output below is **Expected**, since the module wasn't loaded):
+
+```c
+	fd = open("/dev/mychar", O_RDWR | O_NONBLOCK);
+	n = read(fd, buf, sizeof(buf));			/* empty FIFO */
+	printf("read on empty FIFO: %zd (%s)\n", n, n < 0 ? strerror(errno) : "data");
+	write(fd, "hello", 5);
+	ioctl(fd, MYCHAR_IOC_GET_STATS, &st);
+	printf("stats: used %u of %u bytes\n", st.used, st.size);
+	pfd.fd = fd;
+	pfd.events = POLLIN;
+	if (poll(&pfd, 1, 1000) == 1 && (pfd.revents & POLLIN)) { ... read ... }
+	ioctl(fd, 0);					/* unknown command */
+```
+
+```
+# ./mychar_test
+read on empty FIFO: -1 (Resource temporarily unavailable)
+stats: used 5 of 4096 bytes
+poll: readable, read 5 bytes: "hello"
+unknown ioctl: Inappropriate ioctl for device
+```
+
+And from the shell, the blocking path: `cat /dev/mychar` waits in one terminal; `echo hi > /dev/mychar` in another makes it print `hi`. Ctrl-C ends the `cat` through the `-ERESTARTSYS` path.
+
+## 9. sysfs, debugfs and procfs
+
+Three virtual filesystems carry driver information besides `/dev`. They're for different readers:
+
+| | sysfs (`/sys`) | debugfs (`/sys/kernel/debug`) | procfs (`/proc`) |
+|---|---|---|---|
+| For | Configuration and status that tools and scripts rely on | Developers | Processes and the kernel's own state |
+| ABI | **Stable.** Every attribute is ABI, documented in `Documentation/ABI/` | None. Can change at any time; may not be mounted | Stable, but closed to new device files |
+| Format | One value per file, text | Anything | Anything, historically |
+| Use it for in a driver | A mode, a threshold, a counter, a state | Register dumps, internal statistics, fault injection | Nothing new: don't add driver files here |
+
+**sysfs attributes on the device.** Every `struct device` has a directory under `/sys/devices/`, reachable through `/sys/bus/<bus>/devices/<name>/` and, for classes, `/sys/class/<class>/<name>/`. A driver adds files to it with attributes. The `ledbtn` driver of section 11 has three; one of them (**Real**: compiled):
+
+```c
+static ssize_t led_show(struct device *dev, struct device_attribute *attr,
+			char *buf)
+{
+	struct ledbtn *lb = dev_get_drvdata(dev);
+
+	guard(mutex)(&lb->lock);
+	return sysfs_emit(buf, "%d\n", lb->led_on);
+}
+
+static ssize_t led_store(struct device *dev, struct device_attribute *attr,
+			 const char *buf, size_t count)
+{
+	struct ledbtn *lb = dev_get_drvdata(dev);
+	bool on;
+	int ret;
+
+	ret = kstrtobool(buf, &on);
+	if (ret)
+		return ret;
+
+	guard(mutex)(&lb->lock);
+	if (lb->blink_ms)
+		return -EBUSY;
+	ledbtn_set_led(lb, on);
+	return count;
+}
+static DEVICE_ATTR_RW(led);
+
+static struct attribute *ledbtn_attrs[] = {
+	&dev_attr_led.attr,
+	&dev_attr_blink_ms.attr,
+	&dev_attr_presses.attr,
+	NULL
+};
+ATTRIBUTE_GROUPS(ledbtn);
+```
+
+- **`DEVICE_ATTR_RW(led)`** declares `dev_attr_led` with mode 0644 and expects functions named exactly `led_show` and `led_store`. `DEVICE_ATTR_RO` (0444, `_show` only) and `DEVICE_ATTR_WO` (0200, `_store` only) follow the same naming.
+- **`show()` writes into a page-sized buffer** with `sysfs_emit()`, which knows the bounds; `sprintf()` into `buf` is what old code does and `checkpatch` flags it.
+- **`store()` parses** with the `kstrto*()` family (`kstrtouint`, `kstrtobool`, `kstrtoint`), which reject trailing garbage and accept the newline `echo` adds. It returns `count` on success.
+- **Register the group through the driver**, `.driver.dev_groups = ledbtn_groups` (section 11). The driver core then creates the files after `probe()` succeeds and removes them before `remove()` (`drivers/base/dd.c`), so userspace can never see a file whose device isn't ready. Creating attributes by hand with `device_create_file()` in `probe()` opens a window where udev has already seen the device but the files don't exist yet.
+- **Let userspace wait for a change.** `sysfs_notify(&dev->kobj, NULL, "presses")` wakes anyone polling the file. A sysfs file always reports `EPOLLERR|EPOLLPRI` to `poll()` after a notification (**From source**: `fs/kernfs/file.c`), so a program reads the file, polls for `POLLPRI`, then `lseek(fd, 0, SEEK_SET)` and reads again.
+
+On the board (**Expected**):
+
+```
+# cd /sys/bus/platform/devices/ledbtn/
+# echo 1 > led
+# echo 250 > blink_ms
+# echo 1 > led
+sh: write error: Device or resource busy
+# cat presses
+3
+```
+
+**debugfs** for everything you only need while developing (`mydebugfs.c`, **Real**: compiled):
+
+```c
+static struct dentry *dir;
+static u32 errors;
+static u32 irqs;
+
+static int status_show(struct seq_file *s, void *unused)
+{
+	seq_printf(s, "irqs:   %u\n", irqs);
+	seq_printf(s, "errors: %u\n", errors);
+	return 0;
+}
+DEFINE_SHOW_ATTRIBUTE(status);
+
+static int __init mydebugfs_init(void)
+{
+	/* Errors are ignored on purpose: debugfs is optional. */
+	dir = debugfs_create_dir("mydebugfs", NULL);
+	debugfs_create_u32("errors", 0644, dir, &errors);
+	debugfs_create_file("status", 0444, dir, NULL, &status_fops);
+	return 0;
+}
+
+static void __exit mydebugfs_exit(void)
+{
+	debugfs_remove(dir);	/* removes everything below it too */
+}
+```
+
+`debugfs_create_u32()` exposes a variable as a readable and writable file in one line; `DEFINE_SHOW_ATTRIBUTE(status)` turns a `seq_file` show function into `status_fops`. The debugfs API is designed so that drivers **don't check its return values**: when debugfs is disabled or the directory couldn't be created, the later calls do nothing, and the driver must work the same. `mount -t debugfs none /sys/kernel/debug` if it isn't mounted, then `cat /sys/kernel/debug/mydebugfs/status`.
+
+**procfs.** `/proc/<pid>/`, `/proc/interrupts`, `/proc/iomem` and the other kernel files are where you *read* information about drivers (section 19). New driver files in `/proc` aren't accepted upstream; old tutorials that create them with `proc_create()` predate sysfs.

@@ -1097,3 +1097,280 @@ static DEFINE_RUNTIME_DEV_PM_OPS(myip_pm_ops, myip_runtime_suspend,
 ```
 
 and `.driver.pm = pm_ptr(&myip_pm_ops)`. Every later access is bracketed by `pm_runtime_resume_and_get(dev)` and `pm_runtime_put_autosuspend(dev)`; the callbacks run when the usage count reaches zero, after the delay. Runtime PM is a subject of its own (`Documentation/power/runtime_pm.rst`). This skeleton doesn't balance the clock when it's unbound while active; a real driver resumes the device and disables the clock in its teardown.
+
+## 13. GPIOs and interrupts
+
+**GPIOs: descriptors, not numbers.** A driver gets each GPIO it uses from its device's description, as an opaque `struct gpio_desc *`:
+
+| Call | Does |
+|---|---|
+| `devm_gpiod_get(dev, "led", GPIOD_OUT_LOW)` | Looks up `led-gpios` in the node, requests the line, sets it as an output at logical 0 |
+| `devm_gpiod_get_optional(dev, "reset", GPIOD_OUT_HIGH)` | Same, but returns `NULL` (not an error) when the property is absent |
+| `devm_gpiod_get_index(dev, "data", i, GPIOD_IN)`, `devm_gpiod_get_array()` | One line of a multi-line property, or all of them |
+| `gpiod_set_value(desc, 1)`, `gpiod_get_value(desc)` | Set or read the **logical** value: 1 means active, whatever the `GPIO_ACTIVE_LOW` flag makes that on the wire |
+| `gpiod_set_value_cansleep()`, `gpiod_get_value_cansleep()` | The same, allowed to sleep: needed for GPIOs on I2C or SPI expanders |
+| `gpiod_to_irq(desc)` | The interrupt number of an input line, if its controller can interrupt |
+
+**`_cansleep` or not.** The AM3358's own GPIO banks are memory-mapped and never sleep, but the same driver may one day get its LED from an I2C GPIO expander, where every access is an I2C transfer. Use the `_cansleep` variants in process context (as `ledbtn` does), and the plain ones only where sleeping isn't allowed, on a controller that doesn't sleep; `gpiod_cansleep(desc)` tells which. In 7.3 `gpiod_set_value()` returns an `int` (**From source**: `include/linux/gpio/consumer.h`), so a driver that cares can check for errors.
+
+The old integer API (`gpio_request(60, ...)`, `gpio_set_value()`) appears in most tutorials. Don't use it: the global numbers depend on probe order and are no longer stable, and the polarity has to be handled in code. From userspace, the `gpioinfo`, `gpioget`, `gpioset` and `gpiomon` tools of libgpiod use the character device `/dev/gpiochipN`; `/sys/class/gpio` is the deprecated sysfs interface.
+
+**Interrupts.** A device signals an event (a button press, data ready, a transfer done) on an interrupt line. The CPU stops what it's doing and runs the kernel's interrupt entry, which calls every handler registered for that line. The handler runs in **hard interrupt context**: interrupts on that line are masked, nothing may sleep, and every microsecond spent there is latency for the rest of the system.
+
+**Two halves.** The kernel's answer is to split the work:
+
+```
+ button pressed
+      │
+      ▼
+ hard IRQ handler (optional)    interrupt context, can't sleep
+   read/acknowledge the status,     return IRQ_WAKE_THREAD
+      │
+      ▼
+ threaded handler               a kernel thread "irq/53-ledbtn", may sleep:
+   the real work: I2C reads,        mutexes, I2C, SPI, GPIO expanders
+   locking, waking readers
+```
+
+`request_threaded_irq(irq, handler, thread_fn, flags, name, data)` registers both. The `ledbtn` driver passes no hard handler (`NULL`) and does everything in the thread (**Real**: compiled):
+
+```c
+#define LEDBTN_DEBOUNCE_MS	20
+
+/* Threaded handler: runs in a kernel thread, so it may sleep. */
+static irqreturn_t ledbtn_irq_thread(int irq, void *data)
+{
+	struct ledbtn *lb = data;
+	ktime_t now = ktime_get();
+
+	scoped_guard(mutex, &lb->lock) {
+		if (ktime_ms_delta(now, lb->last_press) < LEDBTN_DEBOUNCE_MS)
+			return IRQ_HANDLED;	/* contact bounce */
+		lb->last_press = now;
+		lb->presses++;
+		if (!lb->blink_ms)
+			ledbtn_set_led(lb, !lb->led_on);
+	}
+	sysfs_notify(&lb->dev->kobj, NULL, "presses");
+	return IRQ_HANDLED;
+}
+
+	/* in probe() */
+	ret = devm_request_threaded_irq(dev, irq, NULL, ledbtn_irq_thread,
+					IRQF_TRIGGER_FALLING | IRQF_ONESHOT,
+					dev_name(dev), lb);
+```
+
+- **`IRQF_ONESHOT`** keeps the line masked until the thread has finished. It's mandatory when there is no hard handler: without it, a level-triggered line would fire again immediately, and the kernel refuses the request with `Threaded irq requested with handler=NULL and !ONESHOT for ledbtn (irq 53)` (**From source**: `kernel/irq/manage.c`).
+- **`IRQF_TRIGGER_FALLING`**: the button pulls the pin from 3.3 V to 0 V when pressed. Trigger flags describe the wire, not the logical value, so `GPIO_ACTIVE_LOW` doesn't change them. For a device whose node has an `interrupts` property, leave the trigger out of the flags; it comes from the device tree.
+- **The last argument** (`lb`) is passed back to the handler as `data`. It's also the cookie that identifies this handler on a shared line.
+- **Mechanical buttons bounce**: one press gives several edges within a few milliseconds. The handler ignores edges within 20 ms of the last accepted one. A GPIO controller that supports it can debounce in hardware instead: `gpiod_set_debounce(desc, 20000)`.
+
+**When a hard handler is needed.** When the device must be acknowledged within microseconds, or the line is shared and the handler must check whether its device raised it:
+
+```c
+static irqreturn_t myip_irq(int irq, void *data)
+{
+	struct myip *ip = data;
+	u32 status = readl(ip->base + MYIP_IRQ_STATUS);
+
+	if (!status)
+		return IRQ_NONE;		/* not ours: shared line */
+	writel(status, ip->base + MYIP_IRQ_STATUS);	/* acknowledge */
+	ip->pending |= status;
+	return IRQ_WAKE_THREAD;			/* run the thread */
+}
+```
+
+(**Illustrative**.) The handler returns `IRQ_HANDLED` when it dealt with the event, `IRQ_WAKE_THREAD` to run the threaded handler, `IRQ_NONE` when its device didn't interrupt. A line that keeps firing with every handler returning `IRQ_NONE` is eventually disabled with `irq 53: nobody cared (try booting with the "irqpoll" option)` and `Disabling IRQ #53` (**From source**: `kernel/irq/spurious.c`): usually a device whose interrupt wasn't acknowledged.
+
+**Where the interrupt number comes from:** `gpiod_to_irq()` for a GPIO, `platform_get_irq(pdev, 0)` for the `interrupts` property of a platform device, `client->irq` for an I2C device and `spi->irq` for an SPI device. Never hard-code a number: they're allocated at boot.
+
+**On the board**, the interrupt and its thread are visible (**Expected**; the GPIO bank's interrupt controller prints its device name, from `drivers/gpio/gpio-omap.c`):
+
+```
+# grep ledbtn /proc/interrupts
+ 53:          7  4804c000.gpio  16 Edge      ledbtn
+# ps | grep irq/53
+  245 root       0:00 [irq/53-ledbtn]
+```
+
+The count rises with every edge, bounces included.
+
+## 14. Deferred work and time
+
+Kernel code often has to do something later: blink an LED every 250 ms, poll a sensor every second, finish in process context what an interrupt started, wait 10 ms after a reset. The tools differ by the context the work runs in:
+
+| Mechanism | Runs in | May sleep? | Resolution | Use it for |
+|---|---|---|---|---|
+| **Workqueue** (`struct work_struct`, `struct delayed_work`) | A kernel worker thread (process context) | Yes | Delayed work: jiffies | The default for "later", and for anything that sleeps |
+| **Timer** (`struct timer_list`) | Softirq | No | Jiffies (10 ms at the BeagleBone's `HZ=100`) | Timeouts and watchdogs whose callback is short |
+| **hrtimer** (`struct hrtimer`) | Hard interrupt | No | Nanoseconds (as good as the hardware timer) | Precise periodic events |
+| **Kernel thread** (`kthread_run()`) | Its own thread | Yes | | A loop that waits for events for the driver's whole life |
+| **Threaded IRQ** (section 13) | A thread per interrupt | Yes | | The second half of an interrupt |
+| Tasklet, softirq | Softirq | No | | Legacy; new code uses threaded IRQs or workqueues |
+
+**Workqueues.** `ledbtn` blinks the LED with a delayed work item that reschedules itself (**Real**: compiled):
+
+```c
+static void ledbtn_blink(struct work_struct *work)
+{
+	struct ledbtn *lb = container_of(to_delayed_work(work),
+					 struct ledbtn, blink_work);
+
+	guard(mutex)(&lb->lock);
+	if (!lb->blink_ms)
+		return;				/* blinking was switched off */
+	ledbtn_set_led(lb, !lb->led_on);
+	schedule_delayed_work(&lb->blink_work, msecs_to_jiffies(lb->blink_ms));
+}
+
+static ssize_t blink_ms_store(struct device *dev, struct device_attribute *attr,
+			      const char *buf, size_t count)
+{
+	struct ledbtn *lb = dev_get_drvdata(dev);
+	unsigned int ms;
+	int ret;
+
+	ret = kstrtouint(buf, 0, &ms);
+	if (ret)
+		return ret;
+	if (ms && (ms < 10 || ms > 10000))
+		return -EINVAL;
+
+	guard(mutex)(&lb->lock);
+	lb->blink_ms = ms;
+	if (ms)
+		schedule_delayed_work(&lb->blink_work, 0);
+	return count;
+}
+```
+
+- **`INIT_WORK()`/`INIT_DELAYED_WORK()`** prepare the item; `devm_delayed_work_autocancel()` does it and cancels the work at unbind (**From source**: `include/linux/devm-helpers.h`).
+- **`schedule_work()`** and **`schedule_delayed_work(dw, delay)`** put the item on the system workqueue; an item already pending isn't queued twice. `mod_delayed_work()` changes the delay of a pending item.
+- **Stopping**: writing 0 to `blink_ms` makes the next run return without rescheduling. `cancel_delayed_work_sync()` cancels and waits for a running instance to finish; never call it while holding a lock the work function takes, or the two wait for each other forever. That's why `blink_ms_store()` stops the work through the flag, not by cancelling it under the mutex.
+- **Your own workqueue**, `alloc_workqueue("name", flags, 0)`, isolates work that is slow or must not be delayed by others. `WQ_UNBOUND` lets the scheduler run it on any CPU, `WQ_HIGHPRI` gives its workers a higher priority, `WQ_MEM_RECLAIM` guarantees progress under memory pressure (needed on the path to storage or the network).
+
+**Timers, hrtimers, kthreads and completions**, side by side in one module (`deferred.c`, **Real**: compiled):
+
+```c
+struct demo {
+	struct timer_list timer;	/* jiffies resolution, softirq context */
+	struct hrtimer hrtimer;		/* ns resolution, hardirq context */
+	struct work_struct work;	/* process context, may sleep */
+	struct workqueue_struct *wq;	/* our own queue */
+	struct task_struct *thread;
+	struct completion done;
+	spinlock_t lock;		/* timer and hrtimer callbacks vs. others */
+	unsigned long ticks;
+	unsigned long hr_ticks;
+};
+
+static struct demo demo;
+
+static void demo_timer_fn(struct timer_list *t)
+{
+	struct demo *d = timer_container_of(d, t, timer);
+
+	spin_lock(&d->lock);
+	d->ticks++;
+	spin_unlock(&d->lock);
+
+	queue_work(d->wq, &d->work);		/* the sleeping part */
+	mod_timer(&d->timer, jiffies + HZ);	/* again in one second */
+}
+
+static enum hrtimer_restart demo_hrtimer_fn(struct hrtimer *t)
+{
+	struct demo *d = container_of(t, struct demo, hrtimer);
+
+	spin_lock(&d->lock);
+	d->hr_ticks++;
+	spin_unlock(&d->lock);
+
+	hrtimer_forward_now(t, ms_to_ktime(100));
+	return HRTIMER_RESTART;
+}
+
+static void demo_work_fn(struct work_struct *work)
+{
+	struct demo *d = container_of(work, struct demo, work);
+	unsigned long ticks, hr_ticks;
+
+	spin_lock_irq(&d->lock);	/* hrtimer runs in hardirq context */
+	ticks = d->ticks;
+	hr_ticks = d->hr_ticks;
+	spin_unlock_irq(&d->lock);
+
+	usleep_range(10000, 11000);	/* sleeping: fine here, never in a timer */
+	pr_info("work: %lu timer ticks, %lu hrtimer ticks\n", ticks, hr_ticks);
+}
+
+static int demo_thread_fn(void *data)
+{
+	struct demo *d = data;
+
+	complete(&d->done);		/* tell init we're running */
+	while (!kthread_should_stop()) {
+		/* A real thread would wait for an event here. */
+		schedule_timeout_interruptible(5 * HZ);
+	}
+	return 0;
+}
+
+static int __init deferred_init(void)
+{
+	spin_lock_init(&demo.lock);
+	init_completion(&demo.done);
+	INIT_WORK(&demo.work, demo_work_fn);
+
+	demo.wq = alloc_workqueue("deferred", WQ_UNBOUND, 0);
+	if (!demo.wq)
+		return -ENOMEM;
+
+	demo.thread = kthread_run(demo_thread_fn, &demo, "deferred-thread");
+	if (IS_ERR(demo.thread)) {
+		destroy_workqueue(demo.wq);
+		return PTR_ERR(demo.thread);
+	}
+	wait_for_completion(&demo.done);
+
+	timer_setup(&demo.timer, demo_timer_fn, 0);
+	mod_timer(&demo.timer, jiffies + HZ);
+
+	hrtimer_setup(&demo.hrtimer, demo_hrtimer_fn, CLOCK_MONOTONIC,
+		      HRTIMER_MODE_REL);
+	hrtimer_start(&demo.hrtimer, ms_to_ktime(100), HRTIMER_MODE_REL);
+	return 0;
+}
+
+static void __exit deferred_exit(void)
+{
+	/* Stop the sources first, then what they feed. */
+	hrtimer_cancel(&demo.hrtimer);
+	timer_shutdown_sync(&demo.timer);
+	cancel_work_sync(&demo.work);
+	destroy_workqueue(demo.wq);
+	kthread_stop(demo.thread);
+}
+```
+
+What it shows:
+
+- **The timer callback can't sleep**, so it counts and hands the rest to a work item. That split, a short callback and a work item for the slow part, is the normal shape.
+- **`timer_container_of()`** (formerly `from_timer()`) goes from the `timer_list` back to the structure; hrtimers use plain `container_of()`.
+- **`hrtimer_forward_now()` and `HRTIMER_RESTART`** make a periodic hrtimer without drift: the next expiry is computed from the previous one, not from when the callback ran.
+- **Teardown order matters**: stop what generates work (the timers), then cancel the work, then destroy its queue, then stop the thread. `timer_shutdown_sync()` waits for a running callback and prevents re-arming, which a self-rearming timer needs before its memory is freed.
+- **`kthread_should_stop()`** is how a kernel thread learns that `kthread_stop()` was called; `kthread_stop()` wakes the thread and waits for it to return.
+- **A completion** is a one-shot "it happened" signal between two contexts: `wait_for_completion()` sleeps until another context calls `complete()`. Drivers use it to wait for an interrupt that signals the end of a transfer, with a timeout: `wait_for_completion_timeout(&done, msecs_to_jiffies(100))` returns 0 on timeout.
+
+**Delays.** `Documentation/timers/delay_sleep_functions.rst` in 7.3 gives the rules:
+
+| Context | Call | Notes |
+|---|---|---|
+| May sleep | `fsleep(us)` | Picks the right mechanism for the duration; the safe default |
+| May sleep, ≥ 20 ms | `msleep(ms)`, `msleep_interruptible(ms)` | Jiffy-based: `msleep(1)` sleeps up to two jiffies, 20 ms at `HZ=100`. `checkpatch` warns about `msleep()` below 20 ms |
+| May sleep, 10 µs to 20 ms | `usleep_range(min, max)` | hrtimer-based; the range lets the kernel merge wake-ups |
+| Can't sleep | `udelay(us)`, `ndelay(ns)` | Busy-waits: burns the CPU. Keep it to a few microseconds |
+
+`jiffies` counts timer ticks since boot; compare them with `time_after(a, b)`, never with `>`, because the counter wraps. For timestamps and durations, `ktime_get()` gives a monotonic time in nanoseconds (`ledbtn` uses it for debouncing).

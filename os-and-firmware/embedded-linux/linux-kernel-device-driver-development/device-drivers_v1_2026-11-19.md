@@ -124,7 +124,7 @@ $ scp ledbtn.ko root@192.168.0.50:/tmp/
 The `Makefile` lists every example of this note:
 
 ```make
-obj-m := hellop.o mychar.o mycdev.o mydebugfs.o ledbtn.o mytmp102.o myspi.o deferred.o mydma.o
+obj-m := hellop.o mychar.o mycdev.o mydebugfs.o myip.o ledbtn.o mytmp102.o myspi.o deferred.o mydma.o
 
 KDIR ?= $(HOME)/bbb/build
 
@@ -143,7 +143,7 @@ Three habits make the loop fast and safe:
 
 **Verification status.** In November 2026, on an x86_64 Ubuntu 22.04 machine:
 
-- **Compiled:** every C example of this note (`hellop`, `mychar`, `mycdev`, `mydebugfs`, `ledbtn`, `mytmp102`, `myspi`, `deferred`, `mydma`) and the userspace test program, against mainline Linux 7.3 (commit `c03c1a145`, 18 October 2026), with `W=1` and the tree's `-Werror`, using gcc 11.4. The kernel was an **x86_64** `defconfig` with `OF`, `GPIOLIB`, `I2C`, `SPI`, `HWMON` and `IIO` added, prepared with `make modules_prepare` only. The drivers are architecture-independent, so this checks their API use; it isn't an Arm build. The `modinfo` and `modpost` messages marked **Real output** come from this build.
+- **Compiled:** every C example of this note (`hellop`, `mychar`, `mycdev`, `mydebugfs`, `myip`, `ledbtn`, `mytmp102`, `myspi`, `deferred`, `mydma`) and the userspace test program, against mainline Linux 7.3 (commit `c03c1a145`, 18 October 2026), with `W=1` and the tree's `-Werror`, using gcc 11.4. The kernel was an **x86_64** `defconfig` with `OF`, `GPIOLIB`, `I2C`, `SPI`, `HWMON` and `IIO` added, prepared with `make modules_prepare` only. The drivers are architecture-independent, so this checks their API use; it isn't an Arm build. The `modinfo` and `modpost` messages marked **Real output** come from this build.
 - **Checked:** every example passes `scripts/checkpatch.pl` with no warnings. The device tree of section 11 was compiled with the 7.3 tree's `dtc` on top of `am335x-boneblack.dts` and adds no warnings to the 13 the board's own tree produces. The API names and signatures were read in the 7.3 headers, and their presence was checked again at the `v7.1-rc1` tag.
 - **Not done:** nothing was cross-compiled for Arm, loaded into a kernel, or run on a board or in an emulator. Console output from the board is **Expected**.
 
@@ -748,3 +748,352 @@ static void __exit mydebugfs_exit(void)
 `debugfs_create_u32()` exposes a variable as a readable and writable file in one line; `DEFINE_SHOW_ATTRIBUTE(status)` turns a `seq_file` show function into `status_fops`. The debugfs API is designed so that drivers **don't check its return values**: when debugfs is disabled or the directory couldn't be created, the later calls do nothing, and the driver must work the same. `mount -t debugfs none /sys/kernel/debug` if it isn't mounted, then `cat /sys/kernel/debug/mydebugfs/status`.
 
 **procfs.** `/proc/<pid>/`, `/proc/interrupts`, `/proc/iomem` and the other kernel files are where you *read* information about drivers (section 19). New driver files in `/proc` aren't accepted upstream; old tutorials that create them with `proc_create()` predate sysfs.
+
+## 10. The driver model: buses, devices, drivers and probe
+
+Sections 5 to 9 created devices from a module's init function. Real hardware works the other way round: the device exists first, described by the device tree, and the driver is attached to it by the kernel's **driver model** (`drivers/base/`).
+
+**Three kinds of objects:**
+
+| Object | Represents | Created by | In sysfs |
+|---|---|---|---|
+| `struct bus_type` | A way devices are connected and found: platform, I2C, SPI, USB, PCI, MDIO | The bus core, once | `/sys/bus/<bus>/` |
+| `struct device` | One piece of hardware | The device tree code at boot, a bus controller driver when it scans (I2C children of an adapter, USB enumeration), or code | `/sys/devices/...`, linked from `/sys/bus/<bus>/devices/` |
+| `struct device_driver` | Code that can operate some devices | A module or built-in code calling `platform_driver_register()`, `i2c_add_driver()`... | `/sys/bus/<bus>/drivers/<driver>/` |
+
+**The platform bus** is for devices that can't be discovered: SoC peripherals at fixed addresses, and anything else described only by the device tree. Every node under the SoC's buses with a `compatible` and `status = "okay"`, and every such node directly under the root, becomes a platform device at boot (`drivers/of/platform.c`). Its name comes from its address and node name (`44e09000.serial`), or the node name alone when it has no address (`ledbtn`, **From source**: `of_device_make_bus_id()` in `drivers/of/device.c`). Devices on real buses, such as I2C or SPI, are children of their controller's node, and the controller's driver creates them (section 16).
+
+**Matching.** Whenever a device or a driver is added to a bus, the bus compares them. For the platform bus, in this order (`drivers/base/platform.c`, `platform_match()`): a `driver_override` written in sysfs, then the device tree `compatible` strings against the driver's `of_match_table`, then ACPI, then the driver's `id_table`, then the device and driver names. The `compatible` list of a node goes from the most specific to the most generic, and the first string a driver knows wins.
+
+**Probe.** On a match, the driver core calls the driver's `probe()` with the device. What happens next depends on the return value (**From source**: `drivers/base/dd.c`, `really_probe()` and `call_driver_probe()`):
+
+| `probe()` returns | Result |
+|---|---|
+| `0` | The driver is bound. Its `dev_groups` attributes are created, and `/sys/bus/<bus>/devices/<dev>/driver` points to it |
+| `-EPROBE_DEFER` | Not now: a resource isn't ready yet (a clock, a GPIO controller, a regulator whose driver hasn't probed). The device goes on a list and is retried each time another driver binds |
+| `-ENODEV` or `-ENXIO` | "This isn't mine after all". Logged only at debug level |
+| Anything else | Failure, logged as `probe with driver <name> failed with error <errno>`. The device stays without a driver |
+
+Deferred probing is how the kernel handles initialization order without anyone writing it down: a driver that needs a GPIO asks for it, gets `-EPROBE_DEFER` if the GPIO controller hasn't probed yet, and returns that error unchanged. Use **`dev_err_probe(dev, err, "message")`** for every error in `probe()`: it prints the message for real errors, stays silent for `-EPROBE_DEFER` but records the reason, and returns `err`. The reasons are listed in `/sys/kernel/debug/devices_deferred` (**From source**: `drivers/base/dd.c`), which is the first place to look when a device never appears.
+
+**Module autoloading.** `MODULE_DEVICE_TABLE(of, ledbtn_of_match)` copies the match table into the module as aliases (**Real output**):
+
+```
+$ modinfo -F alias ledbtn.ko
+of:N*T*Cmycompany,ledbtnC*
+of:N*T*Cmycompany,ledbtn
+```
+
+At boot, the kernel announces each device with a uevent carrying its `MODALIAS`, for this node `of:NledbtnT(null)Cmycompany,ledbtn` (**Expected**, from the format in `drivers/of/module.c`: name, then the absent `device_type`, then each `compatible`). udev runs `modprobe` with it, `modprobe` matches it against `modules.alias`, and the driver loads (kernel note, section 14). Without `MODULE_DEVICE_TABLE`, the driver works when loaded by hand but never loads by itself.
+
+**Binding by hand**, useful while developing:
+
+```sh
+# ls -l /sys/bus/platform/devices/ledbtn/driver       # bound to which driver?
+# echo ledbtn > /sys/bus/platform/drivers/ledbtn/unbind
+# echo ledbtn > /sys/bus/platform/drivers/ledbtn/bind
+```
+
+`unbind` calls the driver's removal path without unloading the module, which is the fastest way to test it.
+
+## 11. A platform driver from the device tree
+
+The `ledbtn` driver controls an LED and reads a button, both on GPIOs, as described by a device tree node. It's the pattern of most SoC peripheral drivers: a node, a match table, a `probe()` that gets every resource, and no `remove()`.
+
+**The device tree.** The node goes in the board's own `.dts`, which includes the BeagleBone Black's (kernel note, section 12). This file holds every device of this note (**Real**: compiled with the 7.3 `dtc`, 99,277 bytes):
+
+```dts
+// SPDX-License-Identifier: GPL-2.0
+/*
+ * BeagleBone Black with the example devices of the driver note:
+ * an LED on P9_12, a button on P9_15, a TMP102 on I2C2 (P9_19/P9_20)
+ * and a BMP280 on SPI0 (P9_17, P9_18, P9_21, P9_22).
+ */
+/dts-v1/;
+#include "am335x-boneblack.dts"
+
+/ {
+	model = "TI AM335x BeagleBone Black (driver note)";
+
+	ledbtn {
+		compatible = "mycompany,ledbtn";
+		pinctrl-names = "default";
+		pinctrl-0 = <&ledbtn_pins>;
+		led-gpios = <&gpio1 28 GPIO_ACTIVE_HIGH>;	/* P9_12 */
+		button-gpios = <&gpio1 16 GPIO_ACTIVE_LOW>;	/* P9_15, to GND */
+	};
+};
+
+&am33xx_pinmux {
+	ledbtn_pins: ledbtn-pins {
+		pinctrl-single,pins = <
+			AM33XX_PADCONF(AM335X_PIN_GPMC_BEN1, PIN_OUTPUT, MUX_MODE7)	/* P9_12 gpio1_28 */
+			AM33XX_PADCONF(AM335X_PIN_GPMC_A0, PIN_INPUT_PULLUP, MUX_MODE7)	/* P9_15 gpio1_16 */
+		>;
+	};
+
+	spi0_pins: spi0-pins {
+		pinctrl-single,pins = <
+			AM33XX_PADCONF(AM335X_PIN_SPI0_SCLK, PIN_INPUT, MUX_MODE0)	/* P9_22 */
+			AM33XX_PADCONF(AM335X_PIN_SPI0_D0, PIN_INPUT_PULLUP, MUX_MODE0)	/* P9_21, MISO */
+			AM33XX_PADCONF(AM335X_PIN_SPI0_D1, PIN_OUTPUT, MUX_MODE0)	/* P9_18, MOSI */
+			AM33XX_PADCONF(AM335X_PIN_SPI0_CS0, PIN_OUTPUT, MUX_MODE0)	/* P9_17 */
+		>;
+	};
+};
+
+&i2c2 {
+	temperature-sensor@48 {
+		compatible = "mycompany,mytmp102";
+		reg = <0x48>;
+	};
+};
+
+&spi0 {
+	pinctrl-names = "default";
+	pinctrl-0 = <&spi0_pins>;
+	status = "okay";
+
+	pressure-sensor@0 {
+		compatible = "mycompany,mybmp280";
+		reg = <0>;				/* chip select 0 */
+		spi-max-frequency = <1000000>;
+	};
+};
+```
+
+- **`compatible = "mycompany,ledbtn"`** is the only link to the driver. The vendor prefix comes before the comma. `mycompany` is a placeholder: upstream, prefixes are registered in `Documentation/devicetree/bindings/vendor-prefixes.yaml`, and `make dtbs_check` warns about unknown ones. Don't borrow a short name that looks free; `acme`, for example, is registered to a real company.
+- **`led-gpios`** is a GPIO reference: the controller (`&gpio1`), the line (28), and flags. The driver asks for it by the part before `-gpios`: `devm_gpiod_get(dev, "led", ...)`. `GPIO_ACTIVE_LOW` on the button means "pressed" reads as 1 in the driver, although the pin is at 0 V; the polarity lives in the device tree, not in the code.
+- **`pinctrl-0`** selects the pad configuration: the AM3358's pads each carry up to eight functions, and mode 7 is GPIO. The driver core applies the `default` state before calling `probe()` (`pinctrl_bind_pins()` in `drivers/base/dd.c`), so the driver never mentions pins. `PIN_INPUT_PULLUP` enables the internal pull-up, so a button to ground needs no resistor.
+- **No `reg`**: the device has no registers of its own, so the node sits at the root, and its device is named `ledbtn`.
+
+Build it as in the kernel note: put the file in `arch/arm/boot/dts/ti/omap/`, add `dtb-$(CONFIG_SOC_AM33XX) += am335x-boneblack-mydrivers.dtb` to the `Makefile` there, then `make O=~/bbb/build ti/omap/am335x-boneblack-mydrivers.dtb`, and point the bootloader's `fdt` line at it.
+
+**The driver.** The structure holds everything the device needs, and `probe()` fills it (`ledbtn.c`, **Real**: compiled; the sysfs part is in section 9, the interrupt and work parts in sections 13 and 14):
+
+```c
+struct ledbtn {
+	struct device *dev;
+	struct gpio_desc *led;
+	struct gpio_desc *button;
+	struct delayed_work blink_work;
+	struct mutex lock;		/* protects everything below */
+	bool led_on;
+	unsigned int blink_ms;
+	unsigned long presses;
+	ktime_t last_press;
+};
+
+static int ledbtn_probe(struct platform_device *pdev)
+{
+	struct device *dev = &pdev->dev;
+	struct ledbtn *lb;
+	int irq, ret;
+
+	lb = devm_kzalloc(dev, sizeof(*lb), GFP_KERNEL);
+	if (!lb)
+		return -ENOMEM;
+	lb->dev = dev;
+	platform_set_drvdata(pdev, lb);
+
+	ret = devm_mutex_init(dev, &lb->lock);
+	if (ret)
+		return ret;
+
+	lb->led = devm_gpiod_get(dev, "led", GPIOD_OUT_LOW);
+	if (IS_ERR(lb->led))
+		return dev_err_probe(dev, PTR_ERR(lb->led),
+				     "cannot get the led GPIO\n");
+
+	lb->button = devm_gpiod_get(dev, "button", GPIOD_IN);
+	if (IS_ERR(lb->button))
+		return dev_err_probe(dev, PTR_ERR(lb->button),
+				     "cannot get the button GPIO\n");
+
+	ret = devm_delayed_work_autocancel(dev, &lb->blink_work, ledbtn_blink);
+	if (ret)
+		return ret;
+
+	irq = gpiod_to_irq(lb->button);
+	if (irq < 0)
+		return dev_err_probe(dev, irq, "button GPIO has no interrupt\n");
+
+	ret = devm_request_threaded_irq(dev, irq, NULL, ledbtn_irq_thread,
+					IRQF_TRIGGER_FALLING | IRQF_ONESHOT,
+					dev_name(dev), lb);
+	if (ret)
+		return dev_err_probe(dev, ret, "cannot request IRQ %d\n", irq);
+
+	dev_info(dev, "ready, button on IRQ %d\n", irq);
+	return 0;
+}
+
+static const struct of_device_id ledbtn_of_match[] = {
+	{ .compatible = "mycompany,ledbtn" },
+	{ }
+};
+MODULE_DEVICE_TABLE(of, ledbtn_of_match);
+
+static struct platform_driver ledbtn_driver = {
+	.probe	= ledbtn_probe,
+	.driver	= {
+		.name		= "ledbtn",
+		.of_match_table	= ledbtn_of_match,
+		.dev_groups	= ledbtn_groups,
+	},
+};
+module_platform_driver(ledbtn_driver);
+```
+
+- **One structure per device**, allocated in `probe()`, never a global: the same driver may run several devices. `platform_set_drvdata()` stores it in the device so that every other callback finds it with `dev_get_drvdata()` or `platform_get_drvdata()`. Store it before anything that can call back into the driver, such as the interrupt.
+- **The match table ends with an empty entry.** It's a sentinel, not decoration.
+- **`module_platform_driver()`** writes the module's init and exit functions, which only register and unregister the driver. Nothing else should happen in them; all the work is per device, in `probe()`.
+
+**Managed resources: why there is no `remove()`.** Every `devm_*` call registers its undo action with the device. When `probe()` fails, or when the driver is unbound, the driver core runs those actions in reverse order (`devres_release_all()` in `drivers/base/devres.c`). For `ledbtn`, unbinding does:
+
+1. remove the sysfs attributes (driver core, before anything else);
+2. call `remove()`, if the driver has one;
+3. free the interrupt, so the handler can no longer run;
+4. cancel the blink work and wait for it (`devm_delayed_work_autocancel`);
+5. release the two GPIOs, destroy the mutex, free the structure.
+
+The order is the reverse of `probe()`, which is exactly the order in which it's safe to tear things down: the interrupt goes before the data it uses. This works as long as **everything** in `probe()` is managed. Mixing a non-managed resource into a managed `probe()` is the classic bug: if `remove()` frees something that a still-registered `devm` interrupt handler uses, the handler can run on freed memory between steps 2 and 3. When a resource has no `devm_` variant, wrap it with `devm_add_action_or_reset(dev, undo_fn, data)`, which keeps everything in the same ordered list.
+
+| Common managed calls | Section |
+|---|---|
+| `devm_kzalloc()`, `devm_kcalloc()`, `devm_kstrdup()` | 18 |
+| `devm_platform_ioremap_resource()` | 12 |
+| `devm_clk_get_enabled()`, `devm_regulator_get_enable()`, `devm_reset_control_get_exclusive_deasserted()` | 12 |
+| `devm_gpiod_get()`, `devm_request_threaded_irq()` | 13 |
+| `devm_mutex_init()`, `devm_delayed_work_autocancel()`, `devm_add_action_or_reset()` | 14, 15 |
+| `devm_regmap_init_i2c()`, `devm_hwmon_device_register_with_info()`, `devm_iio_device_register()`, `devm_led_classdev_register()` | 16, 17 |
+
+`Documentation/driver-api/driver-model/devres.rst` lists them all.
+
+**Loading it on the board** (**Expected**, from the format strings in the driver):
+
+```
+# insmod ledbtn.ko
+ledbtn ledbtn: ready, button on IRQ 53
+# ls /sys/bus/platform/drivers/ledbtn/
+bind  ledbtn  module  uevent  unbind
+```
+
+`dev_info()` prints the driver name, then the device name (here both `ledbtn`), then the message. The IRQ number is assigned at run time; it means nothing outside this boot.
+
+## 12. Reaching the hardware: registers, clocks, regulators and pins
+
+`ledbtn` only uses GPIOs, which another driver owns. A driver for an SoC peripheral talks to its registers, and must turn on the clock, the power and the reset line that the block depends on. The device tree lists all of them in the node:
+
+```dts
+	myip@48300000 {
+		compatible = "mycompany,myip";
+		reg = <0x48300000 0x1000>;
+		clocks = <&some_clock_provider 4>;
+		clock-names = "fck";
+		resets = <&some_reset_provider 2>;
+		interrupts = <42>;
+	};
+```
+
+(**Illustrative**: the addresses, the providers and the numbers are made up.) The driver gets each resource by name or index, all managed (`myip.c`, **Real**: compiled):
+
+```c
+#define MYIP_ID		0x00		/* read-only: version register */
+#define MYIP_CTRL	0x04
+#define MYIP_CTRL_EN	BIT(0)
+#define MYIP_CTRL_DIV	GENMASK(11, 8)
+
+static int myip_probe(struct platform_device *pdev)
+{
+	struct device *dev = &pdev->dev;
+	struct reset_control *rst;
+	struct myip *ip;
+	u32 id, ctrl;
+	int ret;
+
+	ip = devm_kzalloc(dev, sizeof(*ip), GFP_KERNEL);
+	if (!ip)
+		return -ENOMEM;
+	platform_set_drvdata(pdev, ip);
+
+	ip->base = devm_platform_ioremap_resource(pdev, 0);
+	if (IS_ERR(ip->base))
+		return PTR_ERR(ip->base);
+
+	ip->clk = devm_clk_get(dev, "fck");
+	if (IS_ERR(ip->clk))
+		return dev_err_probe(dev, PTR_ERR(ip->clk), "no functional clock\n");
+
+	rst = devm_reset_control_get_optional_exclusive_deasserted(dev, NULL);
+	if (IS_ERR(rst))
+		return dev_err_probe(dev, PTR_ERR(rst), "cannot deassert reset\n");
+
+	ret = clk_prepare_enable(ip->clk);
+	if (ret)
+		return ret;
+
+	id = readl(ip->base + MYIP_ID);
+	ctrl = readl(ip->base + MYIP_CTRL);
+	ctrl &= ~MYIP_CTRL_DIV;
+	ctrl |= FIELD_PREP(MYIP_CTRL_DIV, 4) | MYIP_CTRL_EN;
+	writel(ctrl, ip->base + MYIP_CTRL);
+	...
+}
+```
+
+**Registers.** `devm_platform_ioremap_resource(pdev, 0)` takes the first `reg` entry, reserves the physical range (it then appears in `/proc/iomem` with the device's name, and a second driver can't claim it), and maps it into the kernel's virtual address space. The result is a `void __iomem *`: a cookie for the accessors, never dereferenced directly.
+
+| Accessor | Use |
+|---|---|
+| `readl(addr)`, `writel(val, addr)` (and `readb`/`readw`, `writeb`/`writew`) | 32-bit (8, 16-bit) little-endian register access, ordered with respect to the CPU's other memory accesses and to DMA. The default |
+| `readl_relaxed()`, `writel_relaxed()` | Same access without the barriers: faster in loops of register writes, but not ordered against DMA buffers |
+| `readl_poll_timeout(addr, val, cond, sleep_us, timeout_us)` (`<linux/iopoll.h>`) | Poll a status bit until a condition holds, with a timeout. `_atomic` variant for contexts that can't sleep |
+| `FIELD_PREP(mask, val)`, `FIELD_GET(mask, reg)`, `GENMASK(h, l)`, `BIT(n)` (`<linux/bitfield.h>`, `<linux/bits.h>`) | Build and extract register fields without shift constants |
+
+A write to a register is posted: `writel()` may return before the device has seen it. When the next step depends on the write having landed (before a delay, before turning a clock off), read a register of the same device back.
+
+**regmap** puts a uniform API (`regmap_read()`, `regmap_write()`, `regmap_update_bits()`, `regmap_field_*()`) on top of MMIO, I2C, SPI and other buses, with optional caching, locking, and a debugfs view of every register (`/sys/kernel/debug/regmap/<device>/registers`). For MMIO, `devm_regmap_init_mmio(dev, base, &config)`. It costs a few function calls per access, which only matters in very hot paths; for I2C and SPI devices, it's the default choice (section 16).
+
+**Clocks.** A peripheral's registers often read as zeros or hang the bus when its clock is off; on the AM335x, an access to a module whose clock is gated gives an external abort. `devm_clk_get(dev, "fck")` gets the clock named in `clock-names`; `clk_prepare_enable()` turns it on, `clk_disable_unprepare()` off. `devm_clk_get_enabled()` gets and enables it, and disables it at unbind, which is all most drivers need. `clk_get_rate()` gives the frequency for divider calculations.
+
+**Resets.** `devm_reset_control_get_exclusive_deasserted(dev, NULL)` takes the reset line out of reset and puts it back at unbind; the `_optional_` variant used in `myip` returns `NULL` instead of an error when the node has no `resets` property.
+
+**Regulators.** External chips often need their supply turned on: `devm_regulator_get_enable(dev, "vdd")` for a `vdd-supply = <&reg>;` property. Without a property, the regulator core hands out a dummy regulator and warns `supply vdd not found, using dummy regulator` (**From source**: `drivers/regulator/core.c`), so the same driver works on boards where the supply is always on.
+
+**Pins.** Applied automatically from `pinctrl-0` (section 11). A driver with several pin states, such as a `sleep` state, selects them with `pinctrl_pm_select_sleep_state()` or `pinctrl_lookup_state()` and `pinctrl_select_state()`.
+
+**Runtime power management** turns a device's clocks and power off between uses. On the AM335x, the SoC's power domains are driven this way by the `ti-sysc` interconnect driver, which is why many drivers for this SoC call `pm_runtime_get_sync()` before touching registers. `myip` keeps its functional clock off when idle (**Real**: compiled):
+
+```c
+static int myip_runtime_suspend(struct device *dev)
+{
+	struct myip *ip = dev_get_drvdata(dev);
+
+	clk_disable_unprepare(ip->clk);
+	return 0;
+}
+
+static int myip_runtime_resume(struct device *dev)
+{
+	struct myip *ip = dev_get_drvdata(dev);
+
+	return clk_prepare_enable(ip->clk);
+}
+
+static DEFINE_RUNTIME_DEV_PM_OPS(myip_pm_ops, myip_runtime_suspend,
+				 myip_runtime_resume, NULL);
+
+	/* at the end of probe(): the clock is on, the device is active */
+	pm_runtime_set_active(dev);
+	pm_runtime_set_autosuspend_delay(dev, 1000);
+	pm_runtime_use_autosuspend(dev);
+	ret = devm_pm_runtime_enable(dev);
+	if (ret) {
+		clk_disable_unprepare(ip->clk);
+		return ret;
+	}
+	pm_runtime_put_autosuspend(dev);	/* idle in one second */
+```
+
+and `.driver.pm = pm_ptr(&myip_pm_ops)`. Every later access is bracketed by `pm_runtime_resume_and_get(dev)` and `pm_runtime_put_autosuspend(dev)`; the callbacks run when the usage count reaches zero, after the delay. Runtime PM is a subject of its own (`Documentation/power/runtime_pm.rst`). This skeleton doesn't balance the clock when it's unbound while active; a real driver resumes the device and disables the clock in its teardown.

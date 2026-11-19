@@ -1753,3 +1753,239 @@ Every allocation can fail: check the result, return `-ENOMEM`. A `kmalloc()` abo
 - **Large buffers**: `dma_alloc_coherent()` of more than a few pages comes from CMA, the contiguous memory allocator, enabled in `omap2plus_defconfig` (`CONFIG_CMA=y`, `CONFIG_DMA_CMA=y`). Its size is set with `cma=` on the command line.
 
 **DMA engines.** Many peripherals (McSPI, UART, McASP on the AM3358) don't do DMA themselves: a shared DMA controller moves the data, here TI's EDMA (`ti,edma3-tpcc` in `am33xx.dtsi`, `drivers/dma/ti/edma.c`). A peripheral driver asks for a channel with `dma_request_chan(dev, "rx")`, matching a `dmas`/`dma-names` pair in its node, prepares a transfer with `dmaengine_prep_slave_sg()`, and submits it. Bus drivers such as SPI already do this, so an SPI device driver gets DMA for large transfers without writing any of it.
+
+## 19. Debugging a driver
+
+**Print, but on demand.** `dev_dbg()` messages cost nothing until enabled. With `CONFIG_DYNAMIC_DEBUG` (kernel note, section 20):
+
+```sh
+# echo 'module mytmp102 +p' > /sys/kernel/debug/dynamic_debug/control
+# echo 'file ledbtn.c line 60 +p' > /sys/kernel/debug/dynamic_debug/control
+# insmod mytmp102.ko dyndbg=+p          # from the moment the module loads
+```
+
+The `+pflm` flags add the function name, line number and module to each message. For a quick experiment, `#define DEBUG` at the top of the file, before the includes, turns every `dev_dbg()` of that file into a `KERN_DEBUG` message.
+
+**A debug kernel.** Most driver bugs are found by the kernel itself, if you let it check. A fragment for development builds (kernel note, section 5), all supported on 32-bit Arm in 7.3 (**From source**: `arch/arm/Kconfig` selects `HAVE_ARCH_KASAN`, `HAVE_ARCH_KFENCE`, `ARCH_HAS_UBSAN` and `HAVE_DEBUG_KMEMLEAK`):
+
+```
+# debug.config - checks for driver development, not for production
+CONFIG_DEBUG_KERNEL=y
+CONFIG_DEBUG_ATOMIC_SLEEP=y
+CONFIG_PROVE_LOCKING=y
+CONFIG_DEBUG_OBJECTS=y
+CONFIG_DEBUG_OBJECTS_TIMERS=y
+CONFIG_DEBUG_OBJECTS_WORK=y
+CONFIG_DEBUG_KMEMLEAK=y
+CONFIG_KASAN=y
+CONFIG_UBSAN=y
+CONFIG_DMA_API_DEBUG=y
+CONFIG_DYNAMIC_DEBUG=y
+```
+
+| Option | Catches | Reports |
+|---|---|---|
+| `DEBUG_ATOMIC_SLEEP` | A sleeping call in atomic context (section 3) | `BUG: sleeping function called from invalid context at <file>:<line>` (`kernel/sched/core.c`) |
+| `PROVE_LOCKING` (lockdep) | Lock order inversions, a lock taken in an interrupt but not with interrupts disabled elsewhere | `WARNING: possible circular locking dependency detected`, with both call chains |
+| `DEBUG_OBJECTS_*` | Freeing a timer or work item that is still active; initializing one twice | `ODEBUG: free active ...` |
+| `DEBUG_KMEMLEAK` | Memory that nothing points to any more | `echo scan > /sys/kernel/debug/kmemleak; cat /sys/kernel/debug/kmemleak`: `unreferenced object 0x... (size ...)` with the allocation's backtrace |
+| `KASAN` | Out-of-bounds accesses and use after free | `BUG: KASAN: slab-use-after-free in ...`. Doubles memory use and slows the kernel down a lot; fine on a 512 MiB board for testing. `KFENCE` is a sampling alternative cheap enough for production |
+| `UBSAN` | Undefined behavior: shifts, overflows, array bounds | `UBSAN: shift-out-of-bounds in ...` |
+| `DMA_API_DEBUG` | Unmapped buffers, wrong directions, CPU access during DMA (section 18) | `DMA-API: ...` warnings |
+
+**Reading an oops** from your driver works as in the kernel note's section 19: `scripts/decode_stacktrace.sh vmlinux ~/drivers < oops.txt` with the unstripped `.ko` files in that directory, or `scripts/faddr2line ledbtn.ko ledbtn_probe+0x5c/0x1f0`. The `Modules linked in:` line shows `ledbtn(O)` for an out-of-tree module.
+
+**Tracing.** ftrace shows what the driver does without adding prints:
+
+```sh
+# cd /sys/kernel/tracing
+# echo 'ledbtn_*' > set_ftrace_filter && echo function > current_tracer    # needs CONFIG_FUNCTION_TRACER
+# echo 1 > events/irq/enable; echo 1 > events/workqueue/enable
+# echo 1 > events/i2c/enable                                                # every I2C transfer, with data
+# cat trace_pipe
+```
+
+The I2C, SPI, GPIO, regmap and IRQ subsystems have tracepoints: `events/regmap/regmap_reg_read` shows every register value `mytmp102` reads, which settles "is it the hardware or the driver" in seconds.
+
+**Where a device or driver got stuck**, the questions of the kernel note's section 20 apply to your driver:
+
+| Question | Where to look |
+|---|---|
+| Did the device get created? | `ls /sys/bus/platform/devices/`, `/sys/bus/i2c/devices/`; is the node in `/proc/device-tree/` with `status = "okay"`? |
+| Did the driver load and register? | `lsmod`; `ls /sys/bus/<bus>/drivers/<name>/` |
+| Did they match and probe? | `ls -l /sys/bus/<bus>/devices/<dev>/driver`; `dmesg` for the probe message or error |
+| Is the probe deferred? | `cat /sys/kernel/debug/devices_deferred` |
+| Is the module's alias right for autoloading? | `cat /sys/bus/<bus>/devices/<dev>/modalias` against `modinfo -F alias` |
+| Is the interrupt firing? | `/proc/interrupts`, twice |
+| Are the pins configured? | `cat /sys/kernel/debug/pinctrl/44e10800.pinmux-pinctrl-single/pins` |
+
+## 20. Checking a driver without the board
+
+Several checks catch bugs before the driver ever runs. They're cheap enough to run on every change.
+
+- **Compile with warnings**: `make W=1` (extra warnings, which `checkpatch`'s rules assume); `W=12` for more. Compile on a 64-bit configuration too: types like `size_t`, `long` and pointers change size, and the format bug of section 16 only shows there. A separate x86_64 build directory with `defconfig` and the needed subsystems, prepared with `make modules_prepare`, is enough for out-of-tree modules, as the verification of section 2 did.
+- **Without a full kernel build, `modpost` stops the build.** In 7.3, building against a tree that has only been prepared gives (**Real output**):
+
+  ```
+  WARNING: .../Module.symvers is missing.
+           Modules may not have dependencies or modversions.
+           You may get many unresolved symbol errors.
+           You can set KBUILD_MODPOST_WARN=1 to turn errors into warning
+           if you want to proceed at your own risk.
+  ERROR: modpost: hellop.ko: symbol '_printk' undefined!
+  ```
+
+  For a compile check, `KBUILD_MODPOST_WARN=1` lets it finish. For modules you load, build against the kernel tree that produced the running kernel (kernel note, section 15).
+- **`checkpatch.pl`** checks the kernel's coding style and many API mistakes: `scripts/checkpatch.pl --no-tree -f ledbtn.c` for a file, or on a patch. It flagged `msleep(10)` in the first version of `deferred.c` (**Real output**: `WARNING: msleep < 20ms can sleep for up to 20ms; see function description of msleep().`). Every example in this note passes it with no warnings.
+- **sparse** (`make C=1`, needs the `sparse` package) checks address spaces: a `__user` pointer dereferenced directly, an `__iomem` pointer used without `readl()`, endianness annotations (`__be16`) mixed with plain integers. `C=2` checks every file, not only the recompiled ones.
+- **Coccinelle** (`make coccicheck MODE=report M=<dir>`) applies semantic patches that find known bug patterns.
+- **Device tree checks**: `make dtbs_check` validates the board's DTB against the YAML bindings; `make dt_binding_check DT_SCHEMA_FILES=<binding>.yaml` validates a new binding. Both need the `dtschema` Python package. A custom `compatible` without a binding is reported as undocumented, which is expected for `mycompany,`.
+- **QEMU** runs drivers that don't need the BeagleBone's hardware: `mychar`, `mycdev`, `mydebugfs`, `deferred` load unchanged in an Arm QEMU machine (the [Buildroot note](../linux-build-systems/buildroot/buildroot_v1_2026-11-15.md) builds one with `qemu_arm_vexpress_defconfig`). Device drivers can be tried there with QEMU's emulated I2C devices, or by adding a node for a device QEMU's machine has.
+- **KUnit** (`Documentation/dev-tools/kunit/`) runs unit tests inside the kernel, for driver logic that can be separated from the hardware: a conversion function, a protocol parser. `./tools/testing/kunit/kunit.py run` runs them in a UML kernel on the build machine.
+
+## 21. In tree or out of tree, and going upstream
+
+Everything in this note is built out of tree. That's the fastest way to start, and the wrong way to ship for long:
+
+| | Out of tree | In tree (your kernel branch) | Upstream (mainline) |
+|---|---|---|---|
+| Built | Against each kernel separately; rebuilt for every kernel update | With the kernel, from its `Kconfig` and `Makefile` | By everyone |
+| API changes | Break your build, you fix them (section 3) | Same, but you see them when you rebase | Fixed by whoever changes the API |
+| Taint | `O` in every oops (kernel note, section 15) | None | None |
+| Review | None | Yours | The subsystem maintainers' |
+
+**Moving a driver into the tree** is three small edits. For `mytmp102`, in `drivers/hwmon/`:
+
+```
+# drivers/hwmon/Kconfig
+config SENSORS_MYTMP102
+	tristate "TI TMP102 (minimal example driver)"
+	depends on I2C
+	select REGMAP_I2C
+	help
+	  Minimal driver for the TI TMP102 temperature sensor.
+
+	  This driver can also be built as a module. If so, the module
+	  will be called mytmp102.
+
+# drivers/hwmon/Makefile
+obj-$(CONFIG_SENSORS_MYTMP102)	+= mytmp102.o
+```
+
+then `CONFIG_SENSORS_MYTMP102=m` in the board's fragment, and the driver builds and installs with the kernel (kernel note, section 16). `select REGMAP_I2C` is the in-tree equivalent of what the out-of-tree build got for free from a kernel that already had regmap; Kconfig dependencies are where an in-tree driver records them.
+
+**Going upstream**, for a driver of hardware that others use:
+
+- **The binding first.** A YAML file in `Documentation/devicetree/bindings/<subsystem>/`, validated by `make dt_binding_check`, a registered vendor prefix, and a separate patch for it. Bindings describe the hardware, not the driver: no Linux-specific properties.
+- **Follow the subsystem's conventions**: hwmon, IIO and input maintainers each have their own documentation (`Documentation/hwmon/submitting-patches.rst`, for example) and review checklists.
+- **Clean patches**: `checkpatch.pl --strict`, `W=1`, sparse, one logical change per patch, a `Signed-off-by:` line (`git commit -s`, the Developer's Certificate of Origin).
+- **Send them to the right people**: `scripts/get_maintainer.pl <patch>` names the maintainers and lists; `git send-email` or `b4 send` sends them as plain-text mail (`Documentation/process/submitting-patches.rst`).
+- **Add yourself to `MAINTAINERS`** for the new file, and expect several review rounds.
+
+## 22. Troubleshooting by symptom
+
+Messages in quotes come from the kernel source or from the builds run for this note.
+
+**At build time:**
+
+| Symptom | Likely cause | Check, then see |
+|---|---|---|
+| `ERROR: modpost: "<symbol>" ... undefined!` for every symbol, with `Module.symvers is missing` | `KDIR` points to a tree that was configured or prepared but not built | Build the kernel in `KDIR`, or `KBUILD_MODPOST_WARN=1` for a compile check only (section 20) |
+| `ERROR: modpost: ...: missing MODULE_LICENSE()` | No `MODULE_LICENSE()` | Add `MODULE_LICENSE("GPL")` (section 4) |
+| `WARNING: modpost: ...: missing MODULE_DESCRIPTION()` | No `MODULE_DESCRIPTION()` | Add one (section 4) |
+| `module uses symbol '...' from namespace '...', but does not import it.` | Missing `MODULE_IMPORT_NS("...")` | Section 4 |
+| `error: too many arguments to function 'class_create'`, `incompatible pointer type` on `.probe` or `.remove`, `implicit declaration of function 'from_timer'` | Code written for an older kernel API | The table of section 3 |
+| `error: format '%u' expects argument of type 'unsigned int'` | Format specifier doesn't match the type; fatal with `CONFIG_WERROR` | Use `%lu`, `%zu`, `%pad`, `%pe` as appropriate (section 16) |
+
+**When loading or probing:**
+
+| Symptom | Likely cause | Check, then see |
+|---|---|---|
+| `Invalid module format`, `version magic '...' should be '...'` | Module built against another kernel | Rebuild against the board's tree (kernel note, section 8) |
+| `Unknown symbol ...` in `dmesg` | A dependency isn't loaded, or a GPL-only symbol used from a non-GPL module | `modprobe` instead of `insmod`; `MODULE_LICENSE` (section 4) |
+| `insmod` succeeds, nothing happens, no probe message | No device matches: wrong `compatible`, node disabled or absent from the DTB the board actually booted | `/proc/device-tree/`; the `compatible` strings on both sides (sections 10, 11) |
+| The driver works with `insmod` but doesn't load at boot | No `MODULE_DEVICE_TABLE()`, or `depmod` not run after installing | `modinfo -F alias`; `depmod -a` (section 10) |
+| `probe with driver <name> failed with error -2` | `-ENOENT`: often a missing property, such as a `*-gpios` the driver asks for | The driver's `dev_err_probe()` message just before; the node (section 11) |
+| Device listed in `devices_deferred` forever | A resource whose provider never probes: its driver isn't built, or its node is disabled | The reason in `devices_deferred`; enable the provider (section 10) |
+| `-EBUSY` when requesting a GPIO or registers | Another driver (or a `gpio-hog`, or the board's own DTS) already owns them | `/sys/kernel/debug/gpio`, `/proc/iomem` (sections 12, 13) |
+| `Threaded irq requested with handler=NULL and !ONESHOT` | `request_threaded_irq()` without a hard handler and without `IRQF_ONESHOT` | Add `IRQF_ONESHOT` (section 13) |
+| I2C probe fails with `-ENXIO` or `-EREMOTEIO` | Nothing acknowledges at that address: wiring, power, wrong address | `i2cdetect -y -r 2` (section 16) |
+| SPI chip ID reads as `0x00` or `0xff` | No device answering: wiring, chip select, mode, or the pins aren't muxed | `spi-cpol`/`spi-cpha`, the pinmux, an oscilloscope (section 16) |
+| `supply vdd not found, using dummy regulator` | No `vdd-supply` property | Fine if the supply is always on; otherwise add it (section 12) |
+
+**At run time:**
+
+| Symptom | Likely cause | Check, then see |
+|---|---|---|
+| `BUG: sleeping function called from invalid context` | A sleeping call in an interrupt handler, timer, or with a spinlock held | The call chain in the report; move the work to a thread or work item (sections 3, 14) |
+| `WARNING: possible circular locking dependency detected` | Two paths take locks in opposite orders | The two chains in the report (section 15) |
+| The system hangs when the device is used | A spinlock taken in an interrupt and elsewhere without disabling interrupts; a deadlock on a mutex | Lockdep; SysRq `w` (kernel note, section 20) |
+| `irq N: nobody cared`, then `Disabling IRQ #N` | The interrupt isn't acknowledged, or the handler returns `IRQ_NONE` for its own device | The device's status register handling (section 13) |
+| One button press counts several times | Contact bounce | Debounce (section 13) |
+| `read()` returns garbage or the system crashes on a user buffer | User pointer dereferenced directly | `copy_to_user()`; sparse (sections 6, 20) |
+| `cat` on the device never ends | `read()` never returns 0 | Return 0 for end of file, or block (sections 6, 8) |
+| `rmmod` crashes the kernel | A timer, work item or interrupt still running after its memory was freed; mixed managed and non-managed resources | Teardown order (sections 11, 14); `DEBUG_OBJECTS` (section 19) |
+| `rmmod: ERROR: Module ... is in use` | A file is still open, or another module uses its symbols | `lsof`, `lsmod` |
+| Data corruption with DMA, only under load | Wrong DMA direction, CPU touching a mapped buffer, buffer sharing a cache line | `DMA_API_DEBUG` (sections 18, 19) |
+| `unreferenced object` in kmemleak | A missing `kfree()` on an error path | The allocation backtrace; `devm_` allocation (sections 3, 19) |
+
+## 23. Not covered here
+
+- **Building, configuring and installing the kernel**, the boot, and the device tree's role at boot: the [kernel note](../fundamentals/03-kernel/kernel_v1_2026-11-10.md).
+- **Packaging out-of-tree modules** in an image: the [Buildroot](../linux-build-systems/buildroot/buildroot_v1_2026-11-15.md) (`kernel-module` infrastructure) and [Yocto](../linux-build-systems/yocto/yocto_v1_2026-11-14.md) (`module` class) notes.
+- **The userspace side** of device files, `poll`, `epoll` and `mmap`: [Linux systems programming](../../linux-systems-programming/).
+- **Network, Wi-Fi and block drivers**: netdev and NAPI, mac80211 and cfg80211, blk-mq. The [networking](../../networking/fundamentals/fundamentals_v1_2026-10-29.md) and [Wi-Fi](../../../wireless-protocols-and-connectivity/wifi/wifi_v1_2026-11-01.md) notes describe those subsystems from the outside.
+- **USB device drivers** (`usb_driver`, URBs, interfaces and endpoints) and USB gadget functions.
+- **PCI and PCIe drivers**, MSI interrupts, BARs.
+- **`mmap()` of device memory** and `dma-buf` sharing between drivers.
+- **System suspend and resume** in depth, and wake-up sources.
+- **Display and audio** (DRM/KMS, ALSA and ASoC), which are subsystems of their own.
+- **Rust drivers**: the kernel accepts drivers written in Rust for some subsystems, with abstractions in `rust/kernel/`.
+- **Real-time behavior** of drivers under `PREEMPT_RT`, where spinlocks become sleeping locks and most interrupt handlers run in threads.
+
+## References
+
+Kernel documentation (in the source tree under `Documentation/`, also at https://docs.kernel.org):
+
+- `driver-api/driver-model/` (`binding.rst`, `bus.rst`, `devres.rst`, `platform.rst`): the driver model and managed resources.
+- `driver-api/gpio/consumer.rst`, `driver-api/i2c.rst`, `driver-api/spi.rst`, `driver-api/dmaengine/`: the GPIO, I2C, SPI and DMA engine APIs.
+- `core-api/dma-api.rst`, `core-api/dma-api-howto.rst`: the DMA mapping API.
+- `core-api/memory-allocation.rst`, `core-api/workqueue.rst`, `core-api/genericirq.rst`: allocation, workqueues and interrupts.
+- `kernel-hacking/locking.rst` ("Unreliable Guide To Locking"), `locking/lockdep-design.rst`: locking.
+- `timers/delay_sleep_functions.rst`, `timers/hrtimers.rst`: delays and high-resolution timers.
+- `filesystems/sysfs.rst`, `filesystems/debugfs.rst`, `ABI/README`: sysfs, debugfs and the ABI rules.
+- `userspace-api/ioctl/ioctl-number.rst`, `driver-api/ioctl.rst`: ioctl numbers and design.
+- `hwmon/hwmon-kernel-api.rst`, `hwmon/sysfs-interface.rst`, `driver-api/iio/`, `input/input-programming.rst`, `leds/leds-class.rst`: the subsystems of section 17.
+- `power/runtime_pm.rst`: runtime power management.
+- `dev-tools/` (`kasan.rst`, `kfence.rst`, `kmemleak.rst`, `ubsan.rst`, `sparse.rst`, `coccinelle.rst`, `checkpatch.rst`, `kunit/`): the checking tools of sections 19 and 20.
+- `devicetree/bindings/writing-schema.rst`, `devicetree/bindings/submitting-patches.rst`: bindings.
+- `process/submitting-patches.rst`, `process/submit-checklist.rst`: going upstream.
+
+Linux source, 7.3 (commit `c03c1a145`), files cited in the note:
+
+- `drivers/base/dd.c`, `drivers/base/platform.c`, `drivers/base/devres.c`, `drivers/of/device.c`, `drivers/of/module.c`, `drivers/of/platform.c`
+- `drivers/char/misc.c`, `fs/char_dev.c`, `fs/open.c`, `fs/read_write.c`, `fs/kernfs/file.c`
+- `include/linux/device/class.h`, `include/linux/platform_device.h`, `include/linux/i2c.h`, `include/linux/spi/spi.h`, `include/linux/gpio/consumer.h`, `include/linux/timer.h`, `include/linux/hrtimer.h`, `include/linux/workqueue.h`, `include/linux/devm-helpers.h`, `include/linux/cleanup.h`, `include/linux/hwmon.h`, `include/linux/kfifo.h`
+- `kernel/irq/manage.c`, `kernel/irq/spurious.c`, `kernel/module/main.c`, `kernel/sched/core.c`, `scripts/mod/modpost.c`, `init/Kconfig`
+- `drivers/i2c/i2c-core-base.c`, `drivers/spi/spi.c`, `drivers/spi/spidev.c`, `drivers/gpio/gpio-omap.c`, `drivers/hwmon/tmp102.c`, `drivers/regulator/core.c`
+- `arch/arm/boot/dts/ti/omap/am335x-boneblack.dts`, `am335x-bone-common.dtsi`, `am33xx.dtsi`, `am33xx-l4.dtsi`, `include/dt-bindings/pinctrl/am33xx.h`
+- `arch/arm/configs/omap2plus_defconfig`, `arch/arm/Kconfig`
+- `Documentation/devicetree/bindings/vendor-prefixes.yaml`, `Documentation/userspace-api/ioctl/ioctl-number.rst`
+
+Hardware:
+
+- AM335x and AMIC110 Sitara Processors Technical Reference Manual, SPRUH73Q, Texas Instruments: https://www.ti.com/lit/ug/spruh73q/spruh73q.pdf (pad configuration, GPIO, I2C, McSPI, EDMA).
+- BeagleBone Black System Reference Manual, header pin tables: https://docs.beagleboard.org/boards/beaglebone/black/
+- TMP102 datasheet, SBOS397, Texas Instruments: https://www.ti.com/lit/ds/symlink/tmp102.pdf
+- BMP280 datasheet, Bosch Sensortec (register map, SPI read bit, chip ID 0x58).
+
+Tools and books:
+
+- Elixir cross-referencer, to look up any kernel symbol in any version: https://elixir.bootlin.com
+- Bootlin's "Linux kernel and driver development" training materials, freely available: https://bootlin.com/training/kernel/
+- Jonathan Corbet, Alessandro Rubini, Greg Kroah-Hartman, *Linux Device Drivers*, 3rd edition (2005): the concepts still hold; most API details have changed (section 3).
+- John Madieu, *Linux Device Driver Development*, 2nd edition: device tree based drivers on embedded boards.
+
+---
+
+Version 1 · 2026-11-19

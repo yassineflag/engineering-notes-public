@@ -453,4 +453,335 @@ flowchart LR
 
 ---
 
+## Part 3: Addressing
+
+## 9. MAC addresses
+
+A **MAC address** (Media Access Control) identifies a network interface on its local link. It's 48 bits, written as six bytes in hexadecimal:
+
+```
+00:1a:2b:3c:4d:5e        Linux, macOS
+00-1A-2B-3C-4D-5E        Windows
+001a.2b3c.4d5e           some switch vendors
+└──┬───┘└──┬───┘
+  OUI    device part
+```
+
+- The first three bytes are the **OUI** (Organizationally Unique Identifier), assigned by the IEEE to the manufacturer. Lookup tools tell you the vendor from it.
+- The last three bytes are chosen by the manufacturer, so every NIC leaves the factory with a unique address.
+
+Special MAC addresses:
+
+| Address | Meaning |
+|---|---|
+| `ff:ff:ff:ff:ff:ff` | **Broadcast:** every device on the link receives it |
+| First byte odd (lowest bit 1), e.g. `01:00:5e:...` | **Multicast:** a group of devices |
+| Second-lowest bit of the first byte set: for unicast, the second hex digit is `2`, `6`, `A` or `E` (e.g. `02:...`, `da:...`) | **Locally administered:** set by software, not the factory |
+
+Phones and laptops now often use a **random MAC** per Wi-Fi network for privacy, which is why such addresses are locally administered.
+
+**MAC addresses only matter on the local link.** A router throws away the Ethernet header and builds a new one for the next link. A server on the internet never sees your laptop's MAC address.
+
+---
+
+## 10. IPv4 addresses
+
+An **IPv4 address** identifies a host interface across networks. It's 32 bits, written as four decimal numbers from 0 to 255 separated by dots (**dotted decimal**):
+
+```
+192    .168     .10      .20
+11000000.10101000.00001010.00010100
+```
+
+Every IP address has two parts:
+
+- The **network part** says which network the host is on. All hosts of one LAN share it.
+- The **host part** identifies the host inside that network.
+
+Where the split happens is given by the **subnet mask** or, more commonly today, the **prefix length** in **CIDR notation** (Classless Inter-Domain Routing):
+
+```
+Address:   192.168.10.20
+Mask:      255.255.255.0       = 24 bits set to 1
+CIDR:      192.168.10.20/24
+
+           11000000.10101000.00001010 . 00010100
+           └──────── network ───────┘   └ host ┘
+                 24 bits                  8 bits
+```
+
+To find the **network address**, AND the address with the mask bit by bit. Everything in the host part becomes 0:
+
+```
+  11000000.10101000.00001010.00010100   192.168.10.20
+& 11111111.11111111.11111111.00000000   255.255.255.0
+= 11000000.10101000.00001010.00000000   192.168.10.0   ← network address
+```
+
+**Why it matters:** a host uses the mask to decide whether a destination is **local** (same network: send it directly) or **remote** (another network: send it to the router). Section 18 explains this decision.
+
+### Address classes (history only)
+
+Before 1993, the first bits of an address fixed its mask: class A (`/8`), class B (`/16`), class C (`/24`). CIDR replaced classes so networks can have any size. You'll still hear "a class C" to mean a `/24`.
+
+---
+
+## 11. Subnetting
+
+**Subnetting** splits one network into smaller ones. You do it to keep departments, guests or device types apart, to limit broadcast traffic, and to avoid wasting addresses.
+
+### How many hosts fit
+
+With a prefix of `/n`, there are 32 − n host bits, so 2^(32 − n) addresses. Two of them are reserved in each subnet:
+
+- The **network address** (host bits all 0) names the subnet itself.
+- The **broadcast address** (host bits all 1) reaches every host in it.
+
+So the number of usable hosts is **2^(32 − n) − 2**.
+
+| Prefix | Mask | Addresses | Usable hosts | Typical use |
+|---|---|---|---|---|
+| `/8` | `255.0.0.0` | 16,777,216 | 16,777,214 | Very large private network (`10.0.0.0/8`) |
+| `/16` | `255.255.0.0` | 65,536 | 65,534 | Large site |
+| `/24` | `255.255.255.0` | 256 | 254 | A home or office LAN |
+| `/25` | `255.255.255.128` | 128 | 126 | |
+| `/26` | `255.255.255.192` | 64 | 62 | A small department |
+| `/27` | `255.255.255.224` | 32 | 30 | |
+| `/28` | `255.255.255.240` | 16 | 14 | A small server group |
+| `/29` | `255.255.255.248` | 8 | 6 | A block of public IPs from an ISP |
+| `/30` | `255.255.255.252` | 4 | 2 | A link between two routers |
+| `/31` | `255.255.255.254` | 2 | 2 | A point-to-point link (RFC 3021, no network or broadcast address) |
+| `/32` | `255.255.255.255` | 1 | 1 | One single host, used in routes and firewall rules |
+
+Each extra bit of prefix halves the subnet. Each bit less doubles it.
+
+### Example: split a /24 into four /26
+
+An office has `192.168.10.0/24` and wants four separate networks. Four subnets need 2 more bits (2² = 4), so the prefix becomes `/26`, with 64 addresses each:
+
+| Subnet | Network address | Usable hosts | Broadcast | Use |
+|---|---|---|---|---|
+| 1 | `192.168.10.0/26` | `.1` to `.62` | `.63` | Staff |
+| 2 | `192.168.10.64/26` | `.65` to `.126` | `.127` | Servers |
+| 3 | `192.168.10.128/26` | `.129` to `.190` | `.191` | Guests |
+| 4 | `192.168.10.192/26` | `.193` to `.254` | `.255` | Printers and devices |
+
+### Example: which subnet is a host in?
+
+Host `192.168.10.70/26`. The mask `/26` is `255.255.255.192`. Only the last byte matters here:
+
+```
+   70  = 01000110
+& 192  = 11000000
+=  64  = 01000000   → network 192.168.10.64/26
+```
+
+So the host is in subnet 2: network `.64`, broadcast `.127`, and hosts `.65` to `.126` are its neighbors. A quick shortcut: the subnet size is 256 − 192 = 64, so subnets start at multiples of 64 (0, 64, 128, 192), and 70 falls in the one starting at 64.
+
+### Supernetting and route summarization
+
+The reverse also works: four `/26` subnets together are one `/24`, and `192.168.0.0/24` plus `192.168.1.0/24` are `192.168.0.0/23`. Routers use this to advertise one short route instead of many long ones.
+
+---
+
+## 12. Public, private and special addresses
+
+**Public addresses** are unique on the whole internet. Regional registries (RIPE NCC, ARIN, APNIC...) give them to ISPs and organizations. IPv4 has only about 4.3 billion addresses, and they ran out in the 2010s.
+
+**Private addresses** (RFC 1918) can be used by anyone inside their own network. They're never routed on the internet, so millions of homes all use `192.168.1.0/24` without conflict. NAT (section 24) lets these hosts reach the internet through a public address.
+
+| Range | CIDR | Used for |
+|---|---|---|
+| `10.0.0.0` to `10.255.255.255` | `10.0.0.0/8` | Private: companies, cloud networks |
+| `172.16.0.0` to `172.31.255.255` | `172.16.0.0/12` | Private: companies, Docker's default networks |
+| `192.168.0.0` to `192.168.255.255` | `192.168.0.0/16` | Private: home routers |
+| `127.0.0.0` to `127.255.255.255` | `127.0.0.0/8` | **Loopback:** the host itself (`127.0.0.1` = "localhost") |
+| `169.254.0.0` to `169.254.255.255` | `169.254.0.0/16` | **Link-local:** self-assigned when DHCP fails |
+| `100.64.0.0` to `100.127.255.255` | `100.64.0.0/10` | **Shared address space** for carrier-grade NAT (CGNAT) |
+| `224.0.0.0` to `239.255.255.255` | `224.0.0.0/4` | **Multicast** (section 16) |
+| `0.0.0.0` | | "This host" or "any address", depending on context |
+| `255.255.255.255` | | Broadcast on the local link |
+| `192.0.2.0/24`, `198.51.100.0/24`, `203.0.113.0/24` | | **Documentation:** for examples like the ones in this note |
+
+**A `169.254.x.x` address is a symptom:** the host asked for an address with DHCP, got no answer, and gave itself one. It can only talk to the local link.
+
+---
+
+## 13. IPv6
+
+**IPv6** was designed to replace IPv4 because IPv4 addresses ran out. An IPv6 address is **128 bits**, written as eight groups of four hexadecimal digits:
+
+```
+2001:0db8:0000:0000:0000:ff00:0042:8329
+```
+
+Two rules shorten it:
+
+1. Drop the leading zeros in each group: `0db8` → `db8`, `0042` → `42`, `0000` → `0`.
+2. Replace **one** run of consecutive all-zero groups with `::`.
+
+```
+2001:0db8:0000:0000:0000:ff00:0042:8329
+2001:db8:0:0:0:ff00:42:8329
+2001:db8::ff00:42:8329
+```
+
+`::` can appear only once, otherwise you couldn't tell how many zeros each one stands for.
+
+### Structure
+
+A typical IPv6 address on a LAN splits in two halves:
+
+```
+2001:db8:abcd:0012 : 0000:0000:0000:0001
+└──── prefix /64 ┘   └─ interface ID ──┘
+ network (from the router)   host
+```
+
+Almost every LAN is a **/64**. That's 2^64 addresses per LAN, so you never run out of hosts, and subnetting is done in the prefix part. An ISP typically gives a home a /56 or /48, which is 256 or 65,536 LANs.
+
+### Address types
+
+| Prefix | Type | Meaning |
+|---|---|---|
+| `2000::/3` | **Global unicast** | Public, routable on the internet. Most start with `2` or `3` |
+| `fe80::/10` | **Link-local** | Every IPv6 interface has one. Only valid on its link, never routed |
+| `fc00::/7` (in practice `fd00::/8`) | **Unique local (ULA)** | Private addresses, like RFC 1918 for IPv4 |
+| `ff00::/8` | **Multicast** | Groups of hosts. IPv6 has **no broadcast** |
+| `::1/128` | **Loopback** | The host itself, like `127.0.0.1` |
+| `::/128` | Unspecified | "No address yet" |
+| `2001:db8::/32` | Documentation | For examples |
+
+### How hosts get an IPv6 address
+
+- **SLAAC** (stateless address autoconfiguration): the router announces the /64 prefix in **router advertisements**, and the host builds its own address from it. No server needed.
+- **DHCPv6:** a server hands out addresses, like DHCP for IPv4.
+- **Static:** configured by hand, usually for servers and routers.
+
+A host usually has **several IPv6 addresses at once**: a link-local one, one or more global ones, often a temporary one that changes for privacy.
+
+### IPv4 and IPv6 together
+
+The two protocols aren't compatible on the wire. Most networks run both side by side (**dual stack**): hosts have an IPv4 and an IPv6 address, and applications try IPv6 first. Some mobile networks are IPv6-only and translate to IPv4 at the edge (NAT64).
+
+| | IPv4 | IPv6 |
+|---|---|---|
+| Address size | 32 bits | 128 bits |
+| Notation | `192.168.10.20` | `2001:db8::14` |
+| Typical LAN | `/24` | `/64` |
+| Address configuration | DHCP or static | SLAAC, DHCPv6 or static |
+| Address to MAC resolution | ARP | Neighbor Discovery (ICMPv6) |
+| Broadcast | Yes | No, multicast instead |
+| NAT | Everywhere | Rare: addresses are plentiful |
+
+---
+
+## 14. Ports and sockets
+
+An IP address gets a packet to the right **host**. A **port number** gets it to the right **program** on that host. A server runs many services at once (web, SSH, mail), each listening on its own port.
+
+Ports are 16-bit numbers, 0 to 65535, and are separate for TCP and UDP.
+
+| Range | Name | Used by |
+|---|---|---|
+| 0 to 1023 | Well-known ports | Standard services (HTTP 80, HTTPS 443, SSH 22) |
+| 1024 to 49151 | Registered ports | Other applications (MQTT 1883, databases) |
+| 49152 to 65535 | Dynamic or ephemeral ports | Picked at random by clients for their side of a connection |
+
+The ephemeral range is IANA's recommendation. Operating systems use their own: Linux defaults to 32768 to 60999.
+
+**Socket and 5-tuple:** one connection is identified by five values. This is how a server tells apart thousands of clients all connected to port 443:
+
+```
+Protocol   Source IP        Source port   Destination IP     Destination port
+TCP        192.168.10.100   51514         198.51.100.20      443
+TCP        192.168.10.100   51515         198.51.100.20      443    ← second browser tab
+TCP        192.0.2.77       40122         198.51.100.20      443    ← another client
+```
+
+A **socket** is one end of such a connection, an IP address plus a port: `198.51.100.20:443`. IPv6 addresses go in brackets: `[2001:db8::14]:443`.
+
+Common ports worth knowing are listed in section 26.
+
+---
+
+## 15. ARP: from IP address to MAC address
+
+To send a packet on an Ethernet or Wi-Fi link, a host needs the **MAC address** of the next device. It usually only knows the IP address. **ARP** (Address Resolution Protocol) finds the MAC address for an IPv4 address on the local link.
+
+```mermaid
+sequenceDiagram
+    participant L as Laptop 192.168.10.100
+    participant S as Switch
+    participant B as Board 192.168.10.20
+    participant O as Other hosts
+    L->>S: ARP request, broadcast: who has 192.168.10.20? Tell 192.168.10.100
+    S->>B: flooded to all ports
+    S->>O: flooded to all ports, ignored
+    B->>L: ARP reply, unicast: 192.168.10.20 is at 00:1a:2b:3c:4d:5e
+    Note over L: stores the answer in its ARP cache
+    L->>B: IP packet in an Ethernet frame to 00:1a:2b:3c:4d:5e
+```
+
+1. The laptop broadcasts a request (destination MAC `ff:ff:ff:ff:ff:ff`): "who has 192.168.10.20?".
+2. Every host on the LAN receives it. Only the owner of that address answers.
+3. The reply comes back directly to the laptop with the MAC address.
+4. The laptop keeps the answer in its **ARP cache** for a few minutes, so it doesn't ask before every packet.
+
+**For a destination on another network, the host ARPs for the router, not the destination.** A laptop sending to a server on the internet only needs the MAC address of its default gateway (section 18).
+
+Related terms:
+
+- **Gratuitous ARP:** a host announces its own IP and MAC address without being asked, for example after boot or when a backup router takes over an address.
+- **ARP spoofing:** an attacker answers ARP requests with its own MAC address to intercept traffic. It only works from inside the LAN, which is one reason to keep untrusted devices on a separate network.
+- **IPv6** doesn't use ARP. It does the same job with **Neighbor Discovery** (NDP), using ICMPv6 multicast messages instead of broadcasts.
+
+---
+
+## 16. Unicast, broadcast, multicast and anycast
+
+There are four ways to address a packet, depending on how many receivers it has.
+
+```
+Unicast        one to one          A ──────► B
+
+Broadcast      one to all          A ──┬──► B
+               on the local link       ├──► C
+                                       └──► D
+
+Multicast      one to a group      A ──┬──► B   (joined the group)
+               that asked for it       └──► D   (joined the group)
+                                            C   (didn't join, receives nothing)
+
+Anycast        one to the nearest  A ──────► nearest of several servers
+               of several              sharing one address
+```
+
+- **Unicast:** the normal case. Web browsing, SSH, file transfers.
+- **Broadcast:** sent to every host on the local network. ARP and DHCP rely on it because the sender doesn't know who to ask yet. IPv4 only.
+- **Multicast:** sent to the hosts that joined a group. Used for IPTV, service discovery (mDNS, section 26), routing protocols and IPv6 neighbor discovery.
+- **Anycast:** many servers in different places share the same address, and routing delivers each packet to the nearest one. Public DNS resolvers like `1.1.1.1` and `8.8.8.8`, and content delivery networks, use anycast.
+
+### Broadcast domains and collision domains
+
+- A **broadcast domain** is the set of devices that receive each other's broadcasts. One LAN or one VLAN is one broadcast domain. **Routers stop broadcasts**, so they separate broadcast domains.
+- A **collision domain** is the set of devices whose transmissions can collide. On a hub, all ports share one. On a switch, each port is its own, and with full duplex collisions don't happen at all.
+
+```mermaid
+flowchart LR
+    subgraph BD1["Broadcast domain 1: 192.168.10.0/24"]
+        A["PC A"] --- SW1["Switch"]
+        B["PC B"] --- SW1
+    end
+    subgraph BD2["Broadcast domain 2: 192.168.20.0/24"]
+        SW2["Switch"] --- C["PC C"]
+        SW2 --- D["PC D"]
+    end
+    SW1 --- R{{"Router<br/>broadcasts stop here"}} --- SW2
+```
+
+Too many hosts in one broadcast domain means a lot of broadcast traffic that every host must process. That's one reason large networks are split into subnets and VLANs.
+
+---
+
 Version 1 · 2026-11-20

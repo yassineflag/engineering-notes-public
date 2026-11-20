@@ -784,4 +784,624 @@ Too many hosts in one broadcast domain means a lot of broadcast traffic that eve
 
 ---
 
+## Part 4: Moving data
+
+## 17. Switching and VLANs
+
+### How a switch learns
+
+A switch keeps a **MAC address table**: which MAC address was last seen on which port. It fills it by itself, by reading the **source** MAC of every frame it receives.
+
+```
+MAC address table
+Port   MAC address           Learned from
+1      00:1a:2b:00:00:aa     a frame sent by PC A
+2      00:1a:2b:00:00:bb     a frame sent by PC B
+5      00:1a:2b:00:00:01     a frame sent by the router
+```
+
+For each frame, the switch looks up the **destination** MAC:
+
+- **Known:** send the frame out that one port only.
+- **Unknown, broadcast or multicast:** send it out every port except the one it came in on. This is **flooding**.
+
+```mermaid
+sequenceDiagram
+    participant A as PC A port 1
+    participant SW as Switch
+    participant B as PC B port 2
+    participant C as PC C port 3
+    A->>SW: frame from A to B
+    Note over SW: learns A is on port 1. B unknown
+    SW->>B: flooded
+    SW->>C: flooded, C drops it
+    B->>SW: reply from B to A
+    Note over SW: learns B is on port 2. A known
+    SW->>A: sent to port 1 only
+```
+
+Entries expire after a few minutes without traffic (5 minutes is a common default), so the table follows devices that move.
+
+### Switching loops and the Spanning Tree Protocol
+
+Redundant links between switches are good for reliability but create **loops**. Ethernet frames have no TTL, so a broadcast caught in a loop circles forever and multiplies, a **broadcast storm** that can take a whole network down in seconds.
+
+The **Spanning Tree Protocol** (STP, IEEE 802.1D, and the faster **RSTP**, 802.1w) prevents this. Switches agree on a loop-free tree and **block** the redundant ports. If an active link fails, a blocked port takes over.
+
+```
+   [Switch A]═══════[Switch B]
+        ║               ║
+        ║               ║            ═══ forwarding
+        ╚═══[Switch C]──╳            ─╳─ blocked by STP
+```
+
+### Link aggregation
+
+**Link aggregation** (LACP, IEEE 802.1AX) bundles several cables between two devices into one logical link: two 1 Gbit/s links act as one 2 Gbit/s link, and the bundle keeps working if one cable fails. Each single connection still uses only one of the cables.
+
+### VLANs
+
+A **VLAN** (virtual LAN) splits one physical switch into several separate LANs. Devices in different VLANs can't talk at layer 2, as if they were plugged into different switches. Each VLAN is its own broadcast domain and usually its own IP subnet.
+
+Typical use: staff, guests, IP phones and cameras share the same switches but stay apart.
+
+```mermaid
+flowchart TB
+    subgraph SW["One physical switch"]
+        v10["VLAN 10: Staff<br/>192.168.10.0/24"]
+        v20["VLAN 20: Guests<br/>192.168.20.0/24"]
+        v30["VLAN 30: Cameras<br/>192.168.30.0/24"]
+    end
+    pc1["PC"] --- v10
+    pc2["PC"] --- v10
+    g1["Guest laptop"] --- v20
+    cam["Camera"] --- v30
+    SW ---|"trunk: all VLANs, tagged"| R{{"Router or firewall<br/>routes between VLANs, applies rules"}}
+```
+
+Switch ports come in two kinds:
+
+- An **access port** belongs to one VLAN. The device plugged in (a PC, a printer) doesn't know VLANs exist.
+- A **trunk port** carries several VLANs over one cable, usually between switches or to a router. Each frame carries a **802.1Q tag**: 4 extra bytes in the Ethernet header holding the VLAN ID (a 12-bit number, usable values 1 to 4094).
+
+```
+Untagged frame:  [dst MAC][src MAC][type][payload][FCS]
+Tagged frame:    [dst MAC][src MAC][802.1Q tag: VLAN 20][type][payload][FCS]
+```
+
+To go from one VLAN to another, traffic must pass through a **router** (or a **layer 3 switch**, a switch that can also route). That's where firewall rules decide, for example, that guests may reach the internet but not the staff VLAN.
+
+---
+
+## 18. Routing
+
+**Routing** moves packets between networks. Every host and every router makes the same decision for each packet: "where do I send this next?".
+
+### The host's decision: local or remote
+
+A host compares the destination address with its own network (address and mask, section 10):
+
+```mermaid
+flowchart TD
+    start["Packet to send to destination IP"] --> q{"Is the destination in my subnet?"}
+    q -->|"Yes: local"| local["ARP for the destination's MAC<br/>send the frame directly to it"]
+    q -->|"No: remote"| remote["ARP for the default gateway's MAC<br/>send the frame to the router"]
+```
+
+Example, laptop `192.168.10.100/24`:
+
+- To `192.168.10.20`: same `/24`, so send it directly.
+- To `198.51.100.20`: different network, so send it to the **default gateway** `192.168.10.1`.
+
+The **default gateway** is the router a host sends everything that isn't local to. A wrong or missing gateway gives the classic symptom: the LAN works, but nothing beyond it does.
+
+### The routing table
+
+Each router (and each host) has a **routing table**: a list of destination networks and where to send packets for them.
+
+```
+Destination        Next hop         Interface   Meaning
+192.168.10.0/24    (directly)       LAN         My own LAN
+192.168.20.0/24    (directly)       Guest       My guest network
+10.50.0.0/16       192.168.10.254   LAN         Office network, behind another router
+0.0.0.0/0          203.0.113.1      WAN         Everything else: the default route, to the ISP
+```
+
+- `0.0.0.0/0` matches every address. It's the **default route**, "if nothing else matches, go this way".
+- When several routes match, the **longest prefix** wins, because it's the most specific. A packet to `10.50.3.4` matches both `10.50.0.0/16` and `0.0.0.0/0`, and the `/16` wins.
+
+### Hop by hop
+
+No router knows the whole path. Each one only knows the **next hop**, and each one decides again. A packet from a laptop to a server crosses maybe 10 to 20 routers this way.
+
+```mermaid
+flowchart LR
+    L["Laptop"] -->|"default gateway"| H["Home router"]
+    H -->|"default route"| I1["ISP router"]
+    I1 --> I2["ISP core router"]
+    I2 -->|"route to 198.51.100.0/24"| T["Transit or peer network"]
+    T --> D["Data center router"]
+    D --> S["Server 198.51.100.20"]
+```
+
+Each router decrements the packet's **TTL** (time to live, called hop limit in IPv6) by 1 and drops the packet when it reaches 0. A packet caught in a routing loop dies after at most 255 hops instead of circling forever.
+
+### Static and dynamic routing
+
+- **Static routes** are entered by hand. Fine for a home or a small office with one way out.
+- **Dynamic routing protocols** let routers tell each other which networks they can reach, and react when a link fails.
+
+| Protocol | Kind | Where it's used |
+|---|---|---|
+| RIP | Distance vector: counts hops | Old and small networks |
+| OSPF | Link state: each router builds a map of the network | Inside companies and ISPs |
+| IS-IS | Link state | Inside large ISPs |
+| BGP | Path vector, between organizations | The internet itself |
+
+### How the internet is routed: autonomous systems and BGP
+
+The internet is made of tens of thousands of **autonomous systems** (AS): networks run by one organization with one routing policy, each with an AS number. ISPs, cloud providers, big companies and universities each have one or more.
+
+- **Inside** an AS, routers use an **interior** protocol (OSPF, IS-IS).
+- **Between** ASes, routers use **BGP** (Border Gateway Protocol) to announce "I can reach these prefixes". BGP choices are driven by business relationships as much as by distance.
+
+```mermaid
+flowchart LR
+    subgraph AS1["AS 64500: your ISP"]
+        a1["router"] --- a2["router"]
+    end
+    subgraph AS2["AS 64501: transit provider"]
+        b1["router"] --- b2["router"]
+    end
+    subgraph AS3["AS 64502: cloud provider"]
+        c1["router"] --- c2["router"]
+    end
+    a2 ---|"BGP"| b1
+    b2 ---|"BGP"| c1
+    a2 ---|"BGP: direct peering"| c1
+```
+
+(AS numbers 64496 to 64511 are reserved for documentation.)
+
+---
+
+## 19. TCP
+
+**TCP** (Transmission Control Protocol) gives programs a **reliable byte stream**: everything sent arrives, in order, without duplicates, or the connection reports an error. It's used by the web, email, SSH, file transfers and most other applications.
+
+### The three-way handshake
+
+Before sending data, the two sides open a **connection**:
+
+```mermaid
+sequenceDiagram
+    participant C as Client
+    participant S as Server port 443
+    C->>S: SYN, seq=x. I want to connect
+    S->>C: SYN-ACK, seq=y, ack=x+1. OK, me too
+    C->>S: ACK, ack=y+1. Connected
+    Note over C,S: data flows both ways
+    C->>S: FIN. I'm done sending
+    S->>C: ACK
+    S->>C: FIN. Me too
+    C->>S: ACK
+```
+
+- **SYN** (synchronize) opens a connection and picks a starting sequence number.
+- **ACK** (acknowledge) confirms what was received.
+- **FIN** (finish) closes one direction. Each side closes its own, so a normal close takes four messages.
+- **RST** (reset) aborts a connection at once, for example when a client connects to a port where nothing listens.
+
+### How TCP stays reliable
+
+- **Sequence numbers:** every byte has a number, so the receiver can put segments back in order and spot gaps.
+- **Acknowledgments:** the receiver says which bytes it has received.
+- **Retransmission:** if no acknowledgment comes back in time, the sender sends the data again.
+- **Checksum:** corrupted segments are detected and dropped, then retransmitted.
+
+### Flow control and congestion control
+
+- **Flow control:** the receiver announces a **window**, how much data it can accept right now. The sender never sends more, so a slow receiver isn't overwhelmed.
+- **Congestion control:** the sender starts slowly (**slow start**) and speeds up until packets get lost or delayed, then backs off. This is how millions of connections share the internet without collapsing it.
+
+**Consequence:** a new TCP connection is slow for its first round trips, and a lossy link (bad Wi-Fi, weak cellular) makes TCP slow down a lot, because it reads loss as congestion.
+
+### Connection states
+
+A connection goes through states such as `LISTEN` (a server waiting for clients), `SYN-SENT`, `ESTABLISHED` (open), `FIN-WAIT`, `TIME-WAIT` (closed, waiting for stray packets) and `CLOSE-WAIT` (the other side closed, our program hasn't yet). Tools like `netstat` and `ss` show them. Many `CLOSE-WAIT` sockets usually mean a program that forgets to close its connections.
+
+---
+
+## 20. UDP, and choosing between TCP and UDP
+
+**UDP** (User Datagram Protocol) just sends **datagrams**: no connection, no acknowledgments, no retransmission, no ordering. Each datagram may arrive, arrive twice, arrive out of order, or not arrive at all. The application deals with that if it cares.
+
+The upside: no handshake, no waiting for lost data, very little overhead (an 8-byte header against TCP's 20 or more).
+
+| | TCP | UDP |
+|---|---|---|
+| Connection | Yes, handshake first | No |
+| Reliability | Lost data is resent | Lost data stays lost |
+| Order | Guaranteed | Not guaranteed |
+| Speed to first byte | One round trip for the handshake | Immediate |
+| Header | 20 to 60 bytes | 8 bytes |
+| Broadcast and multicast | No | Yes |
+| Typical uses | Web, email, SSH, file transfer, databases | DNS, DHCP, voice and video calls, games, streaming, NTP, QUIC |
+
+**Why voice and games use UDP:** a voice packet that arrives late is useless. It's better to skip it than to pause the call waiting for a retransmission.
+
+**QUIC** is a newer transport built on top of UDP. It adds reliability, encryption and multiple streams in user space, and carries **HTTP/3**. It avoids some of TCP's delays, especially on mobile networks.
+
+---
+
+## 21. ICMP, ping, traceroute and MTU
+
+**ICMP** (Internet Control Message Protocol) carries error and diagnostic messages for IP. It has no ports. Routers and hosts send ICMP messages when something goes wrong.
+
+| ICMP message | Meaning |
+|---|---|
+| Echo request / echo reply | "Are you there?" / "Yes". Used by `ping` |
+| Destination unreachable | No route, host down, port closed, or "packet too big, fragmentation needed" |
+| Time exceeded | The TTL reached 0. Used by `traceroute` |
+| Redirect | "Use this other router for that destination" |
+
+IPv6 has its own version, **ICMPv6**, which also does neighbor discovery and router advertisements. Blocking ICMPv6 breaks IPv6.
+
+### ping
+
+`ping` sends echo requests and measures the round-trip time:
+
+```
+$ ping -c 3 198.51.100.20
+64 bytes from 198.51.100.20: icmp_seq=1 ttl=54 time=12.3 ms
+64 bytes from 198.51.100.20: icmp_seq=2 ttl=54 time=11.9 ms
+64 bytes from 198.51.100.20: icmp_seq=3 ttl=54 time=12.1 ms
+```
+
+A reply proves that IP works both ways. No reply doesn't prove the host is down: many firewalls block ping.
+
+### traceroute
+
+`traceroute` (`tracert` on Windows) shows the routers on the path. It sends packets with TTL 1, then 2, then 3, and so on. Each router that drops a packet because its TTL ran out sends back a "time exceeded" message, which reveals its address.
+
+```mermaid
+sequenceDiagram
+    participant L as Laptop
+    participant R1 as Router 1
+    participant R2 as Router 2
+    participant S as Server
+    L->>R1: TTL=1
+    R1->>L: time exceeded, from Router 1
+    L->>R1: TTL=2
+    R1->>R2: TTL=1
+    R2->>L: time exceeded, from Router 2
+    L->>R1: TTL=3
+    R1->>R2: TTL=2
+    R2->>S: TTL=1
+    S->>L: reply, destination reached
+```
+
+A line of `* * *` means that router didn't answer, which is often just a router configured not to reply, not a failure.
+
+### MTU and fragmentation
+
+The **MTU** (maximum transmission unit) is the largest packet a link can carry. Ethernet's is **1500 bytes**. Tunnels and VPNs add headers, so the usable MTU inside them is smaller (for example about 1420 for WireGuard).
+
+When a packet is bigger than the next link's MTU:
+
+- **IPv4** routers can **fragment** it into smaller pieces, unless the sender set the **Don't Fragment** bit. Modern hosts set it and use **Path MTU Discovery**: the router drops the packet and sends back "fragmentation needed", and the sender sends smaller packets.
+- **IPv6** routers never fragment. They always send "packet too big", and only the sender can fragment.
+
+TCP avoids the problem with the **MSS** (maximum segment size): each side announces how much data fits in one segment. On Ethernet with IPv4, MSS = 1500 − 20 (IP) − 20 (TCP) = **1460 bytes**.
+
+**Classic symptom of an MTU problem:** small things work (ping, SSH login, small web pages), but large transfers hang. Usually a firewall blocks the ICMP "too big" messages, so the sender never learns to send smaller packets. This is called a **PMTU black hole**.
+
+---
+
+## Part 5: Core services
+
+## 22. DHCP: getting an address automatically
+
+A host needs four things to use an IP network: an **IP address**, a **subnet mask**, a **default gateway** and **DNS servers**. Typing them on every device would be painful. **DHCP** (Dynamic Host Configuration Protocol) hands them out automatically.
+
+### The DORA exchange
+
+The new host has no address yet, so it starts with a broadcast. DHCP runs over UDP: clients use port 68, servers port 67.
+
+```mermaid
+sequenceDiagram
+    participant C as New laptop, no IP yet
+    participant S as DHCP server 192.168.10.1
+    C->>S: DISCOVER, broadcast from 0.0.0.0: any DHCP server here?
+    S->>C: OFFER: you can have 192.168.10.100
+    C->>S: REQUEST, broadcast: I'll take 192.168.10.100
+    S->>C: ACK: it's yours for 24 hours, with mask, gateway and DNS
+```
+
+**D**iscover, **O**ffer, **R**equest, **A**cknowledge: **DORA**. The request is broadcast too, so that any other DHCP server that made an offer knows it wasn't chosen.
+
+### What the server hands out
+
+| Setting | Example |
+|---|---|
+| IP address | `192.168.10.100` |
+| Subnet mask | `255.255.255.0` |
+| Default gateway | `192.168.10.1` |
+| DNS servers | `192.168.10.1` |
+| Lease time | 24 hours |
+| Optional extras | Domain name, NTP servers, boot server for network boot |
+
+### Leases
+
+The address is **leased**, not given forever. The client renews it halfway through the lease (at 50 %, then tries any server at 87.5 %). A device that leaves the network stops renewing, and its address goes back to the pool.
+
+### Reservations, scopes and relays
+
+- **Scope or pool:** the range the server hands out, such as `.100` to `.199`. Keep fixed addresses (routers, servers, printers) outside it.
+- **Reservation (static lease):** the server always gives the same address to one MAC address. Handy for printers and servers without configuring them by hand.
+- **DHCP relay:** broadcasts don't cross routers. In a network with many VLANs, routers forward DHCP requests to one central server. This is the "DHCP helper" or "IP helper" setting on routers.
+
+### When DHCP goes wrong
+
+- **No server answers:** the host gives itself a `169.254.x.x` address (section 12). Check the cable, the Wi-Fi association, the VLAN, the server.
+- **Pool exhausted:** new devices get no address, while old ones still work. Shorten the lease or enlarge the pool.
+- **Rogue DHCP server:** a second device (often a home router plugged into an office network) hands out wrong addresses. Managed switches block it with **DHCP snooping**.
+
+---
+
+## 23. DNS: from names to addresses
+
+People use names like `www.example.com`. Packets need IP addresses. **DNS** (Domain Name System) translates one into the other. It's often called the phone book of the internet.
+
+### The DNS hierarchy
+
+Names are read from right to left, from the most general to the most specific. Each level is managed by someone different.
+
+```mermaid
+flowchart TB
+    root["Root: the dot at the end, '.'<br/>13 named root servers, each with many anycast copies worldwide"]
+    com[".com"]
+    org[".org"]
+    uk[".uk"]
+    example["example.com<br/>run by the domain owner"]
+    www["www.example.com"]
+    api["api.example.com"]
+    couk[".co.uk"]
+    root --> com
+    root --> org
+    root --> uk
+    uk --> couk
+    com --> example
+    example --> www
+    example --> api
+```
+
+- The **root servers** know where the servers for each top-level domain are.
+- The **TLD servers** (`.com`, `.org`, `.uk`...) know where each domain's servers are.
+- The **authoritative servers** of a domain hold its actual records.
+
+### How a lookup works
+
+Your device asks one **recursive resolver** (from your router, your ISP or a public service), which does all the work and caches the answers.
+
+```mermaid
+sequenceDiagram
+    participant L as Laptop, stub resolver
+    participant R as Recursive resolver
+    participant Root as Root server
+    participant TLD as .com server
+    participant A as example.com authoritative server
+    L->>R: what is the A record of www.example.com?
+    R->>Root: www.example.com?
+    Root->>R: ask the .com servers, here they are
+    R->>TLD: www.example.com?
+    TLD->>R: ask example.com's servers, here they are
+    R->>A: www.example.com?
+    A->>R: 198.51.100.20, valid for 3600 s
+    R->>L: 198.51.100.20
+    Note over R: caches the answer for its TTL
+```
+
+The next lookup for the same name, from any client of that resolver, is answered straight from the cache. That's why DNS is fast in practice, and why a DNS change can take time to reach everyone: old answers live until their **TTL** (time to live) expires.
+
+Before asking DNS, most systems check a local **hosts file** (`/etc/hosts` on Linux and macOS, `C:\Windows\System32\drivers\etc\hosts` on Windows).
+
+DNS mostly uses **UDP port 53**. It falls back to **TCP port 53** for large answers. Encrypted variants exist: DNS over TLS (port 853) and DNS over HTTPS (port 443).
+
+### Record types
+
+| Record | Maps | Example |
+|---|---|---|
+| **A** | Name to IPv4 address | `www.example.com → 198.51.100.20` |
+| **AAAA** | Name to IPv6 address | `www.example.com → 2001:db8::20` |
+| **CNAME** | Name to another name (an alias) | `shop.example.com → example.shops.example.net` |
+| **MX** | Domain to its mail servers, with priorities | `example.com → 10 mail.example.com` |
+| **NS** | Domain to its authoritative name servers | `example.com → ns1.example.net` |
+| **TXT** | Domain to free text | Domain ownership proofs, email anti-spoofing (SPF, DKIM, DMARC) |
+| **PTR** | IP address back to a name (reverse DNS) | `20.100.51.198.in-addr.arpa → www.example.com` |
+| **SRV** | Service to host and port | `_sip._tcp.example.com → 10 60 5060 sip.example.com` |
+| **SOA** | Administrative data about the zone | Primary server, serial number, timers |
+
+### Local name resolution
+
+On a LAN without a DNS server, devices find each other with **mDNS** (multicast DNS, the `.local` names used by Apple Bonjour, printers and many embedded devices) or Windows' LLMNR and NetBIOS. Home routers often also register DHCP clients' names in their own DNS.
+
+**"It's always DNS":** when a website "doesn't work" but `ping` to an IP address does, the problem is very often name resolution. Section 38 shows how to check.
+
+---
+
+## 24. NAT: sharing one public address
+
+A home has many devices with private addresses (section 12) and usually one public IPv4 address from the ISP. **NAT** (Network Address Translation) lets them all share it. The router rewrites the source address of outgoing packets to its own public address, and remembers the translation to send replies back.
+
+### How it works
+
+The common form, used by every home router, also rewrites ports. It's called **PAT** (Port Address Translation), **NAPT** or "masquerading", although most people just say NAT.
+
+```mermaid
+sequenceDiagram
+    participant L as Laptop 192.168.10.100
+    participant N as Router, public IP 203.0.113.10
+    participant S as Server 198.51.100.20
+    L->>N: from 192.168.10.100:51514 to 198.51.100.20:443
+    Note over N: rewrites the source and records the mapping
+    N->>S: from 203.0.113.10:40001 to 198.51.100.20:443
+    S->>N: from 198.51.100.20:443 to 203.0.113.10:40001
+    Note over N: looks up 40001 in its table
+    N->>L: from 198.51.100.20:443 to 192.168.10.100:51514
+```
+
+The router's **translation table**:
+
+| Inside address:port | Public address:port | Destination | Protocol |
+|---|---|---|---|
+| `192.168.10.100:51514` | `203.0.113.10:40001` | `198.51.100.20:443` | TCP |
+| `192.168.10.100:51515` | `203.0.113.10:40002` | `198.51.100.20:443` | TCP |
+| `192.168.10.42:3478` | `203.0.113.10:40003` | `192.0.2.50:3478` | UDP |
+
+The router keeps the original port when it's free and picks another one when two devices collide. Entries expire after some idle time, which is why long-lived idle connections sometimes drop.
+
+### Consequences
+
+- **Outbound connections just work.** Inbound ones don't: a packet arriving from the internet has no table entry, so the router doesn't know which device it's for. As a side effect, NAT hides the inside network, but it's **not a firewall** and shouldn't be relied on as one.
+- **Port forwarding** (or **DNAT**, destination NAT) fixes inbound access by hand: "send everything arriving on public port 8443 to `192.168.10.20:443`".
+- **Peer-to-peer apps** (video calls, games) use tricks like STUN and hole punching to get through NAT, or relay their traffic through a server.
+
+### NAT types
+
+| Type | What is rewritten | Use |
+|---|---|---|
+| Source NAT, PAT, masquerade | Source address and port of outgoing traffic | Sharing one public address |
+| Destination NAT, port forwarding | Destination of incoming traffic | Publishing a server behind a router |
+| Static 1:1 NAT | One inside address to one public address | Servers with their own public IP |
+| CGNAT (carrier-grade NAT) | The ISP does PAT again for many customers, using `100.64.0.0/10` inside | ISPs and mobile networks that lack IPv4 addresses |
+
+With **CGNAT**, your router's "public" address is itself private, and port forwarding on your router can't work: the ISP's NAT is in the way. **Double NAT** (two NAT routers in a row at home) causes similar problems.
+
+**IPv6 doesn't need NAT:** there are enough addresses for every device to have a public one. A stateful firewall on the router gives the same "outbound only" protection without rewriting addresses.
+
+---
+
+## 25. HTTP, HTTPS and TLS
+
+### HTTP
+
+**HTTP** (Hypertext Transfer Protocol) is how browsers, apps and APIs talk to web servers. The client sends a **request**, the server sends back a **response**.
+
+```
+GET /index.html HTTP/1.1                     ← method, path, version
+Host: www.example.com                        ← which site (one server can host many)
+User-Agent: Mozilla/5.0 ...
+Accept: text/html
+
+HTTP/1.1 200 OK                              ← version, status code
+Content-Type: text/html; charset=utf-8
+Content-Length: 1256
+
+<!doctype html> ...                          ← the body: the page itself
+```
+
+Common **methods**:
+
+| Method | Does |
+|---|---|
+| `GET` | Fetch a resource |
+| `POST` | Send data to be processed (a form, an API call) |
+| `PUT` | Create or replace a resource |
+| `PATCH` | Change part of a resource |
+| `DELETE` | Remove a resource |
+| `HEAD` | Like `GET` but only the headers |
+
+**Status codes** group by their first digit:
+
+| Range | Meaning | Common ones |
+|---|---|---|
+| 1xx | Informational | `101 Switching Protocols` (WebSockets) |
+| 2xx | Success | `200 OK`, `201 Created`, `204 No Content` |
+| 3xx | Redirect | `301 Moved Permanently`, `302 Found`, `304 Not Modified` |
+| 4xx | Client error | `400 Bad Request`, `401 Unauthorized`, `403 Forbidden`, `404 Not Found`, `429 Too Many Requests` |
+| 5xx | Server error | `500 Internal Server Error`, `502 Bad Gateway`, `503 Service Unavailable`, `504 Gateway Timeout` |
+
+HTTP is **stateless**: each request stands alone. Logins and shopping carts work through **cookies** or tokens the client sends with every request.
+
+**HTTP versions:**
+
+- **HTTP/1.1:** text, one request at a time per TCP connection.
+- **HTTP/2:** binary, many requests at once over one TCP connection.
+- **HTTP/3:** like HTTP/2, but over QUIC on UDP (section 20). Faster to start and better on lossy links.
+
+### HTTPS and TLS
+
+**HTTPS** is HTTP inside **TLS** (Transport Layer Security), on port **443** instead of 80. TLS gives three guarantees:
+
+- **Confidentiality:** nobody on the path can read the data.
+- **Integrity:** nobody can change it without being detected.
+- **Authentication:** you're really talking to `www.example.com`, not an impostor.
+
+### The TLS handshake
+
+TLS 1.3, after the TCP handshake:
+
+```mermaid
+sequenceDiagram
+    participant C as Browser
+    participant S as Server
+    C->>S: ClientHello: TLS versions, ciphers, key share, server name
+    S->>C: ServerHello: chosen cipher, key share
+    S->>C: certificate for www.example.com, signature, Finished
+    Note over C: checks the certificate. Both sides compute the same session keys
+    C->>S: Finished
+    Note over C,S: encrypted HTTP requests and responses
+```
+
+The **server name** in the ClientHello (SNI, Server Name Indication) lets one server host many HTTPS sites on the same address. It's one of the few things an observer can still see.
+
+### Certificates and the chain of trust
+
+A **certificate** binds a domain name to a public key and is signed by a **certificate authority** (CA). The browser trusts a short list of root CAs built into the operating system or browser. It checks:
+
+- the certificate is for the name in the URL,
+- it hasn't expired,
+- it chains up to a trusted root:
+
+```
+Root CA (built into your OS or browser)
+  └── signs ─► Intermediate CA
+                 └── signs ─► Certificate for www.example.com
+```
+
+Free automated CAs like Let's Encrypt made HTTPS the default. Common failures: an expired certificate, a name mismatch (`example.com` vs `www.example.com`), a missing intermediate certificate, or a wrong clock on the client. That last one is common on embedded devices that boot without a real-time clock.
+
+---
+
+## 26. Other common protocols
+
+| Protocol | Port | Transport | What it does |
+|---|---|---|---|
+| FTP | 20, 21 | TCP | File transfer, unencrypted. Prefer SFTP |
+| SSH, SFTP, SCP | 22 | TCP | Encrypted remote shell and file transfer |
+| Telnet | 23 | TCP | Unencrypted remote shell. Still found on old network gear |
+| SMTP | 25, 587, 465 | TCP | Sending email: 25 between servers, 587 or 465 from mail clients |
+| DNS | 53 | UDP, TCP | Name resolution |
+| DHCP | 67, 68 | UDP | Automatic address configuration |
+| TFTP | 69 | UDP | Trivial file transfer, used for network boot and firmware updates |
+| HTTP | 80 | TCP | Web, unencrypted |
+| POP3 | 110 (995 with TLS) | TCP | Downloading email |
+| NTP | 123 | UDP | Clock synchronization |
+| IMAP | 143 (993 with TLS) | TCP | Reading email on the server |
+| SNMP | 161, 162 | UDP | Monitoring and managing network devices |
+| LDAP | 389 (636 with TLS) | TCP | Directory services, user accounts |
+| HTTPS | 443 | TCP, UDP (HTTP/3) | Web, encrypted |
+| SMB | 445 | TCP | Windows file and printer sharing |
+| Syslog | 514 | UDP | Sending logs to a central server |
+| DNS over TLS | 853 | TCP | Encrypted DNS |
+| MQTT | 1883 (8883 with TLS) | TCP | Lightweight publish/subscribe messaging for IoT |
+| RDP | 3389 | TCP, UDP | Windows remote desktop |
+| CoAP | 5683 (5684 with DTLS) | UDP | Lightweight REST for constrained devices |
+| mDNS | 5353 | UDP | Local name and service discovery (`.local`) |
+
+**Rule of thumb:** prefer the encrypted variant of every protocol. Telnet, FTP, plain HTTP, POP3 and IMAP without TLS send passwords in clear text.
+
+---
+
 Version 1 · 2026-11-20

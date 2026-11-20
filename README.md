@@ -10,7 +10,7 @@ Every note aims to be practical, so you'll find configs and commands you can reu
 | [linux-general-usage/](os-and-firmware/linux-general-usage/) | Day-to-day Linux: shell, files, users, packages, services |
 | [embedded-linux/](os-and-firmware/embedded-linux/) | [Fundamentals](os-and-firmware/embedded-linux/fundamentals/) (toolchain, bootloader, kernel, rootfs) and [build systems](os-and-firmware/embedded-linux/linux-build-systems/) (Yocto, Buildroot) |
 | [linux-kernel-device-driver-development/](os-and-firmware/embedded-linux/linux-kernel-device-driver-development/) | Kernel modules, character devices, platform, I2C and SPI drivers, the device tree, debugging |
-| [networking/](os-and-firmware/networking/) | Routing, firewalls, Wi-Fi, home and lab network setups |
+| [networking/](os-and-firmware/networking/) | [Networking basics](os-and-firmware/networking/networking-basics/) (OSI, IP, DHCP, DNS, architectures), [Linux networking](os-and-firmware/networking/linux-networking-fundamentals/), routing, firewalls, home and lab network setups |
 | [wireless-protocols-and-connectivity/](wireless-protocols-and-connectivity/) | [Wi-Fi](wireless-protocols-and-connectivity/wifi/), [Bluetooth](wireless-protocols-and-connectivity/bluetooth/), [Cellular](wireless-protocols-and-connectivity/cellular/), [NTN](wireless-protocols-and-connectivity/ntn/) (satellite / non-terrestrial networks) |
 | [linux-systems-programming/](os-and-firmware/linux-systems-programming/) | System calls, processes, threads, IPC, file and socket I/O |
 | [software/](software/) | Language notes: [C](software/c/), [Bash](software/bash/) |
@@ -18,6 +18,7 @@ Every note aims to be practical, so you'll find configs and commands you can reu
 
 ## Latest notes
 
+- [Networking Basics: How Networks Work](os-and-firmware/networking/networking-basics/networking-basics_v1_2026-11-20.md)
 - [Linux Kernel Device Drivers for Embedded Linux](os-and-firmware/embedded-linux/linux-kernel-device-driver-development/device-drivers_v1_2026-11-19.md)
 - [Everyday Linux: The Shell, Files, Users, Packages and Services](os-and-firmware/linux-general-usage/everyday-linux/everyday-linux_v1_2026-11-16.md)
 - [Buildroot for Embedded Linux](os-and-firmware/embedded-linux/linux-build-systems/buildroot/buildroot_v1_2026-11-15.md)

@@ -4,6 +4,8 @@ The mental model you need to bring an embedded Linux device onto a network and d
 
 This note explains the concepts from the **device's side**. [Building a Home Gateway on Linux](../gateway/gateway_v1_2026-10-26.md) applies the same concepts from the **router's side** (VLANs, NAT, firewall rules, dnsmasq), and [Networking on OpenWrt](../openwrt/openwrt_v1_2026-10-29.md) does it with OpenWrt's components (netifd, UCI, firewall4, odhcpd), so this note links there instead of repeating the router configuration.
 
+**New to networking?** [Networking Basics: How Networks Work](../networking-basics/networking-basics_v1_2026-11-20.md) explains the OS-neutral concepts from scratch (the OSI model, subnetting, DHCP, DNS, NAT, example network architectures). This note recaps them briefly and focuses on how Linux implements them on an embedded device.
+
 **Concept, Linux, vendor:** each section separates the protocol (what any implementation does), Linux's implementation (kernel subsystem, daemon, tool) and vendor-specific mechanisms, which are labeled as such.
 
 **Assumptions:**

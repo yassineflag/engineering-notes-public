@@ -4,6 +4,10 @@ Notes on routing, firewalling, Wi-Fi and network services, with a focus on setup
 
 ## Notes
 
+### Networking basics
+
+- [Networking Basics: How Networks Work](networking-basics/networking-basics_v1_2026-11-20.md): the OS-neutral concepts from scratch: network types and devices, the OSI and TCP/IP models, MAC and IP addresses, subnetting, IPv6, switching and VLANs, routing, TCP/UDP, DHCP, DNS, NAT, HTTPS, firewalls, VPNs and Wi-Fi, with example architectures from a home LAN to a data center and a cloud VPC. Start here if you're new to networking.
+
 ### Linux networking fundamentals
 
 - [Linux Networking Fundamentals for Embedded Engineers](linux-networking-fundamentals/linux-networking-fundamentals_v1_2026-10-29.md): layers, Ethernet and MAC addresses, IP subnetting, ARP, routing, DHCP, DNS, TCP/UDP, ICMP, HTTPS, NAT and firewalls, seen from an embedded device, with an end-to-end packet walk and a bottom-up troubleshooting guide.

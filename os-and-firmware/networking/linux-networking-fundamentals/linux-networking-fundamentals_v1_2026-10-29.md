@@ -1,4 +1,4 @@
-# Networking Fundamentals for Embedded Linux Engineers
+# Linux Networking Fundamentals for Embedded Engineers
 
 The mental model you need to bring an embedded Linux device onto a network and debug it when it doesn't work: how frames and packets are addressed, switched and routed, what DHCP, DNS, TCP, TLS, NAT and firewalls do along the way, how Linux implements each piece, and how it all fits together in products where a Linux application processor shares a modem's cellular connection.
 

@@ -4,9 +4,9 @@ Notes on routing, firewalling, Wi-Fi and network services, with a focus on setup
 
 ## Notes
 
-### Fundamentals
+### Linux networking fundamentals
 
-- [Networking Fundamentals for Embedded Linux Engineers](fundamentals/fundamentals_v1_2026-10-29.md): layers, Ethernet and MAC addresses, IP subnetting, ARP, routing, DHCP, DNS, TCP/UDP, ICMP, HTTPS, NAT and firewalls, seen from an embedded device, with an end-to-end packet walk and a bottom-up troubleshooting guide.
+- [Linux Networking Fundamentals for Embedded Engineers](linux-networking-fundamentals/linux-networking-fundamentals_v1_2026-10-29.md): layers, Ethernet and MAC addresses, IP subnetting, ARP, routing, DHCP, DNS, TCP/UDP, ICMP, HTTPS, NAT and firewalls, seen from an embedded device, with an end-to-end packet walk and a bottom-up troubleshooting guide.
 
 ### Gateway
 

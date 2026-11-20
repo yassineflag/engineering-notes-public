@@ -1572,7 +1572,7 @@ The `mychar` device of Part 2 invents its own interface: its own ioctls, its own
 | Displays | **DRM** (`drivers/gpu/drm/`); small panels with `drm_mipi_dbi` or the `solomon` driver for SSD130x | `/dev/dri/cardN`; fbdev emulation | Mode setting, plane updates |
 | Serial-attached chips (GPS, Bluetooth, modems) on a UART | **serdev** | No tty; the device's own subsystem | `receive_buf()` |
 | EEPROMs, OTP, fuses | **nvmem** | `/sys/bus/nvmem/devices/*/nvmem` | `reg_read()` |
-| Network interfaces | **netdev** ([networking fundamentals](../../networking/fundamentals/fundamentals_v1_2026-10-29.md), [Wi-Fi](../../../wireless-protocols-and-connectivity/wifi/wifi_v1_2026-11-01.md)) | `eth0`, `wlan0` | `ndo_start_xmit()`, NAPI |
+| Network interfaces | **netdev** ([Linux networking fundamentals](../../networking/linux-networking-fundamentals/linux-networking-fundamentals_v1_2026-10-29.md), [Wi-Fi](../../../wireless-protocols-and-connectivity/wifi/wifi_v1_2026-11-01.md)) | `eth0`, `wlan0` | `ndo_start_xmit()`, NAPI |
 
 A character device is right only when nothing in this table fits.
 
@@ -1934,7 +1934,7 @@ Messages in quotes come from the kernel source or from the builds run for this n
 - **Building, configuring and installing the kernel**, the boot, and the device tree's role at boot: the [kernel note](../fundamentals/03-kernel/kernel_v1_2026-11-10.md).
 - **Packaging out-of-tree modules** in an image: the [Buildroot](../linux-build-systems/buildroot/buildroot_v1_2026-11-15.md) (`kernel-module` infrastructure) and [Yocto](../linux-build-systems/yocto/yocto_v1_2026-11-14.md) (`module` class) notes.
 - **The userspace side** of device files, `poll`, `epoll` and `mmap`: [Linux systems programming](../../linux-systems-programming/).
-- **Network, Wi-Fi and block drivers**: netdev and NAPI, mac80211 and cfg80211, blk-mq. The [networking](../../networking/fundamentals/fundamentals_v1_2026-10-29.md) and [Wi-Fi](../../../wireless-protocols-and-connectivity/wifi/wifi_v1_2026-11-01.md) notes describe those subsystems from the outside.
+- **Network, Wi-Fi and block drivers**: netdev and NAPI, mac80211 and cfg80211, blk-mq. The [networking](../../networking/linux-networking-fundamentals/linux-networking-fundamentals_v1_2026-10-29.md) and [Wi-Fi](../../../wireless-protocols-and-connectivity/wifi/wifi_v1_2026-11-01.md) notes describe those subsystems from the outside.
 - **USB device drivers** (`usb_driver`, URBs, interfaces and endpoints) and USB gadget functions.
 - **PCI and PCIe drivers**, MSI interrupts, BARs.
 - **`mmap()` of device memory** and `dma-buf` sharing between drivers.

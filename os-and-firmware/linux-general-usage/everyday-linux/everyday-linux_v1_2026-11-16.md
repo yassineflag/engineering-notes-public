@@ -2,7 +2,7 @@
 
 This note covers the Linux you use every day on your own machine: the shell, files and permissions, users and `sudo`, pipes and small scripts, processes, systemd services and logs, packages, disks, devices, the network from the user's side, SSH, archives and backups. It is the note to read before the embedded Linux notes, and the one to come back to when something on the PC gets in the way: a `Permission denied` on a serial port, a full disk, a service that won't start, an SD card to write without wiping the wrong disk.
 
-Each part starts from the concepts, then shows the commands you'll actually type, then the traps. Where a task belongs to embedded work (a USB serial adapter, an SD card image, SSH into a board), the example uses the BeagleBone Black of the [embedded Linux notes](../../embedded-linux/). The [networking fundamentals note](../../networking/fundamentals/fundamentals_v1_2026-10-29.md) covers the network in depth; section 19 here only covers what a user needs.
+Each part starts from the concepts, then shows the commands you'll actually type, then the traps. Where a task belongs to embedded work (a USB serial adapter, an SD card image, SSH into a board), the example uses the BeagleBone Black of the [embedded Linux notes](../../embedded-linux/). The [Linux networking fundamentals note](../../networking/linux-networking-fundamentals/linux-networking-fundamentals_v1_2026-10-29.md) covers the network in depth; section 19 here only covers what a user needs.
 
 **Assumptions:**
 - The machine is a PC (x86_64) running Debian 13 "trixie", with Bash as the login shell, systemd as the init system and APT for packages. Ubuntu 24.04 LTS and 26.04 LTS work the same way for almost everything here; the differences are noted where they matter (Snap, netplan, `sudo-rs`).
@@ -1464,7 +1464,7 @@ Settings for almost every board console, including the BeagleBone Black's: **115
 
 ## 19. The network from the user's side
 
-The [networking fundamentals note](../../networking/fundamentals/fundamentals_v1_2026-10-29.md) explains how all of this works. This section is the set of commands to answer "is the network OK, and if not, where does it stop?".
+The [Linux networking fundamentals note](../../networking/linux-networking-fundamentals/linux-networking-fundamentals_v1_2026-10-29.md) explains how all of this works. This section is the set of commands to answer "is the network OK, and if not, where does it stop?".
 
 **What do I have:**
 

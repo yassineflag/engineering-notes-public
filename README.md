@@ -29,7 +29,7 @@ Every note aims to be practical, so you'll find configs and commands you can reu
 - [Cross-Compilation and Toolchains for Embedded Linux](os-and-firmware/embedded-linux/fundamentals/01-cross-compilation-toolchain/cross-compilation-toolchain_v2_2026-11-08.md)
 - [Cellular Protocols: LTE, 5G NR and Cellular IoT](wireless-protocols-and-connectivity/cellular/cellular_v1_2026-11-02.md)
 - [Wi-Fi for Embedded Linux Engineers](wireless-protocols-and-connectivity/wifi/wifi_v1_2026-11-01.md)
-- [Networking Fundamentals for Embedded Linux Engineers](os-and-firmware/networking/fundamentals/fundamentals_v1_2026-10-29.md)
+- [Linux Networking Fundamentals for Embedded Engineers](os-and-firmware/networking/linux-networking-fundamentals/linux-networking-fundamentals_v1_2026-10-29.md)
 - [Networking on OpenWrt](os-and-firmware/networking/openwrt/openwrt_v1_2026-10-29.md)
 - [Building a Home Gateway on Linux](os-and-firmware/networking/gateway/gateway_v1_2026-10-26.md)
 

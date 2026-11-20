@@ -1397,10 +1397,597 @@ Free automated CAs like Let's Encrypt made HTTPS the default. Common failures: a
 | DNS over TLS | 853 | TCP | Encrypted DNS |
 | MQTT | 1883 (8883 with TLS) | TCP | Lightweight publish/subscribe messaging for IoT |
 | RDP | 3389 | TCP, UDP | Windows remote desktop |
-| CoAP | 5683 (5684 with DTLS) | UDP | Lightweight REST for constrained devices |
 | mDNS | 5353 | UDP | Local name and service discovery (`.local`) |
+| CoAP | 5683 (5684 with DTLS) | UDP | Lightweight REST for constrained devices |
 
 **Rule of thumb:** prefer the encrypted variant of every protocol. Telnet, FTP, plain HTTP, POP3 and IMAP without TLS send passwords in clear text.
+
+---
+
+## Part 6: Security and wireless
+
+## 27. Firewalls
+
+A **firewall** decides which traffic may pass, according to **rules**. A rule matches on fields like source and destination address, protocol and port, and says **allow** or **deny**.
+
+```
+#   Direction   Source            Destination        Port      Action
+1   in          any               192.168.10.20      TCP 443   allow    web server
+2   in          192.168.10.0/24   192.168.10.1       TCP 22    allow    SSH from the LAN only
+3   in          any               any                any       deny     everything else
+```
+
+Rules are checked **top to bottom**, and the first match wins. A good firewall ends with **default deny**: whatever isn't explicitly allowed is blocked.
+
+### Kinds of firewalls
+
+| Kind | Looks at | Notes |
+|---|---|---|
+| Stateless packet filter | Each packet alone: addresses, ports | Fast but blunt: you must allow replies by hand |
+| **Stateful** firewall | Packets and the **connection** they belong to | Remembers outgoing connections and lets their replies back in. The normal kind today |
+| Next-generation firewall (NGFW) | Applications, users, content | Recognizes applications regardless of port, can run intrusion prevention |
+| Web application firewall (WAF) | HTTP requests | Blocks attacks on web apps, such as SQL injection |
+| Host firewall | Traffic of one machine | Windows Defender Firewall, `nftables` on Linux, the macOS firewall |
+
+A stateful firewall makes the typical home policy easy: "allow everything out, allow back in only the replies to what went out".
+
+### Zones and the DMZ
+
+Firewalls usually group interfaces into **zones** with different trust levels: the internet (untrusted), the LAN (trusted), guests. A **DMZ** (demilitarized zone) is a separate zone for servers that the internet must reach. If one of them is hacked, the attacker still has to get through the firewall to reach the LAN.
+
+```mermaid
+flowchart LR
+    inet(("Internet<br/>untrusted")) --- fw{{"Firewall"}}
+    fw --- dmz["DMZ<br/>web and mail servers"]
+    fw --- lan["LAN<br/>staff PCs, file server"]
+    fw --- guest["Guest Wi-Fi<br/>internet only"]
+```
+
+Typical policy: the internet may reach the DMZ on ports 80 and 443 only, the DMZ may not open connections to the LAN, the LAN may reach everything, guests may only reach the internet.
+
+---
+
+## 28. VPNs and tunnels
+
+A **tunnel** carries packets inside other packets. A **VPN** (virtual private network) is an encrypted tunnel: it makes a remote network behave as if you were plugged into it, across the untrusted internet.
+
+```
+Original packet:            [IP: 10.0.0.5 → 10.1.0.9][TCP][data]
+Inside the VPN tunnel:      [IP: 203.0.113.10 → 192.0.2.80][UDP][encrypted: [IP: 10.0.0.5 → 10.1.0.9][TCP][data]]
+                             └── outer header, for the internet ┘ └──────── inner packet, hidden ─────────┘
+```
+
+Routers on the internet only see the outer header between the two VPN endpoints. The inner packet, with its private addresses, is encrypted.
+
+### Two common uses
+
+```mermaid
+flowchart LR
+    subgraph S2S["Site-to-site VPN"]
+        o1["Office A LAN<br/>10.0.0.0/24"] --- g1["VPN gateway"]
+        g1 ===|"encrypted tunnel over the internet"| g2["VPN gateway"]
+        g2 --- o2["Office B LAN<br/>10.1.0.0/24"]
+    end
+    subgraph RA["Remote access VPN"]
+        lap["Laptop at home<br/>VPN client"] ===|"encrypted tunnel"| vg["Company VPN gateway"]
+        vg --- corp["Company LAN"]
+    end
+```
+
+- **Site-to-site:** two networks are joined permanently through their gateways. Users don't notice it.
+- **Remote access:** one device connects to a network, like an employee working from home.
+
+**Full tunnel or split tunnel:** with a full tunnel, all the device's traffic goes through the VPN. With a split tunnel, only traffic for the company's networks does, and the rest goes straight to the internet.
+
+### Common VPN protocols
+
+| Protocol | Notes |
+|---|---|
+| **IPsec** | Standard, supported by every firewall vendor. Common for site-to-site |
+| **WireGuard** | Modern, small and fast, built into the Linux kernel |
+| **OpenVPN** | Mature, runs over TLS, very configurable |
+| SSL VPN | Vendor products running over HTTPS, easy to get through restrictive networks |
+
+### Tunnels without encryption
+
+Not every tunnel is a VPN. **GRE** carries packets between two routers without encryption. **VXLAN** carries Ethernet frames over IP, so a layer 2 network can stretch across a data center (section 34) or between cloud hosts.
+
+**Mesh VPNs** go one step further: every device gets a direct encrypted tunnel to every other one, coordinated by a central service, without a single gateway in the middle.
+
+---
+
+## 29. Wi-Fi in short
+
+Wi-Fi (the IEEE 802.11 standards) is wireless Ethernet: same MAC addresses, same frames once they reach the wire.
+
+**Vocabulary:**
+
+- **Station (STA):** a Wi-Fi client, such as a phone or a laptop.
+- **Access point (AP):** the device stations connect to, which bridges them to the wired LAN.
+- **SSID:** the network name you see, such as "HomeWifi". Several APs can share one SSID.
+- **BSSID:** the MAC address of one AP radio. Each AP of an SSID has its own.
+- **Association:** a station joining an AP, before it can send data and get an address by DHCP.
+
+### Bands and channels
+
+| Band | Range | Speed | Notes |
+|---|---|---|---|
+| 2.4 GHz | Longest, best through walls | Lowest | Crowded. Only 3 non-overlapping channels (1, 6, 11 in most countries). Also used by Bluetooth and microwave ovens |
+| 5 GHz | Medium | High | Many more channels. Some need radar detection (DFS) |
+| 6 GHz | Shortest | Highest | Wi-Fi 6E and 7 only. Clean spectrum, few neighbors |
+
+Neighbors on the same channel share the airtime, so picking a quiet channel matters more than raw speed.
+
+### Generations
+
+| Name | Standard | What it brought |
+|---|---|---|
+| Wi-Fi 4 | 802.11n | Multiple antennas (MIMO), 2.4 and 5 GHz |
+| Wi-Fi 5 | 802.11ac | Faster 5 GHz, wider channels |
+| Wi-Fi 6 | 802.11ax | Better with many devices at once (OFDMA), power saving for IoT |
+| Wi-Fi 6E | 802.11ax | Wi-Fi 6 extended to the 6 GHz band |
+| Wi-Fi 7 | 802.11be | Very wide channels, using several bands at once (multi-link operation) |
+
+The speeds on the box are theoretical maximums. Real throughput is usually well under half.
+
+### Security
+
+| Mode | Use |
+|---|---|
+| Open | No encryption. Avoid, or use only with a VPN |
+| WEP, WPA | Broken. Never use |
+| **WPA2-Personal** | One shared password (PSK). Still widespread |
+| **WPA3-Personal** | Shared password, protected against offline guessing (SAE). Prefer it |
+| **WPA2/WPA3-Enterprise** | A login per user, checked by a RADIUS server (802.1X). For companies |
+
+### Coverage: extenders and mesh
+
+One AP rarely covers a whole house well. **Repeaters** (extenders) relay the signal but halve its speed. **Mesh systems** use several APs that coordinate, ideally linked by Ethernet cables (wired backhaul), and help clients roam to the closest one.
+
+The [Wi-Fi note](../../../wireless-protocols-and-connectivity/wifi/wifi_v1_2026-11-01.md) covers the radio, the frames and the security handshakes in depth.
+
+---
+
+## Part 7: Network architectures
+
+## 30. Client-server and peer-to-peer
+
+Before looking at physical layouts, there are two ways applications talk.
+
+```mermaid
+flowchart LR
+    subgraph CS["Client-server"]
+        c1["Client"] --> srv["Server"]
+        c2["Client"] --> srv
+        c3["Client"] --> srv
+    end
+    subgraph P2P["Peer-to-peer"]
+        p1["Peer"] <--> p2["Peer"]
+        p2 <--> p3["Peer"]
+        p3 <--> p1
+    end
+```
+
+- **Client-server:** clients ask, a server answers. The web, email, games with central servers. Easy to manage and secure, but the server is a single point of load and failure, which is why big services use many servers behind load balancers.
+- **Peer-to-peer (P2P):** every device is both client and server. BitTorrent, some video calls, blockchain networks. No central bottleneck, but NAT and firewalls make peers hard to reach (section 24).
+
+Many real systems mix both: a video call uses a central server to find the other side, then sends the media directly between peers when NAT allows it.
+
+---
+
+## 31. A home network
+
+The simplest real architecture: one public address, one private LAN, and the all-in-one router of section 4.
+
+```mermaid
+flowchart LR
+    isp(("ISP<br/>public IP 203.0.113.10")) --- ont["Fiber ONT or modem"]
+    ont --- rtr{{"Home router<br/>192.168.10.1<br/>NAT, firewall, DHCP, DNS"}}
+    rtr --- sw["Switch"]
+    rtr -.- wifi["Wi-Fi 'HomeWifi'"]
+    rtr -.- gwifi["Wi-Fi 'Guest'<br/>separate network"]
+    sw --- desk["Desktop 192.168.10.10"]
+    sw --- nas["NAS 192.168.10.5<br/>reserved address"]
+    wifi -.- phone["Phone 192.168.10.101"]
+    wifi -.- tv["Smart TV 192.168.10.102"]
+    gwifi -.- visitor["Visitor's phone<br/>internet only"]
+```
+
+| Element | Typical setting |
+|---|---|
+| LAN subnet | `192.168.x.0/24` |
+| Router address | `.1` or `.254`, also the DNS server and default gateway |
+| DHCP pool | `.100` to `.199`, with reservations for the NAS and printer |
+| IPv6 | A /56 or /64 from the ISP, SLAAC on the LAN |
+| Inbound access | None, except port forwarding or a VPN you set up yourself |
+
+**Good practice:** put guests and untrusted smart-home gadgets on a **guest network** or a separate VLAN, change the router's admin password, keep its firmware updated, and turn off UPnP if you don't need it (it lets any device open ports on the router).
+
+The [home gateway note](../gateway/gateway_v1_2026-10-26.md) and the [OpenWrt note](../openwrt/openwrt_v1_2026-10-29.md) build this kind of router by hand.
+
+---
+
+## 32. A small office network
+
+A small office (10 to 100 people) adds separation, a real firewall and remote access.
+
+```mermaid
+flowchart TB
+    inet(("Internet")) --- fw{{"Firewall and router<br/>NAT, VPN gateway"}}
+    fw --- dmz["DMZ<br/>public web server"]
+    fw ---|"trunk: VLANs 10, 20, 30, 40"| core["Managed switch"]
+    core --- apsw["PoE switch"]
+    apsw --- ap1["Access point"]
+    apsw --- ap2["Access point"]
+    apsw --- phone["IP phones"]
+    core --- pcs["Staff PCs"]
+    core --- srv["File server, printer"]
+    remote["Remote worker"] -.-|"VPN"| fw
+```
+
+| VLAN | Subnet | Who | Allowed to reach |
+|---|---|---|---|
+| 10 Staff | `10.0.10.0/24` | Office PCs, staff Wi-Fi | Internet, servers |
+| 20 Servers | `10.0.20.0/24` | File server, printers | Answers staff only |
+| 30 Voice | `10.0.30.0/24` | IP phones | The phone system provider |
+| 40 Guests | `10.0.40.0/24` | Guest Wi-Fi | Internet only |
+| DMZ | `10.0.99.0/24` | Public web server | Reached from the internet on 443 |
+
+The firewall routes between the VLANs and applies the policy in the right column. The access points broadcast two SSIDs, staff and guest, mapped to VLANs 10 and 40. **QoS** settings give the voice VLAN priority, so calls stay clear when someone downloads a large file.
+
+---
+
+## 33. An enterprise campus: the three-tier design
+
+Large sites with hundreds or thousands of users use a **hierarchical** design with three layers, each with its own job.
+
+```mermaid
+flowchart TB
+    wan(("Internet, WAN, data center")) --- c1["Core switch 1"]
+    wan --- c2["Core switch 2"]
+    c1 === c2
+    c1 --- d1["Distribution 1A"]
+    c1 --- d2["Distribution 1B"]
+    c2 --- d1
+    c2 --- d2
+    d1 --- a1["Access switch<br/>floor 1"]
+    d1 --- a2["Access switch<br/>floor 2"]
+    d2 --- a1
+    d2 --- a2
+    a1 --- u1["PCs, phones, APs"]
+    a2 --- u2["PCs, phones, APs"]
+```
+
+| Layer | Job |
+|---|---|
+| **Access** | Where users and devices plug in. Many ports, PoE for phones and APs, VLAN assignment, port security |
+| **Distribution** | Aggregates the access switches of a building. Routes between VLANs, applies policies, holds the default gateways |
+| **Core** | High-speed backbone between buildings and to the data center and WAN. Moves traffic fast and does little else |
+
+Every switch has **two uplinks** to two different switches above it, so no single failure cuts a floor off. A smaller campus merges core and distribution into one layer, the **collapsed core**.
+
+Offices far away connect to headquarters over a **WAN**: leased lines, MPLS from a telecom operator, or today often **SD-WAN**, which builds encrypted tunnels over ordinary internet links and picks the best path for each application.
+
+---
+
+## 34. A data center: spine and leaf
+
+Inside a data center, most traffic goes **between servers** (east-west), not in and out (north-south). Tree designs bottleneck on that, so modern data centers use a **spine-leaf** fabric.
+
+```mermaid
+flowchart TB
+    s1["Spine 1"]
+    s2["Spine 2"]
+    l1["Leaf 1<br/>top-of-rack switch"]
+    l2["Leaf 2"]
+    l3["Leaf 3"]
+    l4["Border leaf<br/>to the internet and WAN"]
+    s1 --- l1
+    s1 --- l2
+    s1 --- l3
+    s1 --- l4
+    s2 --- l1
+    s2 --- l2
+    s2 --- l3
+    s2 --- l4
+    l1 --- r1["Rack 1 servers"]
+    l2 --- r2["Rack 2 servers"]
+    l3 --- r3["Rack 3 servers"]
+```
+
+- Every **leaf** (one switch on top of each rack) connects to **every spine**. Leaves never connect to each other, and spines never connect to each other.
+- Any server reaches any other in the same number of hops: leaf, spine, leaf. Latency is predictable.
+- Traffic is spread over all spines at once with **ECMP** (equal-cost multipath routing). A spine failure only removes some capacity.
+- To grow, add leaves for more racks, or spines for more bandwidth.
+
+The links between switches are usually routed (often with BGP), and **VXLAN** overlays (section 28) give virtual machines the layer 2 networks they expect on top of that routed fabric.
+
+---
+
+## 35. A cloud network: VPCs and subnets
+
+Cloud providers give you a private, software-defined network inside their data centers: a **VPC** (virtual private cloud; a **VNet** on Azure). You choose its address range and split it into subnets, as in section 11.
+
+```mermaid
+flowchart TB
+    inet(("Internet"))
+    subgraph VPC["VPC 10.0.0.0/16, in one region"]
+        igw["Internet gateway"]
+        subgraph PUB["Public subnet 10.0.1.0/24"]
+            lb["Load balancer"]
+            nat["NAT gateway"]
+        end
+        subgraph PRIV["Private subnet 10.0.2.0/24"]
+            app1["App server"]
+            app2["App server"]
+        end
+        subgraph DB["Private subnet 10.0.3.0/24"]
+            db["Database"]
+        end
+    end
+    inet --- igw
+    igw --- lb
+    igw --- nat
+    lb --> app1
+    lb --> app2
+    app1 --> db
+    app2 --> db
+    app1 -.->|"outbound only, for updates"| nat
+```
+
+- A **public subnet** has a route to the **internet gateway**. Only the load balancer and the NAT gateway live there.
+- **Private subnets** have no inbound route from the internet. Their servers reach out (to download updates) through the **NAT gateway**.
+- **Security groups** are stateful firewalls attached to each server or service: "the database accepts port 5432 only from the app servers".
+- For resilience, each subnet is copied into two or three **availability zones** (separate data centers in the same region).
+
+The same building blocks exist under different names:
+
+| Concept | AWS | Azure | Google Cloud |
+|---|---|---|---|
+| Private network | VPC | Virtual Network (VNet) | VPC network |
+| Per-server firewall | Security group | Network security group | Firewall rules |
+| Outbound NAT | NAT gateway | NAT gateway | Cloud NAT |
+| Link to your office | Site-to-site VPN, Direct Connect | VPN Gateway, ExpressRoute | Cloud VPN, Cloud Interconnect |
+
+---
+
+## 36. An IoT product network
+
+Connected products, like sensors, meters or a smart thermostat, usually follow the same shape:
+
+```mermaid
+flowchart LR
+    subgraph SITE["At the customer's site"]
+        s1["Sensor<br/>BLE, Zigbee or Thread"] -.- gw["Gateway or hub"]
+        s2["Sensor"] -.- gw
+        dev["Wi-Fi device"] -.- hr["Home router<br/>NAT"]
+        gw --- hr
+    end
+    cell["Cellular device<br/>LTE-M, NB-IoT"] -.-|"radio"| op["Mobile operator<br/>CGNAT"]
+    hr --- inet(("Internet"))
+    op --- inet
+    inet --- broker["Cloud MQTT broker<br/>TLS on port 8883"]
+    broker --- backend["Backend, database, dashboards"]
+    backend --- app["User's phone app"]
+```
+
+The architecture choices come straight from the earlier sections:
+
+- **Devices connect out, the cloud never connects in.** Home routers do NAT and mobile operators do CGNAT (section 24), so a device can't be reached from the internet. It opens a long-lived connection to a broker and receives commands over it.
+- **MQTT over TLS** is the common protocol: small headers, publish/subscribe, and a server certificate check (section 25). Each device often has its own client certificate.
+- **Keepalives** keep the NAT entry alive. Without them, an idle connection is silently dropped after a few minutes.
+- **Battery devices** don't speak IP at all over the air (BLE, Zigbee) and go through a gateway, or use a low-power cellular link.
+- **Clock and DNS first:** a device that can't resolve the broker's name, or whose clock is wrong so the certificate looks invalid, never connects.
+
+The [Linux networking fundamentals note](../linux-networking-fundamentals/linux-networking-fundamentals_v1_2026-10-29.md) builds such a device, including cellular products with a modem. The [Wi-Fi](../../../wireless-protocols-and-connectivity/wifi/wifi_v1_2026-11-01.md) and [cellular](../../../wireless-protocols-and-connectivity/cellular/cellular_v1_2026-11-02.md) notes cover the radio links.
+
+---
+
+## Part 8: Putting it together
+
+## 37. What happens when you open a web page
+
+You type `https://www.example.com` on a laptop at home. Here is everything from the previous sections, in order.
+
+**The setup:** laptop `192.168.10.100/24`, home router `192.168.10.1` (public address `203.0.113.10`), server `198.51.100.20`.
+
+```mermaid
+sequenceDiagram
+    participant L as Laptop
+    participant R as Home router
+    participant D as DNS resolver
+    participant S as Server 198.51.100.20
+    Note over L: 1. already has an address from DHCP
+    L->>R: 2. ARP: who has 192.168.10.1?
+    R->>L: ARP reply with the router's MAC
+    L->>D: 3. DNS: A and AAAA records of www.example.com?
+    D->>L: 198.51.100.20
+    L->>S: 4. TCP SYN to port 443, through the router and NAT
+    S->>L: SYN-ACK
+    L->>S: ACK
+    L->>S: 5. TLS ClientHello
+    S->>L: ServerHello, certificate, Finished
+    Note over L: checks the certificate
+    L->>S: Finished, then 6. HTTP GET /
+    S->>L: 7. HTTP 200 OK with the HTML page
+    Note over L: 8. renders the page, fetches images and scripts the same way
+```
+
+1. **DHCP** (section 22): when the laptop joined the network, it got its address, mask, gateway `192.168.10.1` and DNS server.
+2. **ARP** (section 15): the server isn't in `192.168.10.0/24`, so the packets go to the default gateway. The laptop needs the router's MAC address and asks with ARP, unless it's already in its cache.
+3. **DNS** (section 23): the browser needs the server's address. It asks the resolver, which walks the DNS hierarchy or answers from its cache.
+4. **TCP** (section 19): the browser opens a connection to `198.51.100.20:443` with the three-way handshake. On the way out, the router's **NAT** (section 24) replaces `192.168.10.100:51514` with `203.0.113.10:40001`, and **routing** (section 18) carries the packets hop by hop across the internet.
+5. **TLS** (section 25): the browser and the server agree on keys, and the browser checks the server's certificate.
+6. **HTTP**: the browser sends `GET /` with `Host: www.example.com`, encrypted inside TLS.
+7. The server answers `200 OK` with the HTML page.
+8. The page references images, styles and scripts. The browser fetches them over the same connection (HTTP/2) or new ones, repeating steps 3 to 7 for other domains.
+
+### What the headers look like at each hop
+
+The IP addresses and ports change only at NAT. The MAC addresses change at every link.
+
+| Link | Source MAC | Destination MAC | Source IP:port | Destination IP:port |
+|---|---|---|---|---|
+| Laptop → home router (Wi-Fi or LAN) | Laptop | Router, LAN side | `192.168.10.100:51514` | `198.51.100.20:443` |
+| Home router → ISP router | Router, WAN side | ISP router | `203.0.113.10:40001` | `198.51.100.20:443` |
+| Each internet hop | That router | Next router | `203.0.113.10:40001` | `198.51.100.20:443` |
+| Last router → server | Last router | Server | `203.0.113.10:40001` | `198.51.100.20:443` |
+
+The reply follows the reverse path, and the home router translates the destination back to `192.168.10.100:51514`.
+
+All of this happens in a fraction of a second, before the first pixel appears.
+
+---
+
+## 38. Troubleshooting by layer
+
+Work **from the bottom up**: there's no point debugging DNS on a laptop that has no IP address. Each step either passes, so you go up one, or fails, so you know which layer to look at.
+
+```mermaid
+flowchart TD
+    a["1. Link: cable plugged in, Wi-Fi connected?"] -->|"yes"| b["2. Address: valid IP, mask, gateway? Not 169.254.x.x?"]
+    b -->|"yes"| c["3. Local network: can I ping the default gateway?"]
+    c -->|"yes"| d["4. Internet: can I ping a public IP, e.g. 1.1.1.1?"]
+    d -->|"yes"| e["5. DNS: does the name resolve?"]
+    e -->|"yes"| f["6. Service: does the port answer? Does the app work?"]
+    a -->|"no"| a2["Cable, port, Wi-Fi password, radio off"]
+    b -->|"no"| b2["DHCP server, VLAN, static settings"]
+    c -->|"no"| c2["Wrong subnet, Wi-Fi isolation, local firewall"]
+    d -->|"no"| d2["Router, ISP, routes, NAT"]
+    e -->|"no"| e2["DNS server settings, resolver down"]
+    f -->|"no"| f2["Server down, firewall, wrong port, TLS certificate, the app itself"]
+```
+
+### The commands, on each system
+
+| Check | Windows | macOS | Linux |
+|---|---|---|---|
+| My addresses | `ipconfig /all` | `ifconfig`, `ipconfig getifaddr en0` | `ip address` |
+| My routes and gateway | `route print` | `netstat -rn` | `ip route` |
+| ARP cache | `arp -a` | `arp -a` | `ip neigh` |
+| Reach a host | `ping 192.168.10.1` | `ping 192.168.10.1` | `ping 192.168.10.1` |
+| Path to a host | `tracert 198.51.100.20` | `traceroute 198.51.100.20` | `traceroute 198.51.100.20` or `tracepath` |
+| Resolve a name | `nslookup www.example.com` | `nslookup`, `dig www.example.com` | `dig www.example.com`, `resolvectl query` |
+| Test a TCP port | `Test-NetConnection www.example.com -Port 443` (PowerShell) | `nc -vz www.example.com 443` | `nc -vz www.example.com 443` |
+| Test a web service | `curl -v https://www.example.com` | `curl -v https://www.example.com` | `curl -v https://www.example.com` |
+| Open connections | `netstat -an` | `netstat -an` | `ss -tunap` |
+| Renew DHCP | `ipconfig /release`, `ipconfig /renew` | System Settings, or `sudo ipconfig set en0 DHCP` | Depends on the network manager |
+
+**Packet captures** settle every argument: **Wireshark** (all systems) or `tcpdump` (Linux, macOS) show exactly which packets leave and arrive.
+
+### Symptoms and likely causes
+
+| Symptom | Likely layer | Usual causes |
+|---|---|---|
+| "No network", link down | 1, 2 | Cable, port, Wi-Fi off or wrong password |
+| Address `169.254.x.x` | 3 (DHCP) | No DHCP answer: server, VLAN, Wi-Fi not really associated |
+| Can ping the gateway, not the internet | 3 | Router's WAN link, ISP outage, missing default route |
+| Can ping `1.1.1.1`, but websites don't load | 7 (DNS) | Wrong or unreachable DNS server |
+| Some sites work, large pages or downloads hang | 3 (MTU) | MTU problem, typically on VPNs and tunnels (section 21) |
+| Works on Wi-Fi, not on cable (or the reverse) | 2, 3 | Different VLAN, subnet or DHCP server per medium |
+| Everything slow | 1, 2 | Wi-Fi interference, duplex mismatch, a saturated uplink |
+| Certificate error | 7 (TLS) | Wrong system clock, expired certificate, captive portal intercepting |
+| Two devices fight over one address | 3 | Static address inside the DHCP pool (IP conflict) |
+| Port forwarding doesn't work | 3, 4 | CGNAT or double NAT, server's own firewall, wrong inside address |
+
+The [Linux networking fundamentals note](../linux-networking-fundamentals/linux-networking-fundamentals_v1_2026-10-29.md#22-troubleshooting) goes deeper on Linux, layer by layer, with packet captures.
+
+---
+
+## 39. Glossary
+
+| Term | Meaning |
+|---|---|
+| **AP** | Access point: connects Wi-Fi clients to the wired network |
+| **ARP** | Finds the MAC address that owns an IPv4 address on the local link |
+| **AS** | Autonomous system: a network under one organization's routing policy |
+| **Bandwidth** | Maximum data rate of a link |
+| **BGP** | The routing protocol between autonomous systems, the internet's routing |
+| **Broadcast domain** | Devices that receive each other's broadcasts: one LAN or VLAN |
+| **CIDR** | Prefix notation for networks, such as `/24` |
+| **CGNAT** | NAT done by the ISP for many customers at once |
+| **Default gateway** | The router a host sends all non-local traffic to |
+| **DHCP** | Hands out IP settings automatically |
+| **DMZ** | Firewall zone for servers reachable from the internet |
+| **DNS** | Translates names into IP addresses |
+| **Encapsulation** | Each layer wrapping the data of the layer above in its own header |
+| **Ephemeral port** | Temporary port picked by a client for its side of a connection |
+| **Frame** | Layer 2 data unit, addressed with MAC addresses |
+| **ICMP** | Error and diagnostic messages for IP (ping, traceroute) |
+| **IP address** | Layer 3 address of a host interface, IPv4 (32 bits) or IPv6 (128 bits) |
+| **LAN, WAN** | Local area network, wide area network |
+| **Latency** | Time for a packet to arrive |
+| **Load balancer** | Spreads requests over several servers |
+| **MAC address** | Layer 2 hardware address of a network interface, 48 bits |
+| **MTU** | Largest packet a link can carry, 1500 bytes on Ethernet |
+| **NAT** | Rewrites addresses so private hosts can share a public address |
+| **NIC** | Network interface card |
+| **OSI model** | The seven-layer reference model |
+| **Packet** | Layer 3 data unit, addressed with IP addresses |
+| **Port** | 16-bit number identifying a program's endpoint on a host |
+| **Protocol** | Agreed rules for communicating |
+| **QoS** | Quality of service: prioritizing some traffic, such as voice |
+| **Router** | Forwards packets between networks using IP addresses |
+| **Routing table** | List of destination networks and next hops |
+| **Segment** | Layer 4 TCP data unit |
+| **SLAAC** | IPv6 hosts building their own address from the router's prefix |
+| **SSID** | A Wi-Fi network's name |
+| **Subnet** | A range of IP addresses forming one network, given by address and mask |
+| **Switch** | Forwards frames within a LAN using MAC addresses |
+| **TCP** | Reliable, ordered, connection-based transport |
+| **TLS** | Encryption and authentication for TCP connections, the S in HTTPS |
+| **TTL** | Hop counter in each IP packet; also how long a DNS answer may be cached |
+| **UDP** | Simple, connectionless transport without delivery guarantees |
+| **VLAN** | A virtual LAN: one switch split into separate layer 2 networks |
+| **VPN** | An encrypted tunnel joining a device or network to a remote network |
+
+---
+
+## 40. Where to go next
+
+Notes in this repository that build on this one:
+
+- [Linux Networking Fundamentals for Embedded Engineers](../linux-networking-fundamentals/linux-networking-fundamentals_v1_2026-10-29.md): the same concepts on a Linux device, with `ip`, `ss`, `nftables`, `tc` and namespaces, and products with a cellular modem.
+- [Building a Home Gateway on Linux](../gateway/gateway_v1_2026-10-26.md): a router built by hand, with NAT, firewall, DHCP, DNS, VLANs and Wi-Fi.
+- [Networking on OpenWrt](../openwrt/openwrt_v1_2026-10-29.md): the same router on OpenWrt.
+- [Wi-Fi for Embedded Linux Engineers](../../../wireless-protocols-and-connectivity/wifi/wifi_v1_2026-11-01.md) and [Cellular Protocols: LTE, 5G NR and Cellular IoT](../../../wireless-protocols-and-connectivity/cellular/cellular_v1_2026-11-02.md): the wireless links in depth.
+
+Topics left for later notes: IPv6 in depth (prefix delegation, DHCPv6, privacy addresses), routing protocols in practice (OSPF and BGP configuration), QoS design, network security (802.1X, intrusion detection, zero trust), load balancing and CDNs, and network automation.
+
+---
+
+## References
+
+Standards (all on <https://www.rfc-editor.org>, Ethernet and Wi-Fi from the IEEE):
+
+| Topic | Standard |
+|---|---|
+| IPv4, ICMP | [RFC 791](https://www.rfc-editor.org/rfc/rfc791), [RFC 792](https://www.rfc-editor.org/rfc/rfc792) |
+| IPv6, addressing, ICMPv6 | [RFC 8200](https://www.rfc-editor.org/rfc/rfc8200), [RFC 4291](https://www.rfc-editor.org/rfc/rfc4291), [RFC 4443](https://www.rfc-editor.org/rfc/rfc4443) |
+| IPv6 neighbor discovery, SLAAC | [RFC 4861](https://www.rfc-editor.org/rfc/rfc4861), [RFC 4862](https://www.rfc-editor.org/rfc/rfc4862) |
+| ARP | [RFC 826](https://www.rfc-editor.org/rfc/rfc826) |
+| TCP, UDP | [RFC 9293](https://www.rfc-editor.org/rfc/rfc9293), [RFC 768](https://www.rfc-editor.org/rfc/rfc768) |
+| QUIC, HTTP/3 | [RFC 9000](https://www.rfc-editor.org/rfc/rfc9000), [RFC 9114](https://www.rfc-editor.org/rfc/rfc9114) |
+| CIDR, private addresses, /31 links, CGNAT range | [RFC 4632](https://www.rfc-editor.org/rfc/rfc4632), [RFC 1918](https://www.rfc-editor.org/rfc/rfc1918), [RFC 3021](https://www.rfc-editor.org/rfc/rfc3021), [RFC 6598](https://www.rfc-editor.org/rfc/rfc6598) |
+| Documentation addresses and AS numbers | [RFC 5737](https://www.rfc-editor.org/rfc/rfc5737), [RFC 3849](https://www.rfc-editor.org/rfc/rfc3849), [RFC 5398](https://www.rfc-editor.org/rfc/rfc5398) |
+| Unique local IPv6 addresses | [RFC 4193](https://www.rfc-editor.org/rfc/rfc4193) |
+| DHCP, DHCPv6 | [RFC 2131](https://www.rfc-editor.org/rfc/rfc2131), [RFC 8415](https://www.rfc-editor.org/rfc/rfc8415) |
+| DNS, mDNS | [RFC 1034](https://www.rfc-editor.org/rfc/rfc1034), [RFC 1035](https://www.rfc-editor.org/rfc/rfc1035), [RFC 6762](https://www.rfc-editor.org/rfc/rfc6762) |
+| Path MTU discovery | [RFC 1191](https://www.rfc-editor.org/rfc/rfc1191), [RFC 8201](https://www.rfc-editor.org/rfc/rfc8201) |
+| NAT | [RFC 3022](https://www.rfc-editor.org/rfc/rfc3022), [RFC 4787](https://www.rfc-editor.org/rfc/rfc4787) |
+| HTTP, TLS 1.3 | [RFC 9110](https://www.rfc-editor.org/rfc/rfc9110), [RFC 8446](https://www.rfc-editor.org/rfc/rfc8446) |
+| BGP, OSPF | [RFC 4271](https://www.rfc-editor.org/rfc/rfc4271), [RFC 2328](https://www.rfc-editor.org/rfc/rfc2328) |
+| VXLAN | [RFC 7348](https://www.rfc-editor.org/rfc/rfc7348) |
+| Ethernet, VLANs and bridging (STP, RSTP), link aggregation | IEEE 802.3, IEEE 802.1Q, IEEE 802.1AX |
+| Wi-Fi | IEEE 802.11 |
+
+Registries: IANA port numbers and special-purpose address registries, <https://www.iana.org/protocols>.
+
+Books:
+
+- James F. Kurose and Keith W. Ross, *Computer Networking: A Top-Down Approach*: the classic textbook, from applications down to the link layer.
+- W. Richard Stevens and Kevin R. Fall, *TCP/IP Illustrated, Volume 1: The Protocols* (2nd edition): how the protocols behave on the wire.
+- Andrew S. Tanenbaum, Nick Feamster and David J. Wetherall, *Computer Networks* (6th edition): a broad, bottom-up textbook.
 
 ---
 

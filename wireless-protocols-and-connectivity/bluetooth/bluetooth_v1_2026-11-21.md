@@ -236,7 +236,7 @@ Coded PHY trades airtime (energy, latency, channel occupancy) for range. It is m
 | 2 | 2.5 mW (+4 dBm) | Phones, headsets, most combo modules |
 | 3 | 1 mW (0 dBm) | Small LE devices |
 
-The class is a **maximum**; the controller and regulation can set less. In the EU, ETSI EN 300 328 limits the band to 20 dBm EIRP (10 dBm EIRP per MHz... for wide-band modulations: the certification lab checks the details). The antenna gain counts in EIRP: a +20 dBm chip with a 3 dBm-gain antenna exceeds 20 dBm EIRP. Since 5.2, LE power control lets two connected devices ask each other to lower or raise their power.
+The class is a **maximum**; the controller and regulation can set less. In the EU, ETSI EN 300 328 limits the band to 20 dBm EIRP, and non-hopping (wideband) modulations such as LE also to 10 dBm EIRP per MHz. The antenna gain counts in EIRP: a +20 dBm chip with a 3 dBi antenna exceeds 20 dBm EIRP. Since 5.2, LE power control lets two connected devices ask each other to lower or raise their power.
 
 ### Range and link budget
 
@@ -250,5 +250,176 @@ The **link budget** is TX power plus antenna gains minus sensitivity. With 0 dBm
 - multipath fading makes the signal drop by 10 to 20 dB at some positions and frequencies: hopping and channel diversity exist because of it.
 
 **RSSI** (received signal strength indication) is reported in advertising reports and per connection. Use it to compare positions, not as a distance meter: the same distance gives values 10 to 20 dB apart depending on orientation, bodies and channel. For distance, Channel Sounding (section 12) or several samples with a calibrated model are needed.
+
+---
+
+## 5. LE advertising and scanning
+
+An LE device that wants to be found **advertises**: it sends short packets on the advertising channels, at an interval, whether anyone listens or not. A device that wants to find others **scans**. Nothing is "paired" or "connected" at this stage, and anyone in range can read the advertisements.
+
+### Advertising events
+
+In legacy advertising, one **advertising event** sends the same PDU on channels 37, 38 and 39, one after the other within about a millisecond, listening briefly after each for a scan or connection request. Events repeat every `advInterval + advDelay`:
+
+- `advInterval`: 20 ms to 10.24 s in steps of 0.625 ms (**normative**). Shorter means faster discovery and more energy.
+- `advDelay`: a random 0 to 10 ms added to every event, so two devices with the same interval don't collide forever.
+
+**Legacy advertising PDU types** (LE 1M only):
+
+| PDU | Connectable | Scannable | Use |
+|---|---|---|---|
+| `ADV_IND` | Yes | Yes | The usual peripheral: "here I am, connect to me" |
+| `ADV_DIRECT_IND` | Yes, by one named central | No | Fast reconnection to a known central. High duty cycle mode lasts at most 1.28 s |
+| `ADV_SCAN_IND` | No | Yes | Broadcasts data, more in the scan response |
+| `ADV_NONCONN_IND` | No | No | Beacons |
+| `SCAN_REQ` / `SCAN_RSP` | | | An active scanner asks for 31 more bytes of data |
+| `CONNECT_IND` | | | A central starts a connection (section 6). Called `CONNECT_REQ` before 5.0 |
+
+### Advertising data
+
+The payload is up to **31 bytes** of **AD structures** (plus 31 in the scan response), each made of a length byte, a type byte and data. The sensor's advertisement (**Illustrative**):
+
+```
+02 01 06                                     len 2, Flags: LE General Discoverable, BR/EDR not supported
+03 03 1A 18                                  len 3, Complete list of 16-bit service UUIDs: 0x181A (little endian)
+0E 09 54 65 6D 70 53 65 6E 73 6F 72 2D 30 31 len 14, Complete local name: "TempSensor-01"
+```
+
+| AD type | Name | Notes |
+|---|---|---|
+| `0x01` | Flags | Discoverable mode (limited `0x01`, general `0x02`), "BR/EDR not supported" `0x04`. Required in connectable advertising |
+| `0x02` / `0x03` | Incomplete / complete list of 16-bit service UUIDs | Lets scanners filter by service without connecting. `0x06`/`0x07` for 128-bit UUIDs, which take 18 of the 31 bytes |
+| `0x08` / `0x09` | Shortened / complete local name | Put a short name; the full name can be read over GATT |
+| `0x0A` | TX power level | Lets the scanner estimate path loss |
+| `0x16` | Service data, 16-bit UUID | A UUID followed by data: the way to broadcast sensor values without connections |
+| `0x19` | Appearance | Icon category (thermometer, keyboard...) from Assigned Numbers |
+| `0xFF` | Manufacturer specific data | Starts with the 16-bit **company identifier** from Assigned Numbers. Don't use another company's ID |
+
+Beacons are just advertising formats: Apple's iBeacon is manufacturer data with Apple's company ID (`0x004C`), Google's Eddystone is service data with UUID `0xFEAA`. Item trackers use their own formats on the same mechanism.
+
+**Advertising is public.** Never put credentials, static identifiers you don't want tracked, or anything the device's owner wouldn't want broadcast. 5.4 added **encrypted advertising data** (key shared beforehand over GATT), still rarely supported.
+
+### Scanning
+
+| Parameter | Meaning |
+|---|---|
+| Scan interval | How often the scanner starts listening on the next advertising channel |
+| Scan window | How long it listens each time. Window = interval means listening continuously |
+| Passive / active | Passive only listens. Active also sends `SCAN_REQ` to scannable devices to get their scan response (and reveals the scanner) |
+| Duplicate filtering | The controller reports each address once (until scanning restarts) instead of every packet. Turn it off to track RSSI or changing data |
+| Filter policy | Report everyone, or only the devices in the filter accept list (formerly white list) |
+
+**Discovery time** depends on both sides. A peripheral advertising every 100 ms, seen by a scanner listening continuously, is found within a few hundred ms. Phones scan at a low duty cycle in the background and when the screen is off, so a device advertising every 1 to 2 s can take several seconds to appear (**rule of thumb**). The usual compromise: advertise fast (20 to 100 ms) for 30 s after power-up or a button press, then slow down. Apple's Accessory Design Guidelines list recommended intervals (20 ms for the first 30 s, then values such as 152.5, 211.25, 318.75 ms or 1022.5, 1285 ms) because iOS scans in a pattern that catches those reliably.
+
+### Extended and periodic advertising (5.0)
+
+Legacy advertising has three limits: 31 bytes, LE 1M only, and everything on three crowded channels. Extended advertising moves the payload off the primary channels:
+
+1. A short `ADV_EXT_IND` on channels 37, 38 and 39 says "the data is on data channel *n* at time *t*, on PHY *p*" (an AuxPtr).
+2. `AUX_ADV_IND` on that data channel carries up to 254 bytes, and can chain more PDUs (`AUX_CHAIN_IND`) for up to **1650 bytes** of advertising data.
+
+The secondary PHY can be 1M, 2M or Coded (and Coded is also allowed on the primary channels, for long-range discovery). A controller can run several **advertising sets** at once, each with its own data, interval and address.
+
+**Older scanners don't see extended advertising.** A device that phones must find should keep a legacy advertising set, or check that every target phone handles extended advertising.
+
+**Periodic advertising** sends data at a fixed interval that scanners synchronize to, so they wake only when a packet is due: the base of LE Audio broadcast (Auracast, section 12). **PAwR** (5.4) adds response slots, so one gateway can talk to thousands of devices (electronic shelf labels) without connections.
+
+---
+
+## 6. LE connections: parameters, data length and throughput
+
+### Establishing a connection
+
+A central that wants to connect scans for a connectable advertisement from the target, then answers it with `CONNECT_IND` (or `AUX_CONNECT_REQ` for extended advertising). That PDU carries everything the link needs: a random 32-bit **access address** that identifies the connection's packets, the CRC seed, the timing of the first event, the connection parameters, the channel map and the hop parameters. The peripheral stops advertising and the two are connected: there's no handshake beyond it, and the first data exchange confirms the link. If it fails, the central's host sees "connection failed to be established" (HCI reason `0x3E`, section 9).
+
+### Connection events
+
+Once connected, the two devices meet at **connection events**, one per connection interval, on a new data channel each time:
+
+```
+ connection interval (e.g. 30 ms)
+ |<------------------------------->|
+ [C→P][P→C][C→P][P→C]               [C→P][P→C]                 ...
+ ^anchor point     radio off         ^next anchor, next channel
+```
+
+- The central transmits first at the **anchor point**; the peripheral answers 150 µs (T_IFS) later. Every packet acknowledges the previous one, and a packet that isn't acknowledged is sent again at the next opportunity: the link layer is reliable.
+- While either side has more data (the **MD**, more data, bit), the event continues; otherwise both turn the radio off until the next anchor.
+- With nothing to send, the central still sends an empty packet each event so both stay in sync.
+
+### Connection parameters
+
+| Parameter | Range (normative) | Effect |
+|---|---|---|
+| Connection interval | 7.5 ms to 4 s, in 1.25 ms units (6.2 adds shorter intervals for controllers that support them) | Latency and throughput vs power |
+| Peripheral latency | 0 to 499 events | The peripheral may skip that many events when it has nothing to send, to save power. The central still listens at every event, so data from the peripheral isn't delayed; data *to* the peripheral may be |
+| Supervision timeout | 100 ms to 32 s, in 10 ms units. Must be larger than `(1 + latency) × interval × 2` | Time without a valid packet before the link is declared lost (HCI reason `0x08`, connection timeout) |
+
+The **central decides**. The peripheral can ask for other values (L2CAP Connection Parameter Update Request, or the link-layer Connection Parameters Request procedure); the central can accept, reject or pick something else. Phones impose their own limits:
+
+- **iOS** (Apple's Accessory Design Guidelines): roughly, interval at least 15 ms, latency at most 30, supervision timeout 2 to 6 s, and `interval × (latency + 1)` at most 2 s. Requests outside the rules are rejected. Check the current guidelines.
+- **Android**: apps choose a priority (`CONNECTION_PRIORITY_HIGH`, `BALANCED`, `LOW_POWER`), which maps to intervals of very roughly 11 to 15 ms, 30 to 50 ms and 100 to 125 ms; exact values vary by Android version and vendor (**stack-dependent**).
+- **Linux** as a central: the kernel's defaults are 30 to 50 ms, latency 0, supervision timeout 420 ms. They can be changed in `/etc/bluetooth/main.conf` (section 13) or per adapter in debugfs.
+
+A short supervision timeout detects lost peripherals quickly but drops connections on short fades; a long one keeps the link through fades but takes long to notice a device that's gone. 2 to 6 s suits most products.
+
+**Connection subrating** (5.3) lets a link alternate between a slow "idle" rate and a fast one without the renegotiation delay, useful for LE Audio and HID devices.
+
+### Packet sizes: data length and MTU
+
+Three sizes stack up, and all three matter for throughput:
+
+| Size | Default | Max | Negotiated by |
+|---|---|---|---|
+| Link-layer payload (data length) | 27 bytes | 251 bytes (4.2 Data Length Extension) | `LL_LENGTH_REQ`, by the controllers when the host asks |
+| ATT MTU | 23 bytes | 517 bytes (stack limit; the spec allows up to 65535 on L2CAP) | ATT Exchange MTU, by the GATT client |
+| Usable data per notification or write | MTU - 3 = 20 bytes | 514 bytes | |
+
+L2CAP adds 4 bytes, ATT 3 bytes of header. A 247-byte MTU fits exactly in one 251-byte link-layer packet (247 + 4), which is why stacks often negotiate 247.
+
+### Throughput
+
+The ceiling is how many packets fit in a connection event and how big they are. An encrypted 251-byte packet on LE 1M takes 2.1 ms on air, plus the acknowledgment and two 150 µs gaps: about 2.5 ms per 244 bytes of ATT data.
+
+| Configuration | Theoretical application throughput, one direction | Typical in practice (rule of thumb) |
+|---|---|---|
+| LE 1M, 27-byte packets, MTU 23 | About 230 kb/s | 30 to 100 kb/s with a phone |
+| LE 1M, 251-byte packets, MTU 247 | About 780 kb/s | 300 to 700 kb/s |
+| LE 2M, 251-byte packets, MTU 247 | About 1.4 Mb/s | 0.7 to 1.3 Mb/s |
+| BR/EDR, 3 Mb/s EDR | About 2.1 Mb/s | 1 to 2 Mb/s |
+
+Real values are lower because controllers limit how many packets they send per connection event (**controller-dependent**), the event shares airtime with Wi-Fi on a combo chip (section 19), and retransmissions grow with distance and interference.
+
+**What the application can do:**
+- Use **notifications** and **write without response**: they stream. Reads, writes with response and indications wait for a reply, at most one per connection event or two.
+- Negotiate the MTU and data length early (Linux and phones do both automatically on recent versions).
+- Ask for a short interval during transfers (firmware updates, logs) and a long one otherwise.
+- Use LE 2M when both sides support it (`bluetoothctl` and the kernel switch automatically only if configured to: section 15).
+- For bulk data, consider an **L2CAP connection-oriented channel** (LE CoC, section 9) instead of GATT: less overhead, flow control built in.
+
+---
+
+## 7. Addresses and privacy
+
+A Bluetooth address is 48 bits. LE adds address **types**, because a fixed address that every advertisement repeats lets anyone track the device (and its owner).
+
+| Type | Form | Lifetime | Used by |
+|---|---|---|---|
+| Public | IEEE-assigned: vendor OUI + serial, like an Ethernet MAC | Fixed | Classic always; LE devices that bought an OUI |
+| Random static | Two top bits `11` (first byte `C0` to `FF`) | Fixed for the device's life, or new at each power cycle | Most LE-only devices (no OUI needed). The sensor's `F0:00:00:00:53:01` |
+| Resolvable private address (RPA) | Two top bits `01` (first byte `40` to `7F`); 24 random bits + 24-bit hash computed with an **IRK** | Changes periodically (typically every 15 min) | Phones, laptops, the board when privacy is on |
+| Non-resolvable private | Two top bits `00` | Changes often, can't be linked to the device | Non-connectable broadcasts |
+
+`btmon` and BlueZ show the type next to the address: `(Public)`, `(Random)` plus `(Static)` or `(Resolvable)` or `(Non-Resolvable)`. In `bluetoothctl` and D-Bus, `AddressType` is `public` or `random`.
+
+**How a bonded peer recognizes a changing address.** During bonding (section 11), each side sends its **identity address** (public or random static) and its **identity resolving key** (IRK). When an RPA shows up later, the peer computes the hash part with each stored IRK; a match means "that's my bonded phone". The controller can do it in hardware (**LL privacy**, 4.2, with a resolving list), which is needed to use filter accept lists and directed advertising with peers that use RPAs. Linux supports controller-based resolution (enabled by default on recent kernels when the controller supports it, **stack-dependent**).
+
+**Consequences for products:**
+- Before bonding, a phone's address means nothing: it changes, and the next scan shows "a new device". Identify unbonded phones by what they do (the GATT exchange), not by their address.
+- After bonding, BlueZ stores the peer under its **identity address** (`/var/lib/bluetooth/<adapter>/<identity>/`), whatever address it uses on air.
+- Advertising content can defeat address rotation: a fixed name with a serial number, or manufacturer data with a constant ID, tracks the device just as well. Rotate or omit such fields if privacy matters.
+- **Classic doesn't rotate addresses.** A discoverable Classic device broadcasts its public address to anyone who inquires. Stay non-discoverable except during pairing (section 20).
+
+The board's own LE privacy is controlled by BlueZ's `Privacy` setting (section 13): `off` uses the public address in advertising and connections, `device` or `network` use RPAs.
 
 ---

@@ -1524,3 +1524,156 @@ A **production line test** typically:
 - **Radio regulation** is separate: FCC Part 15 (15.247) and ISED in North America, the RED in the EU (EN 300 328 for the radio, EN 301 489-1/-17 for EMC, plus safety, and the RED cybersecurity requirements under EN 18031 for connected radio equipment), and others per country. A pre-certified module (modular approval) saves most of the radio testing, **only if** you follow its integration conditions: antenna type and gain, layout, and no change to the firmware's power tables.
 
 ---
+
+## 21. Troubleshooting
+
+### Method
+
+Work up from the hardware and don't go further until a step passes:
+
+```mermaid
+flowchart TD
+    A{"hci0 present,<br/>firmware patched,<br/>valid address?"} -->|no| HW["Power, UART, serdev node,<br/>driver, firmware, address"]
+    A -->|yes| B{"Powered,<br/>not blocked?"}
+    B -->|no| PW["rfkill, AutoEnable,<br/>bluetoothd running"]
+    B -->|yes| C{"Peer found<br/>in a scan?"}
+    C -->|no| SCAN["Advertising or discoverable?<br/>LE vs Classic, extended adv,<br/>range, antenna, coexistence"]
+    C -->|yes| D{"Connection<br/>established?"}
+    D -->|no| CONN["0x3E, page timeout,<br/>connection limits, filter lists"]
+    D -->|yes| E{"Pairing and<br/>encryption succeed?"}
+    E -->|no| SEC["Stale bonds on one side,<br/>IO capabilities, agent,<br/>SC only vs legacy"]
+    E -->|yes| F{"Services and<br/>data work?"}
+    F -->|no| GATT["ATT errors, CCCD,<br/>cache, MTU, profile roles"]
+    F -->|yes| G{"Stable and<br/>fast enough?"}
+    G -->|no| Q["Disconnect reasons, parameters,<br/>PHY, coexistence, power save"]
+```
+
+| Fault domain | Evidence | Tools |
+|---|---|---|
+| Hardware, power, UART | No `hci0`, HCI command timeouts, garbage on the UART | Scope, logic analyzer, `dmesg` |
+| Firmware | Patch not found, ROM build number, controller resets | `dmesg`, `btmon` at startup (Read Local Version) |
+| Kernel and `bluetoothd` state | Adapter unconfigured, not powered, blocked | `btmgmt info`, `bluetoothctl show`, `rfkill list`, `journalctl -u bluetooth` |
+| Discovery | Peer not in scan results | `bluetoothctl scan le`, a phone with nRF Connect, an LE sniffer |
+| Connection | Connection Failed to be Established, page timeout | `btmon` |
+| Pairing, bonds | Authentication Failure, PIN or Key Missing, SMP Pairing Failed | `btmon`, the phone's HCI log, `/var/lib/bluetooth` |
+| GATT | ATT errors, missing notifications, stale services | `btmon`, `bluetoothctl` `menu gatt`, `busctl monitor org.bluez` |
+| Link stability | Disconnect reasons `0x08`, `0x22`, `0x28`, `0x3D` | `btmon`, sniffer, the same test with Wi-Fi idle or on 5 GHz |
+| Upper layers | Bluetooth fine, application misbehaves | Application logs, D-Bus traffic |
+
+**Look at both ends.** A peripheral that "drops the connection" may be a phone giving up after a pairing failure the peripheral never logged. The phone's HCI log and the board's `btmon` capture of the same moment usually settle it; if they disagree, an over-the-air sniffer does.
+
+### Symptoms
+
+| Symptom | Where to look first |
+|---|---|
+| No `hci0` | `dmesg` for `hci_uart`/`btusb`; device tree node under the right UART with `status = "okay"`; `CONFIG_BT_HCIUART_SERDEV` and the vendor protocol; `BT_REG_ON` and the LPO clock; RTS/CTS wiring |
+| `hci0: command 0x0c03 tx timeout` | The controller doesn't answer HCI Reset: power, `BT_REG_ON` polarity, UART pins swapped, RTS/CTS not wired or inverted, wrong initial baud rate |
+| `hci0` exists but isn't usable, `btmgmt info` says unconfigured | No valid address: set `local-bd-address` or `btmgmt public-addr` (section 18) |
+| `Patch file not found` | Firmware file missing or under another name: the log lists the names tried |
+| Adapter powered off after boot | `AutoEnable = true` in `[Policy]`, `rfkill list` (soft block), `bluetoothd` not running |
+| Board finds nothing | Scanning the wrong transport (`scan bredr` for an LE device), duplicate filtering hiding updates, antenna, coexistence with heavy Wi-Fi traffic. Compare with the laptop's adapter in the same place |
+| Phone doesn't see the board | Not advertising (`btmon`: LE Set Advertising Enable), extended advertising only on an old phone, advertising stopped after a connection, data too long for legacy advertising. Classic: not discoverable |
+| Connection fails with `0x3E` | The peripheral stopped advertising, moved, or the channel is noisy; the peripheral's connection limit reached (many sensors accept only one central) |
+| Pairing fails right away | IO capabilities that can't meet the required security (MITM requested, NoInputNoOutput on both sides), Secure Connections Only vs a legacy peer, no agent registered on the board |
+| Worked yesterday, `Authentication Failure` or `PIN or Key Missing` today | One side lost its bond (reset, reflash, "forget" on the phone, read-only `/var/lib/bluetooth`): remove the bond on both sides and pair again |
+| Phone pairs every time it connects | Board doesn't keep bonds (storage not persistent), or the phone's bond was refused (`JustWorksRepairing`) |
+| Reads fail with Insufficient Authentication or Encryption | The characteristic needs a bond the client doesn't have: pair, or relax the flags if appropriate |
+| Notifications never arrive | Client didn't write the CCCD (`notify on`, `start_notify`); server sends before the subscription; indication sent while the previous one wasn't confirmed |
+| Stale services after a firmware update | Client's GATT cache: Service Changed not indicated, or Database Hash unsupported. Clear the cache (forget the device, or remove `/var/lib/bluetooth/<adapter>/cache/<peer>`) |
+| Disconnects with `0x08` every few minutes | Range or interference, supervision timeout too short, inaccurate LPO clock on one side, peripheral firmware crash. Check RSSI before the drop |
+| Disconnects with `0x22` or `0x28` | Link-layer procedure timeouts: firmware bugs, heavy interference, or a peer too slow to follow parameter updates. Try other parameters, update firmware |
+| Slow transfers | Section 19 checklist: PHY, data length, MTU, interval, write type, UART baud rate |
+| Audio stutters | Coexistence with 2.4 GHz Wi-Fi, a codec bit rate too high for the link (LDAC at 990 kb/s), UART speed, CPU load in PipeWire |
+| Headset connects but no audio profile | PipeWire's Bluetooth plugin missing, the user session not running (PipeWire runs per user), profile set to `off` |
+| No Bluetooth after suspend | Wake interrupt not configured, firmware not reloaded after the chip lost power, `BT_REG_ON` dropped during suspend |
+
+### Messages and what they mean
+
+| Message | Meaning |
+|---|---|
+| `Bluetooth: hci0: command 0x.... tx timeout` | The controller stopped answering: power, UART, firmware crash |
+| `Bluetooth: hci0: BCM: Patch file not found, tried: ...` | Firmware missing; the controller runs its ROM firmware |
+| `Bluetooth: hci0: BCM: Using default device address (...)` | The chip's address isn't unique; the adapter stays unconfigured until one is set |
+| `Bluetooth: hci0: unexpected event for opcode 0x....` | Controller and host disagree on the command sequence: often firmware or UART corruption |
+| `Bluetooth: hci0: Frame reassembly failed` | Corrupted HCI stream: UART errors, missing flow control, wrong baud rate |
+| `Bluetooth: hci0: Opcode 0x.... failed: -16` | Command rejected while busy: state machine collisions, usually harmless if isolated |
+| `bluetoothd: src/device.c:...: Failed to connect: org.bluez.Error.Failed` / `le-connection-abort-by-local` | The connection attempt timed out or was cancelled: peer not advertising, out of range |
+| `org.bluez.Error.AuthenticationFailed` / `AuthenticationRejected` | Pairing failed or the peer refused: bonds, IO capabilities, an agent missing or answering no |
+| `org.bluez.Error.InProgress` | Another operation (discovery, connection) is running on the adapter or device |
+| `org.bluez.Error.NotPermitted` on `ReadValue` | The characteristic doesn't allow the operation, or the link lacks the required security |
+| `a2dp-sink profile connect failed ... Protocol not available` | No audio endpoint registered: PipeWire's Bluetooth support missing or not running for this user |
+| `Sap driver initialization failed` / `sap-server: Operation not permitted` | The SIM Access plugin can't start: harmless on boards; disable the plugin |
+
+### A useful bug report
+
+Kernel and BlueZ versions, controller and firmware version (`dmesg`, `btmgmt info`), `bluetoothctl show`, the peer (model, OS version, app), a timestamped `btmon -w` capture of the failure, `bluetoothd -d` logs for the same moment, the phone's HCI log if a phone is involved, and the relevant `main.conf` settings. For radio problems, add RSSI values and whether Wi-Fi was active.
+
+---
+
+## 22. Not covered here
+
+Topics for separate notes:
+
+- **Bluetooth on microcontrollers:** Zephyr's Bluetooth stack, NimBLE, nRF Connect SDK, ESP-IDF; writing the sensor's firmware; running such a chip as an HCI controller for Linux.
+- **Mesh in depth:** provisioning, models, `bluetooth-meshd`, mesh gateways.
+- **LE Audio in depth:** BAP configuration, Auracast broadcast sources and assistants, hearing aid profiles.
+- **Positioning:** AoA/AoD direction finding systems, Channel Sounding ranging.
+- **Matter and Thread:** Matter uses BLE only for commissioning; Thread is an 802.15.4 network ([wireless-protocols-and-connectivity/](../)).
+- **Bluetooth driver development:** writing an `hci_uart` protocol or a vendor setup routine ([linux-kernel-device-driver-development/](../../os-and-firmware/embedded-linux/linux-kernel-device-driver-development/)).
+- **RF design and measurements:** antenna design, matching, conducted and radiated tests ([hardware/rf/](../../hardware/rf/)).
+- **Phone app development:** CoreBluetooth on iOS and the Android Bluetooth APIs, background execution limits.
+- **Wi-Fi** ([Wi-Fi for Embedded Linux Engineers](../wifi/wifi_v1_2026-11-01.md)) and **cellular** ([Cellular Protocols](../cellular/cellular_v1_2026-11-02.md)).
+
+---
+
+## References
+
+Specifications (Bluetooth SIG, <https://www.bluetooth.com/specifications/>):
+
+| Topic | Document |
+|---|---|
+| Radio, link layer, HCI, L2CAP, ATT/GATT, SMP, GAP, error codes | Bluetooth Core Specification (6.x; 5.x for older products). Vol 1 Part F error codes, Vol 3 Part F ATT, Part G GATT, Part H SMP, Vol 4 HCI, Vol 6 LE controller |
+| UUIDs, AD types, company identifiers, appearance values | Assigned Numbers |
+| Characteristic formats | GATT Specification Supplement |
+| Profiles | A2DP, AVRCP, HFP, HID, HOGP, Mesh Protocol, BAP, CAP, TMAP, PBP and the other profile and service specifications |
+| Version feature summaries | The SIG's "Core Specification" feature overview published with each release |
+| Qualification | Bluetooth Qualification Program: <https://www.bluetooth.com/develop-with-bluetooth/qualification-listing/> |
+
+Linux and tools:
+
+- BlueZ: <https://www.bluez.org> and the source at <https://git.kernel.org/pub/scm/bluetooth/bluez.git>. D-Bus API in `doc/` (`org.bluez.Adapter.rst`, `org.bluez.Device.rst`, `org.bluez.GattCharacteristic.rst`, `org.bluez.LEAdvertisement.rst`...; `*-api.txt` in older releases), the mgmt API in `doc/mgmt-api.txt` (or `mgmt.rst`), example programs in `test/` (`example-gatt-server`, `example-advertisement`, `example-gatt-client`)
+- `main.conf`: the commented file installed in `/etc/bluetooth/`
+- Manual pages: `man bluetoothctl` (and `bluetoothctl-gatt`, `bluetoothctl-advertise`...), `man btmon`, `man btmgmt`, `man btattach`, `man bluetoothd`
+- Kernel: `net/bluetooth/`, `drivers/bluetooth/`; device tree bindings in `Documentation/devicetree/bindings/net/bluetooth/` (`bluetooth-controller.yaml`, `brcm,bluetooth.yaml` and others)
+- Linux Bluetooth mailing list: `linux-bluetooth@vger.kernel.org` (archives on <https://lore.kernel.org/linux-bluetooth/>)
+- Bleak: <https://bleak.readthedocs.io>
+- PipeWire Bluetooth and WirePlumber configuration: <https://pipewire.pages.freedesktop.org/wireplumber/>
+- Wireshark Bluetooth support and btsnoop format: <https://wiki.wireshark.org/Bluetooth>
+- Nordic nRF Sniffer for Bluetooth LE, nRF Connect for Mobile: <https://www.nordicsemi.com>
+
+Platform guidance:
+
+- Apple, *Accessory Design Guidelines for Apple Devices* (Bluetooth chapters: advertising intervals, connection parameters, pairing): <https://developer.apple.com/accessories/>
+- Android Bluetooth documentation and the HCI snoop log: <https://source.android.com/docs/core/connect/bluetooth>
+
+Security:
+
+- KNOB, BIAS, BLURtooth, BLUFFS: papers by Daniele Antonioli and coauthors (<https://francozappa.github.io>), and the SIG's security notices: <https://www.bluetooth.com/learn-about-bluetooth/key-attributes/bluetooth-security/>
+- BleedingTooth: Google security research advisories (CVE-2020-12351, CVE-2020-12352, CVE-2020-24490)
+- SweynTooth and BrakTooth: <https://asset-group.github.io>
+
+Regulation (check for amendments before relying on values):
+
+- US: 47 CFR 15.247
+- EU: Radio Equipment Directive 2014/53/EU; ETSI EN 300 328 (2.4 GHz wideband), EN 301 489-17 (EMC), EN 18031 series (RED cybersecurity)
+- Documentation MAC addresses: [RFC 7042](https://www.rfc-editor.org/rfc/rfc7042)
+
+Books:
+
+- Kevin Townsend, Carles Cufí, Akiba and Robert Davidson, *Getting Started with Bluetooth Low Energy*: GAP, GATT and the tools, concisely.
+- Robin Heydon, *Bluetooth Low Energy: The Developer's Handbook*: the design of LE, by one of its authors.
+- Naresh Gupta, *Inside Bluetooth Low Energy* (2nd edition): the full LE stack with protocol traces.
+
+---
+
+Version 1 · 2026-11-21

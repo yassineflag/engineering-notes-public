@@ -10,7 +10,7 @@ Notes on the radio links an embedded device uses to reach a network: how each pr
 
 ### Bluetooth
 
-- [Bluetooth](bluetooth/)
+- [Bluetooth for Embedded Linux Engineers](bluetooth/bluetooth_v1_2026-11-21.md): Classic (BR/EDR) and Low Energy, versions and the radio (channels, PHYs, power, range), LE advertising and scanning, connection parameters and throughput, addresses and privacy, inquiry, paging and Classic links, HCI and L2CAP with their error codes, ATT and GATT, pairing, bonding and known attacks, the profiles (audio, HID, serial, LE Audio and Auracast, mesh, direction finding, Channel Sounding); the Linux stack (kernel, mgmt, bluetoothd, D-Bus), bluetoothctl, btmgmt and btmon, the board as a central (Bleak) and as a peripheral (a provisioning GATT server), PipeWire audio and RFCOMM; board integration (UART HCI, serdev device tree, firmware, the address), Wi-Fi coexistence, power, production hardening, RF tests and qualification, and troubleshooting by symptom.
 
 ### Cellular
 

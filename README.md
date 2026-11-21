@@ -18,6 +18,7 @@ Every note aims to be practical, so you'll find configs and commands you can reu
 
 ## Latest notes
 
+- [Bluetooth for Embedded Linux Engineers](wireless-protocols-and-connectivity/bluetooth/bluetooth_v1_2026-11-21.md)
 - [Networking Basics: How Networks Work](os-and-firmware/networking/networking-basics/networking-basics_v1_2026-11-20.md)
 - [Linux Kernel Device Drivers for Embedded Linux](os-and-firmware/embedded-linux/linux-kernel-device-driver-development/device-drivers_v1_2026-11-19.md)
 - [Everyday Linux: The Shell, Files, Users, Packages and Services](os-and-firmware/linux-general-usage/everyday-linux/everyday-linux_v1_2026-11-16.md)

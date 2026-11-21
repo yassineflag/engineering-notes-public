@@ -731,12 +731,12 @@ A headless board is typically **NoInputNoOutput**, which means Just Works: encry
 
 **Security levels** (LE security mode 1, **normative**):
 
-| Level | Requirement | BlueZ `sec-level` |
-|---|---|---|
-| 1 | No security | `low` |
-| 2 | Encryption, unauthenticated pairing (Just Works) | `medium` |
-| 3 | Encryption, authenticated pairing (MITM) | `high` |
-| 4 | Authenticated LE Secure Connections with a 128-bit key | `fips` |
+| Level | Requirement | Linux socket level | BlueZ GATT flag (section 16) |
+|---|---|---|---|
+| 1 | No security | `BT_SECURITY_LOW` | `read`, `write` |
+| 2 | Encryption, unauthenticated pairing (Just Works) | `BT_SECURITY_MEDIUM` | `encrypt-read`, `encrypt-write` |
+| 3 | Encryption, authenticated pairing (MITM) | `BT_SECURITY_HIGH` | `encrypt-authenticated-read`, `encrypt-authenticated-write` |
+| 4 | Authenticated LE Secure Connections with a 128-bit key | `BT_SECURITY_FIPS` | `secure-read`, `secure-write` |
 
 A characteristic requiring level 3 or 4 can't be reached after Just Works pairing: the server answers Insufficient Authentication. "Secure Connections Only" mode refuses legacy pairing entirely.
 
@@ -776,5 +776,74 @@ Links are encrypted with **AES-CCM** (LE, and Classic with Secure Connections) o
 | BLUFFS | 2023 | Forces reuse of weak session keys across sessions in Classic | Spec and stack updates; Secure Connections Only |
 
 The pattern: most attacks target **legacy modes** kept for compatibility, or **implementation bugs** in controller firmware and host stacks. Keep the controller firmware and kernel updatable, disable what you don't use, and prefer Secure Connections Only where every peer supports it (section 20).
+
+---
+
+## 12. Profiles: Classic, LE, LE Audio, mesh and positioning
+
+A **profile** says which protocols, roles, parameters and procedures to use for one use case, so that a headset from one vendor works with a phone from another. Both sides must implement the same profile in complementary roles (the phone is the A2DP *source*, the headset the *sink*).
+
+### Classic profiles
+
+| Profile | Roles | What it does | Built on |
+|---|---|---|---|
+| **A2DP** (Advanced Audio Distribution) | Source, sink | Stereo music streaming. Codecs: **SBC** (mandatory), AAC, aptX family, LDAC (optional, vendor) | AVDTP over L2CAP, ACL |
+| **AVRCP** (A/V Remote Control) | Controller, target | Play/pause, track info, absolute volume | AVCTP over L2CAP |
+| **HFP** (Hands-Free) | Audio gateway (phone), hands-free (car kit, headset) | Calls: AT commands over RFCOMM for control, SCO/eSCO for voice. Codecs: CVSD (narrowband, 8 kHz), mSBC (wideband, 16 kHz), LC3-SWB (super-wideband, 32 kHz, HFP 1.9) | RFCOMM, SCO/eSCO |
+| HSP (Headset) | Audio gateway, headset | Older, minimal version of HFP | RFCOMM, SCO |
+| **HID** | Host, device | Keyboards, mice, game controllers | L2CAP (PSMs `0x11`, `0x13`) |
+| **SPP** (Serial Port) | | A virtual serial cable | RFCOMM |
+| PAN (Personal Area Networking) | PANU, NAP, GN | Ethernet over Bluetooth: tethering | BNEP over L2CAP |
+| OBEX profiles: OPP, FTP, PBAP, MAP | | File push, file transfer, phone book access (car kits), messages | OBEX over RFCOMM or L2CAP |
+
+The **audio problem of Classic:** A2DP is one-way, high quality; HFP is two-way, low quality. A headset whose microphone is in use switches from A2DP to HFP, and the music suddenly sounds like a phone call. LE Audio fixes this.
+
+### LE profiles and services
+
+LE profiles are mostly GATT services plus rules: **HOGP** (HID over GATT: LE keyboards, mice and remotes), health and fitness profiles (Heart Rate, Cycling Speed and Cadence, Glucose, Blood Pressure...), Find Me and Proximity, Object Transfer, Electronic Shelf Labels (on PAwR). Most products define their own **custom GATT service** (section 16) and use standard ones (Device Information, Battery) next to it.
+
+### LE Audio
+
+LE Audio (Core 5.2 plus a family of profiles finished in 2022) carries audio over LE **isochronous channels**: streams with guaranteed timing, synchronized across several receivers.
+
+| Concept | Meaning |
+|---|---|
+| **CIS / CIG** | Connected isochronous stream: audio over a connection, with acknowledgments. A group (CIG) keeps the two earbuds of a pair in sync, each with its own stream |
+| **BIS / BIG** | Broadcast isochronous stream: audio broadcast to any number of receivers, no connection. The base of **Auracast** |
+| **LC3** | Low Complexity Communication Codec, mandatory. Better quality than SBC at the same bit rate, used for both music and calls |
+| BAP | Basic Audio Profile: how streams are configured and started (with PACS and ASCS services on the sink) |
+| CAP, CSIP | Common Audio Profile, and Coordinated Set Identification: two earbuds discovered and handled as one device |
+| VCP, MCP, CCP | Volume, media control, call control |
+| TMAP, HAP, PBP | Profiles for telephony and media, hearing aids, and public broadcast (Auracast) |
+| BASS | Broadcast Audio Scan Service: a phone (the "assistant") helps earbuds find and join a broadcast |
+
+| | Classic audio | LE Audio |
+|---|---|---|
+| Music and calls at once | No: A2DP or HFP | Yes: bidirectional streams with good quality |
+| Two earbuds | One gets the stream and relays it to the other (vendor-specific) | Each gets its own synchronized stream (CIS) |
+| Broadcast | No | Auracast: one source, any number of listeners, optionally encrypted with a Broadcast Code |
+| Hearing aids | Vendor-specific | Standard (HAP) |
+| Availability | Everywhere | Recent phones, earbuds and hearing aids; laptops and Linux catching up |
+
+**Linux status (stack-dependent):** BlueZ implements the LE Audio services (BAP, PACS, ASCS, BASS, CSIP, VCP, MCP and others) and PipeWire routes the audio, but it moves fast: use the newest kernel, BlueZ and PipeWire you can, and a controller with isochronous channel support. Section 17 shows what to check.
+
+### Mesh
+
+**Bluetooth Mesh** (2017, Mesh Protocol 1.1 in 2023) is a many-to-many network for lighting, building automation and sensors, built on LE advertising rather than connections:
+
+- Messages are **flooded**: every relay node rebroadcasts what it hears, with a TTL and a message cache to stop loops. No routing tables (1.1 adds optional directed forwarding).
+- A **provisioner** (often a phone or gateway) adds devices to the network and gives them keys: a network key (all nodes), application keys (per application), a device key (per node).
+- Devices expose **models** (Generic OnOff, Light Lightness, Sensor...) and talk by **publish/subscribe** to group addresses.
+- **Proxy** nodes let a phone, which can't flood advertising, join over a GATT connection. **Friend** nodes buffer messages for battery-powered **low-power nodes**.
+- 1.1 adds remote provisioning, certificate-based provisioning and firmware updates over the mesh.
+
+On Linux, BlueZ provides `bluetooth-meshd` and the `mesh-cfgclient` tool. `bluetooth-meshd` needs the controller for itself: it can't share it with `bluetoothd` (**stack-dependent**), so a gateway that does both usually has two controllers. Mesh is its own topic: section 22.
+
+### Direction finding and Channel Sounding
+
+- **Direction finding** (5.1) adds a **constant tone extension** (CTE) to LE packets. A receiver with an antenna array switches antennas during the tone and samples I/Q, from which software computes the **angle of arrival** (AoA); or the transmitter has the array and the receiver computes the **angle of departure** (AoD). Used for indoor positioning (asset tracking with fixed locators). The controller delivers I/Q samples; the angle computation is your software or a vendor's.
+- **Channel Sounding** (6.0) measures the **distance** between two connected devices by phase-based ranging (tones on many channels) and round-trip timing, with protection against relay attacks. Aimed at digital car keys and "find my" precision. Needs 6.0 controllers on both sides; host support is recent everywhere (**stack-dependent**).
+
+Neither is an RSSI estimate (section 4): both need specific controller hardware and support.
 
 ---

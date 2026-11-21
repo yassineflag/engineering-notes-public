@@ -1298,3 +1298,229 @@ PAN carries Ethernet frames over BNEP. With BlueZ: `Network1.Connect("nap")` on 
 A Bluetooth keyboard or remote paired with the board appears as an ordinary input device (`/dev/input/event*`): Classic HID through the `hidp` module, LE HOGP through `bluetoothd` and `uhid`. Nothing Bluetooth-specific is needed in the application; enable `CONFIG_BT_HIDP` and `CONFIG_UHID` in the kernel (section 18).
 
 ---
+
+## 18. Integrating a Bluetooth controller on a board
+
+The board's combo module, as drawn in the [Wi-Fi note's integration section](../wifi/wifi_v1_2026-11-01.md#18-integrating-a-wi-fi-chip-on-a-board): Wi-Fi on SDIO, Bluetooth on a UART, shared RF front end and antenna.
+
+### Signals
+
+| Signal | Role |
+|---|---|
+| UART TX, RX, **RTS, CTS** | HCI (H4). Hardware flow control is required at the 1 to 4 Mbaud used after firmware load; without RTS/CTS, packets are lost under load (or use H5 if the chip supports it) |
+| `BT_REG_ON` | Enables the Bluetooth part. Driven by the host (`shutdown-gpios` in the device tree). Some chips need it sequenced with `WL_REG_ON` |
+| `BT_DEV_WAKE` | Host → chip: "stay awake, data coming". Lets the controller sleep between transfers |
+| `BT_HOST_WAKE` | Chip → host interrupt: "data for you", and the wake source during suspend |
+| 32.768 kHz LPO | Sleep clock, shared with Wi-Fi. Missing or inaccurate, it breaks LE timing (connections drop after a few seconds or minutes) |
+| PCM / I2S (CLK, SYNC, IN, OUT) | SCO voice to an audio codec, when voice isn't carried over HCI (section 17) |
+| VBAT, VDDIO | Supplies. VDDIO must match the UART's voltage |
+
+### Device tree (serdev, Broadcom example)
+
+Since Linux 4.x, a UART-attached controller is described as a **child of its UART node**: the `serdev` bus binds `hci_uart` to it at boot, which powers the chip, loads the firmware and switches the baud rate. No `btattach` or `hciattach` service is needed (**Illustrative**):
+
+```dts
+&uart2 {
+	pinctrl-names = "default";
+	pinctrl-0 = <&pinctrl_uart2>;		/* TX, RX, RTS, CTS */
+	uart-has-rtscts;
+	status = "okay";
+
+	bluetooth {
+		compatible = "brcm,bcm4345c5";
+		shutdown-gpios = <&gpio2 11 GPIO_ACTIVE_HIGH>;		/* BT_REG_ON */
+		device-wakeup-gpios = <&gpio2 12 GPIO_ACTIVE_HIGH>;	/* BT_DEV_WAKE */
+		interrupt-parent = <&gpio2>;
+		interrupts = <13 IRQ_TYPE_EDGE_FALLING>;		/* BT_HOST_WAKE */
+		interrupt-names = "host-wakeup";
+		clocks = <&pmic_clk32k>;
+		clock-names = "lpo";
+		vbat-supply = <&reg_3v3>;
+		vddio-supply = <&reg_1v8>;
+		max-speed = <3000000>;
+		local-bd-address = [ 00 00 00 00 00 00 ];		/* filled in by the bootloader */
+	};
+};
+```
+
+- The compatible, GPIOs and polarities come from the module's datasheet and the kernel's binding (`Documentation/devicetree/bindings/net/bluetooth/`). Other families have their own compatibles and properties: Qualcomm (`qcom,...-bt`), TI WiLink (`ti,wl18xx-st`), Realtek (`realtek,...-bt`, H5), NXP (`nxp,...-bt`), MediaTek.
+- `max-speed` is the baud rate after firmware load; the chip starts at its default (usually 115200) and the driver switches it with a vendor command.
+- **`local-bd-address`** gives the controller its address when the chip has none in OTP. The bootloader writes the board's unique address into it (U-Boot: `fdt set`, or board code), least significant byte first as the binding specifies. All zeros means "not set".
+- USB and SDIO controllers enumerate on their bus and need no Bluetooth node, only their power and reset.
+
+**Without a device tree node** (testing, or a vendor kernel without serdev support), attach the UART by hand:
+
+```
+# btattach -B /dev/ttymxc1 -P bcm -S 3000000 &
+```
+
+`btattach` keeps running for as long as the link exists; power and reset GPIOs are then your responsibility. Use it to test, then move to serdev.
+
+### Firmware
+
+Most controllers boot from ROM and need a **firmware patch** (often called "patchram") loaded by the driver at every power-up, fixing bugs and enabling features. Without it, the controller often works partially: discovery fine, connections unstable, missing features.
+
+| Vendor | Driver helper | Files in `/lib/firmware/` |
+|---|---|---|
+| Broadcom, Cypress, Infineon | `btbcm` | `brcm/BCM4345C5.hcd`; board-specific names are tried first (`brcm/BCM4345C5.<board compatible>.hcd`) |
+| Realtek | `btrtl` | `rtl_bt/rtl8723bs_fw.bin` + `rtl8723bs_config.bin` (the config carries UART settings and sometimes the address) |
+| Intel | `btintel` | `intel/ibt-*.sfi`, `.ddc` |
+| Qualcomm | `btqca` | `qca/` (`rampatch_*.bin`, `nvm_*.bin`) |
+| NXP | `btnxpuart` | `nxp/` (the driver downloads the whole firmware, the chip has none at boot) |
+| MediaTek | `btmtk` | `mediatek/` |
+
+Check what happened at boot:
+
+```
+# dmesg | grep -i -e bluetooth -e hci0
+Bluetooth: hci0: BCM: chip id 130
+Bluetooth: hci0: BCM4345C5
+Bluetooth: hci0: BCM4345C5 (003.006.006) build 0000
+Bluetooth: hci0: BCM4345C5 'brcm/BCM4345C5.hcd' Patch
+Bluetooth: hci0: BCM4345C5 ... build 0123
+```
+
+(**Illustrative**, format from `btbcm`.) The build number changes after the patch: if it doesn't, or the log says `Patch file not found`, the controller runs its ROM firmware. Ship the patch from the module vendor that matches your module (and its antenna and RF configuration), not a random file with the same chip name.
+
+### The address
+
+- A controller needs a **unique public address**. Modules either have one in OTP (programmed by the module maker, from their OUI) or expect the host to set it.
+- Some chips report a fixed default address shared by every unit. The kernel recognizes known defaults (`btbcm` logs `Using default device address`) and marks the controller **unconfigured**: it doesn't appear as a usable adapter until an address is set. With `local-bd-address` in the device tree, the kernel sets it automatically; otherwise `btmgmt --index 0 public-addr <address>` at boot (from a file written in production) does it.
+- Two boards with the same address will fight: phones reconnect to the wrong one, bonds collide.
+
+### Kernel and image configuration
+
+| Option | For |
+|---|---|
+| `CONFIG_BT`, `CONFIG_BT_BREDR`, `CONFIG_BT_LE` | The core; Classic and LE parts |
+| `CONFIG_BT_RFCOMM`, `CONFIG_BT_BNEP`, `CONFIG_BT_HIDP` | Serial profiles and HFP, PAN, Classic HID |
+| `CONFIG_BT_LE_L2CAP_ECRED` | Enhanced credit-based channels (EATT, LE Audio) |
+| `CONFIG_BT_HCIUART`, `CONFIG_BT_HCIUART_SERDEV`, `CONFIG_SERIAL_DEV_BUS` | UART HCI with device tree (serdev) |
+| `CONFIG_BT_HCIUART_BCM`, `_QCA`, `_LL`, `_3WIRE`, `_INTEL`, `CONFIG_BT_NXPUART` | Vendor protocols |
+| `CONFIG_BT_HCIBTUSB` (+ `_RTL`, `_MTK`) | USB controllers |
+| `CONFIG_UHID` | LE HID (HOGP) devices |
+| `CONFIG_CRYPTO_ECDH`, `CONFIG_CRYPTO_AES`, `CONFIG_CRYPTO_CMAC` | SMP and Secure Connections (selected automatically) |
+| `CONFIG_BT_DEBUGFS` | `/sys/kernel/debug/bluetooth` (development) |
+| `CONFIG_RFKILL` | Radio enable/disable |
+
+In the image: BlueZ (`bluetoothd`, `bluetoothctl`, and `btmon` at least in development builds), D-Bus, the firmware file, and PipeWire only if audio is needed. Yocto adds BlueZ with `bluetooth` in `DISTRO_FEATURES` (the `bluez5` recipe); Buildroot with the `bluez5_utils` package and its sub-options for the client, tools and plugins (see the [Yocto](../../os-and-firmware/embedded-linux/linux-build-systems/yocto/yocto_v1_2026-11-14.md) and [Buildroot](../../os-and-firmware/embedded-linux/linux-build-systems/buildroot/buildroot_v1_2026-11-15.md) notes for adding packages and firmware).
+
+**`/var/lib/bluetooth` must be writable and persistent.** On a read-only root filesystem, bonds vanish at every reboot and every phone has to pair again: put it on the data partition ([rootfs note, read-only root](../../os-and-firmware/embedded-linux/fundamentals/04-rootfs/rootfs_v1_2026-11-11.md#15-read-only-root-and-persistent-data)).
+
+### Bring-up order
+
+| Step | Check | Passing looks like |
+|---|---|---|
+| 1. Power and reset | Scope `BT_REG_ON`, supplies, LPO clock | Rails up, `BT_REG_ON` high after the delay, 32.768 kHz present |
+| 2. UART | Logic analyzer on TX/RX/RTS/CTS at 115200 | `01 03 0C 00` (HCI Reset) out, `04 0E 04 01 03 0C 00` back |
+| 3. Driver and firmware | `dmesg` | Chip identified, patch loaded, new build number, baud rate switched |
+| 4. Adapter | `btmgmt info`, `bluetoothctl show` | `hci0` with the right address, `Powered: yes` |
+| 5. Radio | `bluetoothctl scan le` near a phone advertising (nRF Connect) | Devices found, RSSI comparable to a reference adapter at the same place |
+| 6. Connection and throughput | Connect, read, stream notifications; `btmon` | Stable for hours, expected parameters, no HCI timeouts |
+
+---
+
+## 19. Coexistence, power and performance
+
+### Coexistence with Wi-Fi
+
+On a combo chip, Bluetooth and 2.4 GHz Wi-Fi usually share the antenna and the front end: only one can transmit or receive at a time. The chip's **packet traffic arbitration** (PTA) gives the air to one or the other, by priority: SCO voice and LE connection events are usually protected, so Wi-Fi waits.
+
+- **Rule of thumb:** with Bluetooth audio streaming or continuous LE scanning on a shared antenna, 2.4 GHz Wi-Fi throughput can drop by half or more and its latency becomes irregular.
+- **Put Wi-Fi on 5 or 6 GHz** whenever possible: the problem mostly disappears (the chip still shares some resources).
+- **Limit scanning:** continuous scanning with window = interval occupies the radio. Scan in bursts, or use the controller's filtering (advertisement monitors) so it doesn't report everything.
+- **AFH** lets Classic avoid the Wi-Fi channel; combo chips usually tell the Bluetooth core which channel Wi-Fi uses. LE uses its channel map the same way.
+- **Separate antennas** with enough isolation (often 20 to 25 dB or more) let both run simultaneously on chips that support it. Coexistence settings live in the firmware and NVRAM/config files from the module vendor: they must match the board's antenna design.
+- A nearby **LTE/5G modem** (bands 7, 38, 40, 41) needs filtering, and some chips support a coexistence interface with the modem.
+
+### Power
+
+**On a battery-powered peripheral** (the sensor), the radio dominates. Rough numbers (**rule of thumb**, current from datasheets of typical LE SoCs):
+
+| Activity | Average current |
+|---|---|
+| Sleep with RTC running | 1 to 3 µA |
+| Advertising every 1 s, legacy, 3 channels, 0 dBm | About 10 µA |
+| Advertising every 100 ms | About 100 µA |
+| Connected, 1 s interval, nothing to send | About 5 to 10 µA |
+| Connected, 30 ms interval | About 100 to 200 µA |
+| Continuous scanning (central) | Several mA |
+
+A CR2032 (about 220 mAh usable at low current) at 15 µA average lasts about 1.5 years. Coin cells don't like the 5 to 15 mA peaks of the radio: a capacitor across the cell keeps the voltage up, and capacity at low temperature is much lower. The levers: advertising interval and duration, connection interval and peripheral latency, TX power, sending data in fewer, bigger packets, and broadcasting values in advertisements instead of keeping connections.
+
+**On the Linux board**, the controller's power matters less than not keeping the system awake:
+- The controller sleeps between events if `BT_DEV_WAKE` and `BT_HOST_WAKE` are wired and described (the `hci_uart` drivers do runtime power management with them).
+- **Suspend:** enable wakeup on the controller's interrupt (`/sys/.../power/wakeup`) if a keyboard or a connection must wake the system. The kernel configures the controller to scan only for bonded devices during suspend.
+- Turn off what isn't needed: an adapter that stays discoverable or scans keeps the radio and the UART busy.
+
+### Performance checklist
+
+When throughput or latency is below expectations, read the actual parameters in `btmon` first:
+
+1. **PHY:** `LE PHY Update Complete` shows 1M or 2M.
+2. **Data length:** `LE Data Length Change`, 251 bytes or stuck at 27.
+3. **MTU:** the `Exchange MTU` exchange; 23 means 20-byte writes.
+4. **Connection interval:** in `Connection Complete` and `Connection Update Complete`. A phone in the background or power saving may raise it to 50 to 100 ms or more.
+5. **Write type:** with response (one per round trip) or without; notifications or indications.
+6. **The transport:** a UART still at 115200 baud caps everything at about 11 KB/s; check that the baud switch happened. At 3 Mbaud, H4 carries about 300 KB/s.
+7. **Retransmissions and coexistence:** the same test with Wi-Fi idle or on 5 GHz; a test in a shielded box or an RF-quiet place.
+8. **The other end:** test against a second Linux adapter (`hci1` on the laptop) to separate the board from the phone.
+
+For Classic, `l2test` measures raw L2CAP throughput between two Linux machines, and `btmon` shows the packet types used (`3-DH5` or stuck at `DM1`).
+
+---
+
+## 20. Production: configuration, hardening, RF tests and qualification
+
+### Development vs production configuration
+
+| Setting | Development | Production |
+|---|---|---|
+| `ControllerMode` | `dual` | `le` if nothing needs Classic: less attack surface, less power |
+| Discoverable, pairable | On | Off by default; open a **pairing window** (button press, first boot, factory reset) for a few minutes |
+| Pairing security | Whatever works | Secure Connections only (`SecureConnections = only` in `main.conf`, or `btmgmt sc only`) if every peer supports it; never legacy pairing |
+| `JustWorksRepairing` | `always` | `never` |
+| Characteristic flags | Open | `encrypt-*` at least; `encrypt-authenticated-*` or `secure-*` where the peer can do authenticated pairing |
+| Debugging | `bluetoothd -d`, debugfs, `btmon` installed | Off; logs at normal level |
+| Plugins and profiles | All | Only what's used (`bluetoothd --noplugin=...`, or BlueZ built without them) |
+| D-Bus access | Root | A dedicated service user; a D-Bus policy limiting who can talk to `org.bluez` |
+| Factory reset | | Wipes `/var/lib/bluetooth` and the application's provisioning data |
+
+### Securing pairing on a headless device
+
+A board without a screen or keyboard can only do Just Works, which encrypts the link but lets **anyone in range pair** and use the protected characteristics. For a provisioning service that receives Wi-Fi credentials, that's not enough. Combine:
+
+- **A pairing window:** accept pairing only for a short time after a physical action (button, power cycle sequence). An attacker must be present at that moment.
+- **Out-of-band pairing** where hardware allows it: NFC tag, or a QR code on the device carrying OOB data. The phone app must support it.
+- **Application-level authentication:** a per-device secret printed on a label (QR code), used by the app and the board in a password-authenticated key exchange (SRP, SPAKE2+) over GATT before credentials are accepted, and to encrypt them end to end. ESP-IDF's Wi-Fi provisioning ("security 2") and Matter's commissioning work this way.
+- **Limit what a bond allows:** a phone bonded for provisioning shouldn't stay able to reconfigure the device forever. Remove bonds after provisioning if they aren't needed, cap the number of stored bonds.
+
+### Updates
+
+The controller firmware patch is a file in the root filesystem: ship it in updates like any other file, together with the kernel (Bluetooth CVEs in the kernel and in controller firmware are regular, section 11). Keep the vendor's release notes, and retest coexistence and RF after a firmware change.
+
+### RF tests and the production line
+
+**Direct Test Mode (DTM)** is the standard way to test the LE radio: HCI commands put the controller in transmit or receive test mode, and a Bluetooth tester or spectrum analyzer measures power, frequency and modulation, or sends packets for a receiver sensitivity test. With `bluetoothd` stopped, raw HCI commands do it (**Illustrative**; `hcitool` is deprecated but still the simplest raw command sender where installed):
+
+```
+# systemctl stop bluetooth
+# hcitool -i hci0 cmd 0x08 0x001E 0x13 0x25 0x00     # LE Transmitter Test: RF channel 19 (2440 MHz), 37 bytes, PRBS9
+# hcitool -i hci0 cmd 0x08 0x001F                    # LE Test End (after a receiver test it returns the packet count)
+# hcitool -i hci0 cmd 0x08 0x001D 0x13               # LE Receiver Test on RF channel 19
+```
+
+Classic radio tests use *Enable Device Under Test Mode* with a tester, and vendors provide their own tools and vendor commands for continuous carrier, fixed power and frequency calibration (the module vendor's manufacturing test tools). Certification labs use these modes too.
+
+A **production line test** typically:
+1. Programs the unique Bluetooth address (from the module's OTP, or a range you own written to persistent storage and the device tree).
+2. Checks the address and firmware version (`btmgmt info`, `dmesg`).
+3. Checks conducted TX power and frequency (DTM) on modules with an antenna connector, or a radiated check against a golden device: the board scans for a reference beacon and the RSSI must fall in a window calibrated on known-good units.
+4. Leaves the device with no bonds, not discoverable, pairing window ready for the customer.
+
+### Qualification and regulatory
+
+- **Bluetooth SIG qualification** is required to ship a product using Bluetooth (section 3). The usual path for a Linux product: a module or controller that's already qualified as a controller subsystem, plus a qualified host subsystem. BlueZ itself isn't a ready-made listing for every version: companies qualify their BlueZ-based host, or use a vendor or test house that maintains one. Plan for it early; it constrains which BlueZ version you ship.
+- **Radio regulation** is separate: FCC Part 15 (15.247) and ISED in North America, the RED in the EU (EN 300 328 for the radio, EN 301 489-1/-17 for EMC, plus safety, and the RED cybersecurity requirements under EN 18031 for connected radio equipment), and others per country. A pre-certified module (modular approval) saves most of the radio testing, **only if** you follow its integration conditions: antenna type and gain, layout, and no change to the firmware's power tables.
+
+---

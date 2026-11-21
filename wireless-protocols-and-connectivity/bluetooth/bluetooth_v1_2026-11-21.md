@@ -847,3 +847,308 @@ On Linux, BlueZ provides `bluetooth-meshd` and the `mesh-cfgclient` tool. `bluet
 Neither is an RSSI estimate (section 4): both need specific controller hardware and support.
 
 ---
+
+## 13. The Linux Bluetooth stack
+
+```
+ bluetoothctl   PipeWire (audio)   your app (Python, C)   NetworkManager
+       │               │                   │                    │
+ ──────┴───────────────┴──── D-Bus (system bus): org.bluez ─────┴──────
+                                   │
+ bluetoothd ── GAP policy, GATT client and server, profiles (A2DP, HFP via
+               PipeWire, HID, PAN...), agents, storage in /var/lib/bluetooth
+                                   │ mgmt socket (HCI control channel)
+ ─────────────────────────────── kernel ──────────────────────────────────
+ net/bluetooth:  mgmt API · HCI core · L2CAP · SMP · RFCOMM · SCO · ISO
+                 sockets (AF_BLUETOOTH)          monitor channel → btmon
+ drivers/bluetooth:  hci_uart (+ btbcm, btrtl, btqca, btnxpuart...) · btusb
+                                   │ HCI
+                         controller (firmware)
+```
+
+### The kernel
+
+- **`net/bluetooth`** (module `bluetooth`) implements the HCI core (command queue, connection handles, flow control), L2CAP, SMP, the **management API** (mgmt), and the sockets: `BTPROTO_HCI`, `BTPROTO_L2CAP`, `BTPROTO_RFCOMM`, `BTPROTO_SCO`, `BTPROTO_ISO`. Separate modules: `rfcomm`, `bnep` (PAN), `hidp` (Classic HID).
+- **`drivers/bluetooth`** moves HCI packets to and from the controller and loads its firmware: `btusb` for USB, `hci_uart` for UARTs with a protocol per vendor, plus vendor helpers (`btbcm`, `btrtl`, `btintel`, `btqca`, `btmtk`, `btnxpuart`) that download the firmware patch and apply quirks. Section 18 covers the board side.
+- **The mgmt API** is how `bluetoothd` drives the kernel: power, discoverable, connectable, pairing, keys, advertising, scanning. The kernel runs the time-sensitive parts (SMP, connection setup, auto-connect lists) itself. Older tools (`hciconfig`, `hcitool`) sent raw HCI commands behind the kernel's back, which is why they're deprecated: the kernel's state and the controller's got out of sync.
+- **HCI channels** on an HCI socket: *control* (mgmt, `bluetoothd`, `btmgmt`), *monitor* (read-only copy of all traffic, `btmon`), *user* (exclusive raw access, takes the controller away from the kernel: used by other stacks and test tools), *raw* (legacy).
+
+### bluetoothd
+
+`bluetoothd` (systemd unit `bluetooth.service`) owns policy and profiles and publishes everything on D-Bus. Its configuration is `/etc/bluetooth/main.conf`; defaults are commented in the file. A board configuration (**Illustrative**):
+
+```ini
+[General]
+Name = Board-0053
+# dual, bredr or le: le-only saves the Classic attack surface if nothing needs it
+ControllerMode = dual
+DiscoverableTimeout = 180
+PairableTimeout = 180
+# off, device or network (RPAs, section 7)
+Privacy = off
+# never, confirm or always: re-pairing a known device with Just Works
+JustWorksRepairing = never
+
+[Policy]
+# power the adapter on at startup
+AutoEnable = true
+ReconnectAttempts = 7
+ReconnectIntervals = 1,2,4,8,16,32,64
+
+[LE]
+# connection parameters as a central, in 1.25 ms units (24 = 30 ms) and 10 ms units
+MinConnectionInterval = 24
+MaxConnectionInterval = 40
+ConnectionLatency = 0
+ConnectionSupervisionTimeout = 400
+
+[GATT]
+# always, yes (bonded devices only) or no
+Cache = always
+# minimum encryption key size for protected attributes, 7 to 16
+KeySize = 16
+ExchangeMTU = 517
+```
+
+- **Storage:** `/var/lib/bluetooth/<adapter address>/` holds the adapter settings, one directory per known device (`info`: name, keys, services; `attributes`), and `cache/` with remote GATT databases. Bonds live here: keep this directory on persistent storage, include it in backups of a device's identity, and **wipe it on factory reset**.
+- **Experimental features:** `bluetoothd -E` (or `Experimental = true`) enables D-Bus interfaces and features marked experimental, and `KernelExperimental` the kernel-side ones. Some LE Audio and advertisement-monitor features needed them on older versions.
+- **Debug logging:** run `bluetoothd -d` through a systemd drop-in; the path of the binary varies (`/usr/libexec/bluetooth/bluetoothd` on Debian 12 and later):
+
+```ini
+# /etc/systemd/system/bluetooth.service.d/debug.conf
+[Service]
+ExecStart=
+ExecStart=/usr/libexec/bluetooth/bluetoothd -d
+```
+
+### The D-Bus API
+
+Everything `bluetoothctl` does goes through D-Bus, so your application can do the same. The objects:
+
+| Interface | Object path | What it does |
+|---|---|---|
+| `org.bluez.Adapter1` | `/org/bluez/hci0` | `Powered`, `Discoverable`, `Pairable`, `Alias`; `StartDiscovery`, `SetDiscoveryFilter`, `RemoveDevice` |
+| `org.bluez.Device1` | `/org/bluez/hci0/dev_F0_00_00_00_53_01` | `Connect`, `Disconnect`, `Pair`; `Connected`, `Paired`, `Bonded`, `Trusted`, `Blocked`, `ServicesResolved`, `RSSI`, `UUIDs`, `ManufacturerData`, `ServiceData` |
+| `org.bluez.GattService1`, `GattCharacteristic1`, `GattDescriptor1` | `.../service0010/char0011/desc0013` | Remote GATT database: `ReadValue`, `WriteValue`, `StartNotify`, `AcquireNotify`, `AcquireWrite`; the `Value` property changes on notifications |
+| `org.bluez.GattManager1` | `/org/bluez/hci0` | `RegisterApplication`: publish your own GATT server (section 16) |
+| `org.bluez.LEAdvertisingManager1` | `/org/bluez/hci0` | `RegisterAdvertisement`: advertise your data (section 16) |
+| `org.bluez.AgentManager1`, `Agent1` | `/org/bluez` | Pairing UI: your agent answers passkey and confirmation requests |
+| `org.bluez.Battery1` | device path | Battery level of a peer (from its Battery service or HFP) |
+| `org.bluez.ProfileManager1`, `Profile1` | `/org/bluez` | Register a Classic profile (an RFCOMM server, section 17) |
+| `org.bluez.Media1`, `MediaEndpoint1`, `MediaTransport1` | | Audio: used by PipeWire |
+| `org.bluez.AdvertisementMonitorManager1` | `/org/bluez/hci0` | Let the controller filter advertisements and wake you on matches |
+
+Explore them with `busctl tree org.bluez` and `busctl introspect org.bluez /org/bluez/hci0`, and watch them with `busctl monitor org.bluez`. Interface documentation ships with BlueZ (`doc/org.bluez.*.rst` in recent versions, `doc/*-api.txt` before).
+
+Objects appear when BlueZ learns about them and disappear when it forgets them: a device found by a scan shows up as `Device1` with `Paired = false` and is removed some time after the scan stops unless it's paired or connected. Code that keeps object paths must handle `InterfacesRemoved`.
+
+---
+
+## 14. Tools: bluetoothctl, btmgmt, btmon and friends
+
+### Deprecated tools and their replacements
+
+| Old (deprecated in BlueZ 5) | Replacement |
+|---|---|
+| `hciconfig hci0 up`, `hciconfig -a` | `bluetoothctl power on`, `bluetoothctl show`, `btmgmt info` |
+| `hcitool scan`, `hcitool lescan` | `bluetoothctl scan on`, `bluetoothctl scan le` |
+| `hcitool con`, `hcitool rssi` | `bluetoothctl info <addr>`, `btmon` |
+| `gatttool` | `bluetoothctl` `menu gatt`, `btgatt-client` |
+| `sdptool browse` | `bluetoothctl info <addr>` (UUIDs), `btmon` during connection |
+| `hciattach` | `btattach`, or better a serdev device tree node (section 18) |
+| `hcidump` | `btmon` |
+| `rfcomm bind` | A `Profile1` registration, or RFCOMM sockets (section 17) |
+
+Distributions may still ship some of them, but they bypass the kernel's management layer and give confusing results with a running `bluetoothd`.
+
+### bluetoothctl
+
+Interactive (`bluetoothctl`) or one command at a time (`bluetoothctl show`). It acts as a pairing agent while it runs.
+
+| Command | Does |
+|---|---|
+| `list`, `show`, `select <addr>` | Adapters, the current one's state and features |
+| `power on`, `discoverable on`, `pairable on` | Adapter states |
+| `scan on`, `scan le`, `scan bredr`, `scan off` | Discovery, both or one transport |
+| `devices`, `devices Paired`, `info <addr>` | Known devices; one device's properties and UUIDs |
+| `pair`, `trust`, `connect`, `disconnect`, `remove <addr>` | Pairing, trusting (allow connections without asking the agent), connecting, forgetting |
+| `agent on`, `default-agent`, `agent NoInputNoOutput` | Register the built-in agent with an IO capability |
+| `menu gatt`: `list-attributes`, `select-attribute`, `read`, `write`, `notify on` | GATT client on the connected device |
+| `menu gatt`: `register-service`, `register-characteristic`, `register-application` | Quick GATT server tests |
+| `menu advertise`: `uuids`, `manufacturer`, `name`, `back`; then `advertise on` | Quick advertising tests |
+| `menu scan`: `uuids`, `rssi`, `transport`, `duplicate-data` | Discovery filter |
+
+### btmgmt
+
+`btmgmt` talks to the kernel's mgmt API directly: what the controller and kernel are set to, without `bluetoothd`'s interpretation.
+
+```
+# btmgmt info                         # supported and current settings, address, version
+# btmgmt --index 0 le on              # LE on, also: bredr, ssp, sc on|only|off, privacy
+# btmgmt --index 0 phy                # supported and selected PHYs
+# btmgmt --index 0 phy LE1MTX LE1MRX LE2MTX LE2MRX   # allow LE 2M
+# btmgmt --index 0 public-addr 00:00:5E:00:53:16     # for controllers without a valid address
+# btmgmt find -l                      # LE discovery from the kernel
+```
+
+Changes made with `btmgmt` while `bluetoothd` runs can be overridden by it; for persistent settings, use `main.conf`.
+
+### btmon: the first tool to reach for
+
+`btmon` shows every HCI packet and mgmt command, decoded, plus `bluetoothd`'s log messages, with timestamps. It sees what both kernel and controller do, so it settles most "who's at fault" questions.
+
+```
+# btmon -t                                 # live, with timestamps
+# btmon -w /tmp/pairing.btsnoop            # save (open in Wireshark or btmon -r)
+# btmon -r /tmp/pairing.btsnoop            # replay a capture
+# btmon -i hci0                            # one adapter only
+```
+
+A connection to the sensor, abridged (**Illustrative**):
+
+```
+< HCI Command: LE Extended Create Connection (0x08|0x0043) plen 26
+        Own address type: Public (0x00)
+        Peer address: F0:00:00:00:53:01 (Static)
+        Initiating PHYs: LE 1M
+          Min connection interval: 30.00 msec (0x0018)
+          Max connection interval: 50.00 msec (0x0028)
+          Supervision timeout: 420 msec (0x002a)
+> HCI Event: Command Status (0x0f) plen 4
+        Status: Success (0x00)
+> HCI Event: LE Meta Event (0x3e) plen 31
+      LE Enhanced Connection Complete (0x0a)
+        Status: Success (0x00)
+        Handle: 64
+        Role: Central (0x00)
+        Connection interval: 48.75 msec (0x0027)
+> HCI Event: LE Meta Event (0x3e) plen 11
+      LE Data Length Change (0x07)
+        Max TX octets: 251
+< ACL Data TX: Handle 64 flags 0x00 dlen 7
+      ATT: Exchange MTU Request (0x02) len 2
+        Client RX MTU: 517
+> ACL Data RX: Handle 64 flags 0x02 dlen 7
+      ATT: Exchange MTU Response (0x03) len 2
+        Server RX MTU: 247
+...
+> HCI Event: Disconnect Complete (0x05) plen 4
+        Status: Success (0x00)
+        Handle: 64
+        Reason: Connection Timeout (0x08)
+```
+
+`<` is host to controller, `>` controller to host, `@` mgmt traffic, `=` log messages. Search a capture for `Reason:`, `Status:` values other than Success, and `Error:` in ATT.
+
+### Other views
+
+| Tool | When |
+|---|---|
+| `journalctl -u bluetooth` | `bluetoothd` messages; add `-d` for debug (section 13) |
+| `busctl monitor org.bluez` | What applications ask BlueZ, and what it answers |
+| `rfkill list` | Soft or hard blocked adapter (`rfkill unblock bluetooth`) |
+| `/sys/kernel/debug/bluetooth/hci0/` | Kernel parameters and state: `conn_min_interval`, `conn_max_interval`, `supervision_timeout`, `adv_min_interval`, `rpa_timeout`, identity, features |
+| `dmesg | grep -i bluetooth` | Driver, firmware loading, HCI command timeouts |
+| `l2ping <addr>`, `l2test`, `rctest` | Classic link checks and L2CAP/RFCOMM throughput tests (BlueZ test tools) |
+| `btgatt-client`, `btgatt-server` | Standalone GATT tools from BlueZ's sources, without `bluetoothd` |
+
+**The phone's side.** Android writes an HCI capture when *Enable Bluetooth HCI snoop log* is on in developer options (retrieve it with a bug report, `adb bugreport`); Apple provides a Bluetooth logging profile for iOS and PacketLogger on macOS. A capture from the phone often shows a refusal the board only sees as a disconnection.
+
+**Over the air.** HCI captures only show what reaches the host. To see advertising and link-layer packets, use a sniffer: an nRF52840 dongle with Nordic's nRF Sniffer for Bluetooth LE (Wireshark plugin) for LE, commercial analyzers for Classic and for reliable capture of hopping links. An LE sniffer must see the `CONNECT_IND` to follow a connection, and needs the LTK (from BlueZ's `info` file) to decrypt a bonded link.
+
+---
+
+## 15. The board as a central: scan, pair, connect, read a sensor
+
+### With bluetoothctl
+
+```
+# bluetoothctl
+[bluetooth]# power on
+[bluetooth]# scan le
+[NEW] Device F0:00:00:00:53:01 TempSensor-01
+[bluetooth]# scan off
+[bluetooth]# connect F0:00:00:00:53:01
+Attempting to connect to F0:00:00:00:53:01
+[CHG] Device F0:00:00:00:53:01 Connected: yes
+Connection successful
+[CHG] Device F0:00:00:00:53:01 ServicesResolved: yes
+[TempSensor-01]# menu gatt
+[TempSensor-01]# list-attributes
+Primary Service (Handle 0x0010)
+        /org/bluez/hci0/dev_F0_00_00_00_53_01/service0010
+        0000181a-0000-1000-8000-00805f9b34fb
+        Environmental Sensing
+Characteristic (Handle 0x0011)
+        /org/bluez/hci0/dev_F0_00_00_00_53_01/service0010/char0011
+        00002a6e-0000-1000-8000-00805f9b34fb
+        Temperature
+...
+[TempSensor-01]# select-attribute 00002a6e-0000-1000-8000-00805f9b34fb
+[TempSensor-01:/service0010/char0011]# read
+        98 08                                            ..
+[TempSensor-01:/service0010/char0011]# notify on
+[CHG] Attribute /org/bluez/hci0/dev_F0_00_00_00_53_01/service0010/char0011 Value:
+        a2 08                                            ..
+```
+
+(**Illustrative**: `0x0898` = 2200 → 22.00 °C... read little-endian: bytes `98 08` are `0x0898` = 2200, so 22.00 °C; `a2 08` is 22.10 °C.)
+
+- **Pair only if the sensor needs it.** Many sensors expose values without encryption. If a read returns Insufficient Authentication or Encryption, `pair F0:00:00:00:53:01` (with an agent registered) and read again; `trust` it so reconnections aren't refused.
+- **Reconnection is the application's job** for a custom GATT device. `bluetoothd` reconnects automatically only for some profiles (HID, audio); for a sensor, the application calls `Connect` again when the device reappears or after a disconnection, with a backoff.
+- **Faster links:** allow LE 2M with `btmgmt phy` (section 14); the kernel then lets the controller switch PHYs when the peer supports it. Data length and MTU are negotiated automatically (the MTU from `ExchangeMTU` in `main.conf`).
+
+### From an application
+
+BlueZ's D-Bus API from Python is most easily used through **Bleak**, a cross-platform BLE client library that uses BlueZ on Linux. A small gateway that connects, subscribes and reconnects (**Illustrative**):
+
+```python
+#!/usr/bin/env python3
+"""Read the TempSensor-01 temperature notifications, reconnecting forever."""
+import asyncio
+from bleak import BleakClient, BleakScanner
+
+NAME = "TempSensor-01"
+TEMPERATURE = "00002a6e-0000-1000-8000-00805f9b34fb"   # sint16, 0.01 degC
+
+
+def on_temperature(_char, data: bytearray) -> None:
+    celsius = int.from_bytes(data[:2], "little", signed=True) / 100
+    print(f"temperature {celsius:.2f} C", flush=True)
+
+
+async def run_once() -> None:
+    device = await BleakScanner.find_device_by_name(NAME, timeout=20.0)
+    if device is None:
+        raise RuntimeError("sensor not found")
+    disconnected = asyncio.Event()
+    async with BleakClient(device, disconnected_callback=lambda _c: disconnected.set()) as client:
+        on_temperature(None, await client.read_gatt_char(TEMPERATURE))
+        await client.start_notify(TEMPERATURE, on_temperature)
+        await disconnected.wait()
+
+
+async def main() -> None:
+    delay = 1
+    while True:
+        try:
+            await run_once()
+            delay = 1
+        except Exception as exc:          # scan timeout, connection failure, BlueZ error
+            print(f"retrying in {delay}s: {exc}", flush=True)
+            await asyncio.sleep(delay)
+            delay = min(delay * 2, 60)
+
+
+asyncio.run(main())
+```
+
+- Run it as a systemd service ordered `After=bluetooth.service`.
+- Bleak's BlueZ backend needs `bluetoothd` running and the D-Bus system bus; the user needs D-Bus permission for `org.bluez` (root, or a policy file).
+- In C, use the same D-Bus API through GDBus or sd-bus. Raw HCI or L2CAP sockets are only worth it when `bluetoothd` can't be used (a minimal image, a custom stack).
+
+### Reading advertisements without connecting
+
+Sensors that broadcast their values in **service data** or **manufacturer data** (section 5) need no connection: start discovery with duplicates reported, and read `ServiceData` / `ManufacturerData` from the `Device1` property changes (`SetDiscoveryFilter` with `DuplicateData: true`, or Bleak's `BleakScanner` with a detection callback). It scales to many sensors, costs the sensors less, and doesn't hit the controller's connection limit. The price: no acknowledgment, no encryption (unless 5.4 encrypted advertising data), and continuous scanning on the board.
+
+---

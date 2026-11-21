@@ -642,7 +642,7 @@ Handle  Type (UUID)                         Value
   ...
 0x0010  Primary Service (0x2800)            0x181A (Environmental Sensing)
 0x0011  Characteristic (0x2803)             props=read|notify, value handle 0x0012, UUID 0x2A6E
-0x0012  Temperature (0x2A6E)                0x0898 (sint16, 0.01 °C → 21.68 °C)
+0x0012  Temperature (0x2A6E)                0x0898 (sint16, 0.01 °C units: 2200 → 22.00 °C)
 0x0013  Client Characteristic Config (0x2902)  0x0000 (notifications off)
 0x0014  Characteristic User Description (0x2901)  "Indoor temperature"
 0x0020  Primary Service (0x2800)            0x180F (Battery)
@@ -1092,7 +1092,7 @@ Characteristic (Handle 0x0011)
         a2 08                                            ..
 ```
 
-(**Illustrative**: `0x0898` = 2200 → 22.00 °C... read little-endian: bytes `98 08` are `0x0898` = 2200, so 22.00 °C; `a2 08` is 22.10 °C.)
+(**Illustrative**. Values are little-endian: bytes `98 08` are `0x0898` = 2200, so 22.00 °C; `a2 08` is 22.10 °C.)
 
 - **Pair only if the sensor needs it.** Many sensors expose values without encryption. If a read returns Insufficient Authentication or Encryption, `pair F0:00:00:00:53:01` (with an agent registered) and read again; `trust` it so reconnections aren't refused.
 - **Reconnection is the application's job** for a custom GATT device. `bluetoothd` reconnects automatically only for some profiles (HID, audio); for a sensor, the application calls `Connect` again when the device reappears or after a disconnection, with a backoff.
@@ -1150,5 +1150,151 @@ asyncio.run(main())
 ### Reading advertisements without connecting
 
 Sensors that broadcast their values in **service data** or **manufacturer data** (section 5) need no connection: start discovery with duplicates reported, and read `ServiceData` / `ManufacturerData` from the `Device1` property changes (`SetDiscoveryFilter` with `DuplicateData: true`, or Bleak's `BleakScanner` with a detection callback). It scales to many sensors, costs the sensors less, and doesn't hit the controller's connection limit. The price: no acknowledgment, no encryption (unless 5.4 encrypted advertising data), and continuous scanning on the board.
+
+---
+
+## 16. The board as a peripheral: advertising and a GATT server
+
+The provisioning use case: the board, with no network yet, advertises a provisioning service; the phone app connects, writes the Wi-Fi SSID and passphrase, asks the board to connect, and reads the result.
+
+### The provisioning service
+
+| Characteristic | UUID (placeholder) | Flags | Contents |
+|---|---|---|---|
+| Service | `7d2a0000-6b1e-4c8a-9f3d-2e5b8c1a0001` | | |
+| SSID | `7d2a0001-6b1e-4c8a-9f3d-2e5b8c1a0001` | `encrypt-write` | UTF-8, up to 32 bytes |
+| Passphrase | `7d2a0002-6b1e-4c8a-9f3d-2e5b8c1a0001` | `encrypt-write` (never readable) | UTF-8, 8 to 63 bytes |
+| Command | `7d2a0003-6b1e-4c8a-9f3d-2e5b8c1a0001` | `encrypt-write` | `0x01` = connect, `0x02` = forget |
+| Status | `7d2a0004-6b1e-4c8a-9f3d-2e5b8c1a0001` | `encrypt-read`, `notify` | State byte (idle, connecting, connected, failed) + reason + IPv4 address |
+
+It follows the design rules of section 10: one write per field, a command characteristic, a status characteristic that notifies, protection on every characteristic. `encrypt-write` makes the phone pair (Just Works on a headless board) before its first write; section 20 explains why that's not enough on its own and what to add.
+
+### Quick tests with bluetoothctl
+
+```
+# bluetoothctl
+[bluetooth]# menu advertise
+[bluetooth]# uuids 7d2a0000-6b1e-4c8a-9f3d-2e5b8c1a0001
+[bluetooth]# name Board-0053
+[bluetooth]# discoverable on
+[bluetooth]# back
+[bluetooth]# advertise on
+[bluetooth]# menu gatt
+[bluetooth]# register-service 7d2a0000-6b1e-4c8a-9f3d-2e5b8c1a0001
+[bluetooth]# register-characteristic 7d2a0004-6b1e-4c8a-9f3d-2e5b8c1a0001 read,notify
+[bluetooth]# register-application
+```
+
+A phone with a generic BLE app (nRF Connect, LightBlue) now sees `Board-0053` and the service. Good for checking advertising and phone compatibility before writing code.
+
+### A GATT server over D-Bus
+
+An application publishes a GATT server by exporting D-Bus objects and handing their root to BlueZ:
+
+```
+/com/example/prov                                   org.freedesktop.DBus.ObjectManager
+/com/example/prov/service0                          org.bluez.GattService1         UUID, Primary
+/com/example/prov/service0/char0 ... char3          org.bluez.GattCharacteristic1  UUID, Service, Flags
+                                                       ReadValue, WriteValue, StartNotify, StopNotify
+/com/example/prov/advertisement0                    org.bluez.LEAdvertisement1     Type, ServiceUUIDs, LocalName
+```
+
+Then `GattManager1.RegisterApplication("/com/example/prov", {})` and `LEAdvertisingManager1.RegisterAdvertisement("/com/example/prov/advertisement0", {})` on `/org/bluez/hci0`. BlueZ calls `GetManagedObjects` on the root to read the tree, builds the attribute table, and from then on calls your `ReadValue` and `WriteValue` methods when a client accesses a characteristic. A notification is a `PropertiesChanged` signal on the characteristic's `Value`, sent while the client has notifications enabled (between `StartNotify` and `StopNotify`).
+
+The core of two characteristics, in the style of BlueZ's `test/example-gatt-server` (dbus-python; **Illustrative**: the `Characteristic` base class with the D-Bus boilerplate, the `Application` and `Advertisement` classes come from that example):
+
+```python
+class PassphraseChrc(Characteristic):
+    UUID = "7d2a0002-6b1e-4c8a-9f3d-2e5b8c1a0001"
+
+    def __init__(self, bus, index, service, state):
+        super().__init__(bus, index, self.UUID, ["encrypt-write"], service)
+        self.state = state
+
+    def WriteValue(self, value, options):
+        if not 8 <= len(value) <= 63:
+            raise InvalidValueLengthException()       # sent to the client as ATT error 0x0D
+        self.state.passphrase = bytes(value).decode("utf-8")
+
+
+class StatusChrc(Characteristic):
+    UUID = "7d2a0004-6b1e-4c8a-9f3d-2e5b8c1a0001"
+
+    def __init__(self, bus, index, service, state):
+        super().__init__(bus, index, self.UUID, ["encrypt-read", "notify"], service)
+        self.state = state
+        self.notifying = False
+
+    def ReadValue(self, options):
+        return self.state.encode_status()             # list of dbus.Byte
+
+    def StartNotify(self):
+        self.notifying = True
+
+    def StopNotify(self):
+        self.notifying = False
+
+    def status_changed(self):                         # called by the Wi-Fi code
+        if self.notifying:
+            self.PropertiesChanged(GATT_CHRC_IFACE, {"Value": self.state.encode_status()}, [])
+```
+
+The Command characteristic's `WriteValue` starts the Wi-Fi connection asynchronously (through wpa_supplicant's or NetworkManager's D-Bus API, [Wi-Fi note section 15](../wifi/wifi_v1_2026-11-01.md#15-station-mode-connecting-a-device)) and returns at once; the outcome reaches the phone as a Status notification. Blocking in `WriteValue` blocks the ATT request slot and, after 30 s, kills ATT on the link (section 10).
+
+**Practical points:**
+- Register a **pairing agent** with the right IO capability (`NoInputNoOutput` for a headless board) through `AgentManager1.RegisterAgent` and `RequestDefaultAgent`; don't rely on `bluetoothd`'s behavior without an agent.
+- Restart cleanly when `bluetoothd` restarts: watch the `org.bluez` name on the bus and register again.
+- `Flags` such as `encrypt-write` are enforced by BlueZ: your method isn't called until the link meets the requirement.
+- **Stop advertising once provisioned** (or after a timeout), and only advertise again on a button press or a factory reset (section 20).
+- Advertising data has 31 bytes in legacy advertising: one 128-bit UUID (18 bytes) plus flags (3) leaves 10 for a name. BlueZ puts what doesn't fit in the scan response, or fails to register the advertisement.
+- The number of simultaneous advertisements is limited by the controller (`SupportedInstances` on `LEAdvertisingManager1`).
+
+---
+
+## 17. Classic on Linux: audio, serial and networking
+
+### Audio with PipeWire
+
+On current distributions, **PipeWire** with **WirePlumber** handles Bluetooth audio: `bluetoothd` manages the connection, PipeWire's `bluez5` plugin registers as a media endpoint, encodes and decodes the codecs and exposes the headset as a sound card (Debian package `libspa-0.2-bluetooth`).
+
+```
+$ bluetoothctl pair 00:00:5E:00:53:70
+$ bluetoothctl trust 00:00:5E:00:53:70
+$ bluetoothctl connect 00:00:5E:00:53:70
+$ wpctl status                                   # the headset appears under Audio devices and sinks
+$ pactl list cards | grep -A30 bluez_card        # profiles: a2dp-sink-sbc, a2dp-sink-aac, headset-head-unit...
+$ pactl set-card-profile bluez_card.00_00_5E_00_53_70 a2dp-sink    # music
+$ pactl set-card-profile bluez_card.00_00_5E_00_53_70 headset-head-unit   # calls (HFP)
+```
+
+- **Codecs:** SBC is always there; AAC, aptX and LDAC need PipeWire built with the corresponding libraries (patent and licensing issues make distributions differ). `pactl list cards` lists those available for this headset.
+- **HFP** needs a backend: PipeWire's native one (the default) or oFono. Roles and codecs are set in WirePlumber's configuration (`monitor.bluez.properties`: `bluez5.roles`, `bluez5.codecs`, `bluez5.enable-msbc`...); the format of that file changed between WirePlumber 0.4 (Lua) and 0.5 (SPA-JSON).
+- **LE Audio** (**stack-dependent**): needs a controller with isochronous channels, a recent kernel (ISO sockets), BlueZ and PipeWire with BAP enabled (`bap_sink`, `bap_source` roles), and on older versions BlueZ's experimental mode. The headset then shows LE Audio profiles next to or instead of A2DP and HFP.
+- **On an embedded board**, combo modules often route SCO voice to a **PCM/I2S interface** to an audio codec, not over HCI. Whether voice goes over HCI or PCM is a vendor setting (for Broadcom chips, `brcm,bt-pcm-int-params` in the device tree, section 18); it must match how the audio path is designed. A2DP always goes over HCI.
+
+### Serial links (RFCOMM, SPP)
+
+RFCOMM emulates a serial cable over L2CAP: still common for industrial devices, OBD-II adapters and old instruments. Python's standard library speaks it directly (**Illustrative**, a client):
+
+```python
+import socket
+
+with socket.socket(socket.AF_BLUETOOTH, socket.SOCK_STREAM, socket.BTPROTO_RFCOMM) as s:
+    s.connect(("00:00:5E:00:53:80", 1))      # peer address, RFCOMM channel (from SDP: bluetoothctl info)
+    s.sendall(b"ATZ\r")
+    print(s.recv(1024))
+```
+
+A **server** that phones and PCs can find needs an SDP record advertising the Serial Port UUID (`0x1101`) and its channel. Register it with `ProfileManager1.RegisterProfile` (UUID `00001101-0000-1000-8000-00805f9b34fb`, options `Channel`, `Role: server`): `bluetoothd` publishes the SDP record and passes each incoming connection to your `Profile1.NewConnection` method as a file descriptor. The old `rfcomm bind` / `/dev/rfcomm0` route still exists in many distributions but is deprecated.
+
+iOS doesn't allow SPP for ordinary apps (only MFi accessories): for phone apps use LE (GATT or an LE CoC).
+
+### Networking (PAN)
+
+PAN carries Ethernet frames over BNEP. With BlueZ: `Network1.Connect("nap")` on a phone's device object gives a `bnep0` interface to configure with DHCP (tethering); `NetworkServer1.Register("nap", "br0")` on the adapter makes the board a network access point whose clients join the bridge `br0`. NetworkManager handles the client side (`nmcli` lists a Bluetooth connection type). It's slow (well under 1 Mb/s in practice) and phones increasingly drop it: use it for debug access, not as a product feature.
+
+### HID
+
+A Bluetooth keyboard or remote paired with the board appears as an ordinary input device (`/dev/input/event*`): Classic HID through the `hidp` module, LE HOGP through `bluetoothd` and `uhid`. Nothing Bluetooth-specific is needed in the application; enable `CONFIG_BT_HIDP` and `CONFIG_UHID` in the kernel (section 18).
 
 ---

@@ -412,7 +412,7 @@ A Bluetooth address is 48 bits. LE adds address **types**, because a fixed addre
 
 `btmon` and BlueZ show the type next to the address: `(Public)`, `(Random)` plus `(Static)` or `(Resolvable)` or `(Non-Resolvable)`. In `bluetoothctl` and D-Bus, `AddressType` is `public` or `random`.
 
-**How a bonded peer recognizes a changing address.** During bonding (section 11), each side sends its **identity address** (public or random static) and its **identity resolving key** (IRK). When an RPA shows up later, the peer computes the hash part with each stored IRK; a match means "that's my bonded phone". The controller can do it in hardware (**LL privacy**, 4.2, with a resolving list), which is needed to use filter accept lists and directed advertising with peers that use RPAs. Linux supports controller-based resolution (enabled by default on recent kernels when the controller supports it, **stack-dependent**).
+**How a bonded peer recognizes a changing address.** During bonding (section 11), each side sends its **identity address** (public or random static) and its **identity resolving key** (IRK). When an RPA shows up later, the peer computes the hash part with each stored IRK; a match means "that's my bonded phone". The controller can do it in hardware (**LL privacy**, 4.2, with a resolving list), which is needed to use filter accept lists and directed advertising with peers that use RPAs. Linux can use controller-based resolution when the controller supports it; on older kernels it sits behind an experimental switch, and otherwise the host resolves addresses itself (**stack-dependent**).
 
 **Consequences for products:**
 - Before bonding, a phone's address means nothing: it changes, and the next scan shows "a new device". Identify unbonded phones by what they do (the GATT exchange), not by their address.
@@ -421,5 +421,161 @@ A Bluetooth address is 48 bits. LE adds address **types**, because a fixed addre
 - **Classic doesn't rotate addresses.** A discoverable Classic device broadcasts its public address to anyone who inquires. Stay non-discoverable except during pairing (section 20).
 
 The board's own LE privacy is controlled by BlueZ's `Privacy` setting (section 13): `off` uses the public address in advertising and connections, `device` or `network` use RPAs.
+
+---
+
+## 8. Classic (BR/EDR): inquiry, paging, piconets and links
+
+### Finding and connecting
+
+Classic separates two states that LE merges in advertising:
+
+| State | What the device does | Linux setting |
+|---|---|---|
+| **Discoverable** (inquiry scan) | Answers inquiries: anyone searching sees it, its address and name | `bluetoothctl discoverable on`, `DiscoverableTimeout` |
+| **Connectable** (page scan) | Answers pages addressed to it: only devices that already know its address can connect | `bluetoothctl` `connectable` via `btmgmt connectable on` |
+
+- **Inquiry:** the searcher hops quickly over 32 inquiry channels sending ID packets. Discoverable devices answer with their address, clock and **Class of Device** (a 24-bit field: major class such as Audio/Video or Phone, minor class, service bits), followed by an **Extended Inquiry Response** (EIR) with the name, service UUIDs and TX power. An inquiry lasts several seconds (often 10.24 s), because both sides hop independently until they meet.
+- **Paging:** to connect, the initiator pages the target's address on a hopping sequence derived from it. The target listens briefly every 1.28 s by default, so a page usually succeeds in well under 2 s; the page timeout is 5.12 s by default. A device that is connectable but not discoverable can still be connected to by peers that already know its address: a car kit reconnects to its paired phone that way.
+- Once connected, the hosts use **SDP** (service discovery protocol, L2CAP PSM `0x0001`) to learn which profiles the peer offers and on which channel (an RFCOMM channel number or an L2CAP PSM).
+
+### Piconets and roles
+
+A **piconet** is one central and up to **7 active** peripherals sharing the central's hopping sequence and clock. Time is divided into **625 µs slots**; the central transmits in even slots, the addressed peripheral answers in the next. A device can be in several piconets (a **scatternet**), dividing its time between them. Either side can ask for a **role switch** after connecting: a phone that is a peripheral in one link often wants to be the central of all its links, to schedule them together.
+
+### Logical links and packets
+
+| Link | What it carries | Properties |
+|---|---|---|
+| **ACL** | All data: L2CAP, signaling, profiles including A2DP audio | Packet-based, acknowledged and retransmitted, best effort timing |
+| **SCO** | Voice, 64 kb/s | Reserved slots at a fixed interval, never retransmitted. Narrowband CVSD voice |
+| **eSCO** | Voice with a retransmission window | Reserved slots plus room for retries. Needed for wideband (mSBC) and super-wideband (LC3) speech in HFP |
+
+ACL packets last 1, 3 or 5 slots. The 5-slot packets carry the most: 339 bytes in `DH5` (1 Mb/s), 679 in `2-DH5`, 1021 in `3-DH5`. With 5-slot packets one way and 1-slot packets back, EDR 3 Mb/s reaches about 2.1 Mb/s of payload; in practice A2DP uses a few hundred kb/s (SBC at 328 kb/s, AAC at 256 kb/s, LDAC up to 990 kb/s).
+
+### Low-power modes
+
+| Mode | What happens | Typical use |
+|---|---|---|
+| Active | The peripheral listens in every central-to-peripheral slot | Streaming |
+| **Sniff** | The peripheral wakes only every sniff interval (for example every 50 to 500 ms) for a few slots | Idle keyboards and mice, connected headsets between calls |
+| Sniff subrating | Longer intervals when idle, without renegotiating | Same, with less power |
+| Hold | Both agree to pause for a set time | Rare |
+
+The link manager (LMP, controller to controller) negotiates these modes, features, encryption and role switches. Hosts ask for them through HCI, and `btmon` shows the "Mode Change" events.
+
+### The Linux view
+
+Classic links show up in `btmon` as `Connection Complete` events with a link type (`ACL`, `SCO`, `eSCO`), a handle and the peer address. Profiles are run by `bluetoothd` (section 17): you rarely open Classic sockets yourself, except RFCOMM for serial links.
+
+---
+
+## 9. The host stack: HCI and L2CAP
+
+### HCI packets
+
+HCI carries five kinds of packets. On a UART with the **H4** transport, each starts with an indicator byte:
+
+| Indicator | Packet | Direction | Contents |
+|---|---|---|---|
+| `0x01` | Command | Host → controller | 16-bit opcode, parameter length, parameters |
+| `0x02` | ACL data | Both | Connection handle and flags, length, L2CAP data |
+| `0x03` | Synchronous (SCO) data | Both | Voice samples, when routed over HCI rather than a PCM bus |
+| `0x04` | Event | Controller → host | Event code, length, parameters |
+| `0x05` | ISO data | Both | Isochronous data for LE Audio (5.2) |
+
+**Opcodes** are a 6-bit OGF (group) and a 10-bit OCF (command), sent little-endian. `HCI_Reset` is OGF `0x03` (controller and baseband), OCF `0x003`, opcode `0x0C03`. On the wire, the reset and its answer (**Illustrative**):
+
+```
+host → controller:   01  03 0C  00              Command, opcode 0x0C03, no parameters
+controller → host:   04  0E  04  01  03 0C  00  Event 0x0E (Command Complete), 4 bytes:
+                                                1 command credit, opcode 0x0C03, status 0x00 (success)
+```
+
+| OGF | Group | Examples |
+|---|---|---|
+| `0x01` | Link control | Inquiry, Create Connection, Disconnect, Accept Connection Request |
+| `0x02` | Link policy | Sniff Mode, Role Discovery, Switch Role |
+| `0x03` | Controller and baseband | Reset, Set Event Mask, Write Scan Enable, Write Local Name |
+| `0x04` | Informational | Read Local Version Information, Read BD_ADDR, Read Local Supported Features |
+| `0x05` | Status | Read RSSI, Read Encryption Key Size |
+| `0x08` | LE | LE Set Advertising Parameters, LE Set Scan Enable, LE Create Connection, LE Set PHY, LE Set Data Length |
+| `0x3F` | Vendor-specific | Firmware download, baud rate change, BD address write, RF tests. Different for every vendor |
+
+**Flow control.** The controller grants **command credits** in each Command Complete or Command Status event; the host sends no more commands than it has credits. For data, the host reads the controller's buffer count at init (Read Buffer Size, LE Read Buffer Size) and sends no more ACL packets than there are free buffers; the controller returns buffers with **Number Of Completed Packets** events. A controller that stops returning credits stalls the stack: commands time out, data stops.
+
+**Events you'll read most:**
+
+| Code | Event | Meaning |
+|---|---|---|
+| `0x0E` | Command Complete | The command finished, with its status and results |
+| `0x0F` | Command Status | The command started (connections, inquiry); a later event gives the result |
+| `0x03` | Connection Complete | A BR/EDR ACL or SCO link is up (or failed, with a status) |
+| `0x05` | Disconnection Complete | A link went down, with a **reason** |
+| `0x08` | Encryption Change | Encryption on or off |
+| `0x13` | Number Of Completed Packets | Buffer credits back |
+| `0x3E` | LE Meta | All LE events: Advertising Report, (Enhanced) Connection Complete, Connection Update Complete, PHY Update Complete, Data Length Change, Long Term Key Request... |
+| `0xFF` | Vendor-specific | Firmware debug, crash reports |
+
+### Status and reason codes
+
+The same table of error codes is used for command statuses and disconnection reasons (**normative**, Core Specification Vol 1 Part F):
+
+| Code | Name | What it usually means in practice |
+|---|---|---|
+| `0x05` | Authentication Failure | Pairing or key verification failed: wrong passkey, or the peer lost its keys |
+| `0x06` | PIN or Key Missing | One side has a bond, the other doesn't (one side was reset or "forgotten"): remove and pair again |
+| `0x08` | Connection Timeout | Supervision timeout: out of range, interference, the peer crashed or reset |
+| `0x0C` | Command Disallowed | Command not valid in the current state (scanning while scanning, advertising with an invalid set) |
+| `0x12` | Invalid HCI Command Parameters | A parameter outside its range: check the values against the command's definition |
+| `0x13` | Remote User Terminated Connection | The peer disconnected on purpose: the normal end of a link |
+| `0x15` | Remote Device Terminated due to Power Off | The peer is shutting down |
+| `0x16` | Connection Terminated By Local Host | This side disconnected (`bluetoothctl disconnect`, idle timeout, or `bluetoothd` after a failure: look just before) |
+| `0x1A` | Unsupported Remote Feature | The peer lacks a feature that was requested (a PHY, data length, encryption mode) |
+| `0x22` | LMP / LL Response Timeout | A link-control procedure didn't complete in time: often a firmware bug on one side or heavy interference |
+| `0x28` | Instant Passed | A parameter or channel map change arrived too late: radio trouble or a slow peripheral |
+| `0x3B` | Unacceptable Connection Parameters | The peer refused the requested parameters (section 6) |
+| `0x3D` | Connection Terminated due to MIC Failure | Packet integrity check failed: keys out of sync, or a buggy controller |
+| `0x3E` | Connection Failed to be Established | The peripheral never answered after `CONNECT_IND`: it moved, stopped advertising, or the channel is noisy |
+
+### Transports
+
+| Transport | Used by | Linux driver |
+|---|---|---|
+| UART H4 | Most embedded modules, combo chips | `hci_uart` with a vendor protocol (`bcm`, `qca`, `ll` for TI, `intel`, `mrvl`, `nxp`...). Needs RTS/CTS flow control at 1 to 4 Mbaud |
+| UART H5 (three-wire) | UARTs without flow control, some Realtek chips | `hci_uart` `3wire`: adds sequence numbers, acknowledgments and SLIP framing |
+| USB | Adapters, laptop modules, Intel/Realtek/MediaTek combo cards | `btusb`: commands on the control endpoint, events on interrupt, ACL on bulk, SCO on isochronous |
+| SDIO | Some Marvell/NXP and MediaTek chips | `btmrvl_sdio`, `btmtksdio` |
+| In SoC | Phones and some SoCs with an integrated controller | Shared memory or a vendor IPC driver; virtio for virtual machines |
+
+### L2CAP
+
+L2CAP multiplexes logical channels over one link, segments large packets and, depending on the mode, adds flow control. A channel is identified by a **CID** on each side.
+
+**Fixed channels** exist on every link without setup:
+
+| CID | Transport | Protocol |
+|---|---|---|
+| `0x0001` | BR/EDR | L2CAP signaling |
+| `0x0004` | LE | ATT (GATT) |
+| `0x0005` | LE | LE L2CAP signaling (connection parameter update requests, credit-based channels) |
+| `0x0006` | LE | SMP (pairing) |
+| `0x0007` | BR/EDR | SMP over BR/EDR (cross-transport key derivation, section 11) |
+
+**Dynamic channels** are opened by **PSM** (protocol/service multiplexer), the L2CAP equivalent of a port:
+
+| PSM | Protocol |
+|---|---|
+| `0x0001` | SDP |
+| `0x0003` | RFCOMM (serial port emulation; profiles such as HFP and SPP run on RFCOMM channels 1 to 30) |
+| `0x000F` | BNEP (PAN networking) |
+| `0x0011`, `0x0013` | HID control, HID interrupt |
+| `0x0017`, `0x0019` | AVCTP (remote control, AVRCP), AVDTP (audio streaming, A2DP) |
+| `0x0027` | EATT (Enhanced ATT, LE) |
+| `0x0080`-`0x00FF` | LE dynamic PSMs, for your own LE connection-oriented channels |
+
+**Modes:** basic (no flow control, BR/EDR), enhanced retransmission and streaming (BR/EDR), **LE credit-based** (LE CoC, 4.1) and **enhanced credit-based** (5.2, several channels at once; used by EATT). In credit-based modes the receiver grants credits, one per segment it can accept, so a slow receiver can't be flooded.
+
+An **LE CoC** is a reliable, flow-controlled byte-message pipe with an MTU up to 65535 bytes: the right tool for bulk transfers (logs, firmware images) between devices you control. Linux exposes it as a `SOCK_SEQPACKET` socket with `BTPROTO_L2CAP` and an LE address type; iOS and Android offer it too.
 
 ---

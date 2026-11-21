@@ -433,7 +433,7 @@ Classic separates two states that LE merges in advertising:
 | State | What the device does | Linux setting |
 |---|---|---|
 | **Discoverable** (inquiry scan) | Answers inquiries: anyone searching sees it, its address and name | `bluetoothctl discoverable on`, `DiscoverableTimeout` |
-| **Connectable** (page scan) | Answers pages addressed to it: only devices that already know its address can connect | `bluetoothctl` `connectable` via `btmgmt connectable on` |
+| **Connectable** (page scan) | Answers pages addressed to it: only devices that already know its address can connect | `btmgmt connectable on`; `bluetoothd` normally manages it |
 
 - **Inquiry:** the searcher hops quickly over 32 inquiry channels sending ID packets. Discoverable devices answer with their address, clock and **Class of Device** (a 24-bit field: major class such as Audio/Video or Phone, minor class, service bits), followed by an **Extended Inquiry Response** (EIR) with the name, service UUIDs and TX power. An inquiry lasts several seconds (often 10.24 s), because both sides hop independently until they meet.
 - **Paging:** to connect, the initiator pages the target's address on a hopping sequence derived from it. The target listens briefly every 1.28 s by default, so a page usually succeeds in well under 2 s; the page timeout is 5.12 s by default. A device that is connectable but not discoverable can still be connected to by peers that already know its address: a car kit reconnects to its paired phone that way.
@@ -577,5 +577,204 @@ L2CAP multiplexes logical channels over one link, segments large packets and, de
 **Modes:** basic (no flow control, BR/EDR), enhanced retransmission and streaming (BR/EDR), **LE credit-based** (LE CoC, 4.1) and **enhanced credit-based** (5.2, several channels at once; used by EATT). In credit-based modes the receiver grants credits, one per segment it can accept, so a slow receiver can't be flooded.
 
 An **LE CoC** is a reliable, flow-controlled byte-message pipe with an MTU up to 65535 bytes: the right tool for bulk transfers (logs, firmware images) between devices you control. Linux exposes it as a `SOCK_SEQPACKET` socket with `BTPROTO_L2CAP` and an LE address type; iOS and Android offer it too.
+
+---
+
+## 10. ATT and GATT
+
+### ATT: a table of attributes
+
+The **Attribute Protocol** (ATT) is a tiny client-server protocol. The server holds a table of **attributes**, each with:
+
+| Field | Meaning |
+|---|---|
+| Handle | 16-bit index in the table (`0x0001` to `0xFFFF`), assigned by the server. The client addresses attributes by handle |
+| Type | A UUID saying what the attribute is |
+| Value | Up to 512 bytes |
+| Permissions | Readable, writable, and whether encryption, authentication or authorization is needed. Not visible to the client: it learns them by getting an error |
+
+The main ATT operations:
+
+| Operation | Acknowledged | Use |
+|---|---|---|
+| Exchange MTU | Yes | Negotiate the MTU (section 6), once per connection |
+| Find Information, Find By Type Value, Read By Type, Read By Group Type | Yes | Discovery: walk the table |
+| Read, Read Blob, Read Multiple | Yes | Read a value; Read Blob continues past the MTU |
+| Write Request | Yes (Write Response) | Write a value and get a confirmation or an error |
+| Write Command | No | "Write without response": streams, no confirmation |
+| Prepare Write / Execute Write | Yes | Long or atomic writes (reliable writes) |
+| Handle Value Notification | No | Server pushes a value change |
+| Handle Value Indication | Yes (Confirmation) | Server pushes a value change and waits for the client's confirmation |
+
+ATT allows **one outstanding request per direction** per ATT bearer: a client can't send a second read before the first response. Requests time out after **30 s** without response, after which ATT can't be used on that link until it reconnects. EATT (5.2) opens several ATT bearers over credit-based L2CAP channels so that parallel requests (from different apps on a phone) don't wait for each other.
+
+**ATT error codes** (**normative**):
+
+| Code | Name | Usual cause |
+|---|---|---|
+| `0x01` | Invalid Handle | The client uses a stale handle: the server's database changed (see GATT caching below) |
+| `0x02` / `0x03` | Read / Write Not Permitted | The attribute doesn't allow that operation |
+| `0x05` | Insufficient Authentication | The attribute needs an authenticated (MITM-protected) bond. The client should pair, then retry |
+| `0x06` | Request Not Supported | The server doesn't implement that request |
+| `0x07` | Invalid Offset | Read Blob or Prepare Write past the value's end |
+| `0x08` | Insufficient Authorization | Application-level permission refused |
+| `0x0A` | Attribute Not Found | Discovery reached the end of the range: normal during discovery |
+| `0x0C` | Insufficient Encryption Key Size | Encrypted with a key shorter than the attribute requires |
+| `0x0D` | Invalid Attribute Value Length | Wrong size written |
+| `0x0E` | Unlikely Error | Catch-all server failure |
+| `0x0F` | Insufficient Encryption | The link must be encrypted first: the client starts encryption (or pairing) and retries |
+| `0x11` | Insufficient Resources | Server out of memory or queue space |
+| `0x12` | Database Out Of Sync | The client's cache is stale (GATT caching, 5.1) |
+| `0x80`-`0x9F` | Application errors | Defined by the service or by you |
+| `0xFD`, `0xFE`, `0xFF` | CCCD improperly configured, procedure already in progress, out of range | Common profile errors |
+
+Errors `0x05`, `0x0F` and `0x0C` are how **security is triggered** in LE: an iPhone or Android phone that gets them on a read starts pairing automatically and retries. That's the usual way to make an app pair: protect a characteristic, and the OS shows the pairing dialog on first access.
+
+### GATT: services and characteristics on top of ATT
+
+The **Generic Attribute Profile** (GATT) organizes the attribute table into services and characteristics using attributes of special types:
+
+```
+Handle  Type (UUID)                         Value
+0x0001  Primary Service (0x2800)            0x1800 (Generic Access)
+0x0002  Characteristic (0x2803)             props=read, value handle 0x0003, UUID 0x2A00
+0x0003  Device Name (0x2A00)                "TempSensor-01"
+  ...
+0x0010  Primary Service (0x2800)            0x181A (Environmental Sensing)
+0x0011  Characteristic (0x2803)             props=read|notify, value handle 0x0012, UUID 0x2A6E
+0x0012  Temperature (0x2A6E)                0x0898 (sint16, 0.01 °C → 21.68 °C)
+0x0013  Client Characteristic Config (0x2902)  0x0000 (notifications off)
+0x0014  Characteristic User Description (0x2901)  "Indoor temperature"
+0x0020  Primary Service (0x2800)            0x180F (Battery)
+0x0021  Characteristic (0x2803)             props=read|notify, value handle 0x0022, UUID 0x2A19
+0x0022  Battery Level (0x2A19)              0x5A (90 %)
+0x0023  Client Characteristic Config (0x2902)  0x0000
+```
+
+(**Illustrative**: the sensor's table. Handles are the server's choice.)
+
+- A **service** starts with a service declaration (`0x2800` primary, `0x2801` secondary) and runs until the next one. It can include other services (`0x2802`).
+- A **characteristic** is a declaration (`0x2803`: properties, value handle, UUID), the value attribute, then **descriptors**.
+- The **CCCD** (Client Characteristic Configuration Descriptor, `0x2902`) is how a client subscribes: it writes `0x0001` for notifications, `0x0002` for indications. The server keeps one CCCD value **per client**, and for bonded clients across reconnections. "My notifications don't arrive" usually means nobody wrote the CCCD.
+
+**Characteristic properties** (bits of the declaration): broadcast `0x01`, read `0x02`, write without response `0x04`, write `0x08`, notify `0x10`, indicate `0x20`, authenticated signed writes `0x40`, extended properties `0x80`.
+
+**UUIDs.** SIG-defined attributes use 16-bit UUIDs, which are short for 128-bit UUIDs built on the Bluetooth base UUID `0000xxxx-0000-1000-8000-00805F9B34FB`. Your own services and characteristics use random 128-bit UUIDs (`uuidgen`); never invent 16-bit ones, and don't reuse another vendor's.
+
+**Standard services worth using** instead of inventing your own (Assigned Numbers, GATT Specification Supplement for the formats):
+
+| Service | UUID | Characteristics |
+|---|---|---|
+| Generic Access (GAP) | `0x1800` | Device Name `0x2A00`, Appearance `0x2A01`, preferred connection parameters |
+| Generic Attribute (GATT) | `0x1801` | Service Changed `0x2A05`, Database Hash `0x2B2A`, Client Supported Features `0x2B29` |
+| Device Information | `0x180A` | Manufacturer Name `0x2A29`, Model Number `0x2A24`, Serial Number `0x2A25`, Firmware Revision `0x2A26` |
+| Battery | `0x180F` | Battery Level `0x2A19` (0 to 100) |
+| Environmental Sensing | `0x181A` | Temperature `0x2A6E` (sint16, 0.01 °C), Humidity `0x2A6F` (uint16, 0.01 %) |
+| Heart Rate | `0x180D` | Heart Rate Measurement `0x2A37` |
+| Human Interface Device | `0x1812` | Used by HID over GATT (HOGP) keyboards, mice and remotes |
+
+Phones and Linux handle `0x1800` and `0x1801` themselves; BlueZ also reads Battery (`0x180F`) and shows it as `org.bluez.Battery1` (section 13).
+
+### Discovery and caching
+
+On first connection, a client discovers the whole table: services, then characteristics in each, then descriptors. With a 23-byte MTU and dozens of characteristics that's dozens of round trips, a second or more. Clients therefore **cache** the table of bonded servers. When the server's firmware update changes the table:
+
+- The server must indicate **Service Changed** (`0x2A05`) to bonded clients with the affected handle range, so they rediscover.
+- With **GATT caching** (5.1), the client compares the **Database Hash** (`0x2B2A`) on reconnection and rediscovers only if it changed; a server answers Database Out Of Sync (`0x12`) to a client that hasn't caught up.
+- Unbonded clients shouldn't cache, but some do. If a phone shows stale services after a firmware update, toggling Bluetooth or forgetting the device clears its cache.
+
+BlueZ caches remote databases in `/var/lib/bluetooth/<adapter>/cache/<peer>` and is controlled by `Cache` in the `[GATT]` section of `main.conf` (section 13).
+
+### Designing a GATT interface
+
+- **Reuse standard services** where they fit (battery, device information, sensors): phones and tools understand them.
+- **Notify, don't poll.** A client subscribing once costs less than reading every second.
+- **Keep values small and fixed-size** where possible; use a version characteristic or field so the app can handle several firmware versions.
+- **Put protection on the characteristics, not in the app:** require encryption or authentication on what matters (section 11), so a random phone can't read or write it.
+- **Use a request/response pattern for commands**: write a command to one characteristic, receive the result as a notification on another. It avoids blocking the single ATT request slot during long operations.
+- **Plan for disconnections mid-operation:** make commands idempotent or resumable (firmware updates especially).
+
+---
+
+## 11. Pairing, bonding and security
+
+**Pairing** authenticates two devices and creates encryption keys. **Bonding** stores those keys so later connections encrypt immediately without pairing again. Classic and LE pair differently but have converged on the same cryptography.
+
+### LE pairing (SMP)
+
+The **Security Manager Protocol** runs on L2CAP CID `0x0006` in three phases:
+
+1. **Feature exchange.** Each side sends its **IO capabilities**, whether it has out-of-band (OOB) data, and its requirements: bonding, MITM protection, **Secure Connections**, maximum key size.
+2. **Key generation.** With **LE Secure Connections** (4.2), both sides do an ECDH exchange on P-256 and derive a **Long Term Key** (LTK), authenticated by the chosen association model. With **LE legacy pairing** (4.0, 4.1), a 128-bit temporary key derived from a 6-digit passkey or zero (Just Works) protects a short-term key; a passive listener who captures the pairing can brute-force it in seconds. Avoid legacy pairing in new products.
+3. **Key distribution** over the now-encrypted link: the LTK (legacy only; with Secure Connections both sides already have it), the **IRK** and identity address (section 7), and optionally a **CSRK** for signed writes.
+
+**Association models**, chosen from both sides' IO capabilities:
+
+| Responder ↓ / Initiator → | DisplayOnly | DisplayYesNo | KeyboardOnly | NoInputNoOutput | KeyboardDisplay |
+|---|---|---|---|---|---|
+| **DisplayOnly** | Just Works | Just Works | Passkey (responder shows) | Just Works | Passkey (responder shows) |
+| **DisplayYesNo** | Just Works | Numeric Comparison (SC), Just Works (legacy) | Passkey (responder shows) | Just Works | Numeric Comparison (SC), Passkey (legacy) |
+| **KeyboardOnly** | Passkey (initiator shows) | Passkey (initiator shows) | Passkey (both type) | Just Works | Passkey (initiator shows) |
+| **NoInputNoOutput** | Just Works | Just Works | Just Works | Just Works | Just Works |
+| **KeyboardDisplay** | Passkey (initiator shows) | Numeric Comparison (SC), Passkey (legacy) | Passkey (responder shows) | Just Works | Numeric Comparison (SC), Passkey (legacy) |
+
+(**Normative**, Core Specification Vol 3 Part H, simplified: when neither side requests MITM protection, Just Works is used whatever the capabilities.)
+
+| Model | User action | Protects against a man in the middle |
+|---|---|---|
+| **Just Works** | None (sometimes a "pair?" prompt) | No. Encrypted against passive listeners (with Secure Connections), but anyone can pair |
+| **Passkey Entry** | Type a 6-digit number shown on the other device | Yes. A passkey printed on a label or fixed in firmware is much weaker: don't |
+| **Numeric Comparison** | Confirm that both screens show the same 6 digits (Secure Connections only) | Yes |
+| **Out of band** | Keys exchanged through NFC, a QR code or another channel | Yes, as strong as the OOB channel |
+
+A headless board is typically **NoInputNoOutput**, which means Just Works: encrypted, but not authenticated. Section 20 lists ways to do better (OOB through a QR code, a pairing window opened by a physical button, application-level authentication).
+
+**Security levels** (LE security mode 1, **normative**):
+
+| Level | Requirement | BlueZ `sec-level` |
+|---|---|---|
+| 1 | No security | `low` |
+| 2 | Encryption, unauthenticated pairing (Just Works) | `medium` |
+| 3 | Encryption, authenticated pairing (MITM) | `high` |
+| 4 | Authenticated LE Secure Connections with a 128-bit key | `fips` |
+
+A characteristic requiring level 3 or 4 can't be reached after Just Works pairing: the server answers Insufficient Authentication. "Secure Connections Only" mode refuses legacy pairing entirely.
+
+### Classic pairing
+
+- **Legacy PIN pairing** (before 2.1): a PIN (`0000`, `1234` for headsets) feeds a weak key derivation; capturable and crackable. Still accepted by stacks for old devices.
+- **Secure Simple Pairing** (SSP, 2.1): ECDH (P-192, then P-256 with **Secure Connections** in 4.1) with the same association models as LE: Just Works, Numeric Comparison, Passkey Entry, OOB.
+- The result is a **link key** stored by both sides (BlueZ: `[LinkKey]` in the peer's `info` file).
+
+**Cross-transport key derivation** (CTKD): a dual-mode device pairing with Secure Connections over one transport can derive the key for the other, so a headset paired over BR/EDR is also bonded over LE. Convenient, and the root of the BLURtooth attack below: stacks now refuse to overwrite a stronger key with a weaker one.
+
+### Bonding storage and its failure modes
+
+Bonds are stored on **both** sides. If one side loses them (factory reset, "forget device" on the phone, a reflashed board with a new `/var/lib/bluetooth`), the other still thinks it's bonded:
+
+- The side with keys starts encryption; the other has no key: the link fails with PIN or Key Missing (`0x06`) or Authentication Failure (`0x05`), or the phone shows "pairing rejected".
+- Fix: remove the bond on **both** sides and pair again. A product needs a way to clear its bonds (button, menu, API).
+- Phones and BlueZ refuse to silently re-pair a bonded device by default, because that's what an attacker impersonating it would do. BlueZ's `JustWorksRepairing` option controls whether it accepts a Just Works re-pairing from a known device.
+
+### Encryption
+
+Links are encrypted with **AES-CCM** (LE, and Classic with Secure Connections) or the older **E0** cipher (Classic legacy). The **encryption key size** is negotiated between 7 and 16 bytes; anything below 16 is a weakness, and the KNOB attack showed it could be forced down to 1 byte. Linux enforces a minimum of 7 bytes for Classic and lets you require 16 (`KeySize` in the `[GATT]` section of `main.conf` for LE attributes).
+
+### Known attacks
+
+| Attack | Year | What it does | Mitigation |
+|---|---|---|---|
+| Legacy pairing cracking (Crackle) | 2013 | Captures LE legacy pairing, brute-forces the key, decrypts the traffic | LE Secure Connections |
+| BlueBorne | 2017 | Remote code execution in several stacks including Linux's L2CAP, no pairing needed | Updated kernels and stacks |
+| Invalid curve (CVE-2018-5383) | 2018 | ECDH public keys not validated: a MITM learns the key | Validate peer keys (fixed in controllers and hosts) |
+| KNOB | 2019 | Forces the encryption key size down to 1 byte, then brute-forces it | Minimum key size (7 bytes in the spec now; prefer 16) |
+| BIAS | 2020 | Impersonates a previously bonded device without its key, using role switch and legacy authentication | Secure Connections, mutual authentication |
+| BLURtooth | 2020 | CTKD overwrites a strong key with a weak one | Don't overwrite authenticated keys with unauthenticated ones |
+| SweynTooth | 2020 | Crashes or bypasses security in several LE controllers' firmware with malformed packets | Vendor firmware updates |
+| BleedingTooth | 2020 | Remote code execution in the Linux kernel's Bluetooth stack (A2MP, extended advertising parsing) | Kernel updates; A2MP since removed |
+| BrakTooth | 2021 | Crashes or code execution in many Classic controllers' firmware (LMP) | Vendor firmware updates |
+| BLUFFS | 2023 | Forces reuse of weak session keys across sessions in Classic | Spec and stack updates; Secure Connections Only |
+
+The pattern: most attacks target **legacy modes** kept for compatibility, or **implementation bugs** in controller firmware and host stacks. Keep the controller firmware and kernel updatable, disable what you don't use, and prefer Secure Connections Only where every peer supports it (section 20).
 
 ---

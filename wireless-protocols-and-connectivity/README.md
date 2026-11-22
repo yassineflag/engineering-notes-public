@@ -16,6 +16,6 @@ Notes on the radio links an embedded device uses to reach a network: how each pr
 
 - [Cellular Protocols: LTE, 5G NR and Cellular IoT](cellular/cellular_v1_2026-11-02.md): generations, releases and device capabilities, EPS and 5GS architecture, protocol stacks and state machines, NSA vs SA, bands and channel numbers, the LTE and NR physical layer, channels, cell search, system information and random access, scheduling, power control, HARQ and layer 2, carrier aggregation and dual connectivity, RSRP/RSRQ/SINR and link budgets, identities and the SIM (eSIM included), attach and registration with UE capabilities and reject causes, APNs, bearers, PDU sessions and the LTE and 5G QoS models, security and known attacks, RRC states including RRC_INACTIVE, paging, reselection, handover and 4G-5G interworking, DRX, eDRX and PSM, LTE-M, NB-IoT and RedCap, IMS voice and EPS fallback, SMS, positioning, slicing, URLLC and NTN, reading signaling in modem reports and logs, and troubleshooting by layer.
 
-### NTN
+### Satellite communications and NTN
 
-- [Non-terrestrial networks](ntn/) (satellite)
+- [Satellite communications and non-terrestrial networks](satcom-ntn/): satellite links and 3GPP NTN (notes to come)

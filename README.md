@@ -11,13 +11,14 @@ Every note aims to be practical, so you'll find configs and commands you can reu
 | [embedded-linux/](os-and-firmware/embedded-linux/) | [Fundamentals](os-and-firmware/embedded-linux/fundamentals/) (toolchain, bootloader, kernel, rootfs) and [build systems](os-and-firmware/embedded-linux/linux-build-systems/) (Yocto, Buildroot) |
 | [linux-kernel-device-driver-development/](os-and-firmware/embedded-linux/linux-kernel-device-driver-development/) | Kernel modules, character devices, platform, I2C and SPI drivers, the device tree, debugging |
 | [networking/](os-and-firmware/networking/) | [Networking basics](os-and-firmware/networking/networking-basics/) (OSI, IP, DHCP, DNS, architectures), [Linux networking](os-and-firmware/networking/linux-networking-fundamentals/), routing, firewalls, home and lab network setups |
-| [wireless-protocols-and-connectivity/](wireless-protocols-and-connectivity/) | [Wi-Fi](wireless-protocols-and-connectivity/wifi/), [Bluetooth](wireless-protocols-and-connectivity/bluetooth/), [Cellular](wireless-protocols-and-connectivity/cellular/), [SatCom and NTN](wireless-protocols-and-connectivity/satcom-ntn/) (satellite communications, non-terrestrial networks) |
+| [wireless-protocols-and-connectivity/](wireless-protocols-and-connectivity/) | [Wi-Fi](wireless-protocols-and-connectivity/wifi/), [Bluetooth](wireless-protocols-and-connectivity/bluetooth/), [Cellular](wireless-protocols-and-connectivity/cellular/), [LoRa](wireless-protocols-and-connectivity/lora/), [SatCom and NTN](wireless-protocols-and-connectivity/satcom-ntn/) (satellite communications, non-terrestrial networks) |
 | [linux-systems-programming/](os-and-firmware/linux-systems-programming/) | System calls, processes, threads, IPC, file and socket I/O |
 | [software/](software/) | Language notes: [C](software/c/), [Bash](software/bash/) |
 | [hardware/](hardware/) | Electronics, boards, buses and peripherals: [analog](hardware/analog/), [digital](hardware/digital/), [signal processing](hardware/signal-processing/), [baseband](hardware/baseband/) (modulation, IQ, coding), [RF](hardware/rf/), [SDR](hardware/sdr/) |
 
 ## Latest notes
 
+- [LoRa and LoRaWAN for Embedded Linux Engineers](wireless-protocols-and-connectivity/lora/lora_v1_2026-11-22.md)
 - [Bluetooth for Embedded Linux Engineers](wireless-protocols-and-connectivity/bluetooth/bluetooth_v1_2026-11-21.md)
 - [Networking Basics: How Networks Work](os-and-firmware/networking/networking-basics/networking-basics_v1_2026-11-20.md)
 - [Linux Kernel Device Drivers for Embedded Linux](os-and-firmware/embedded-linux/linux-kernel-device-driver-development/device-drivers_v1_2026-11-19.md)

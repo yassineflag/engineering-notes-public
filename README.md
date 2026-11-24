@@ -18,6 +18,7 @@ Every note aims to be practical, so you'll find configs and commands you can reu
 
 ## Latest notes
 
+- [Bash: A Quick Reference](software/bash/bash_v1_2026-11-25.md)
 - [Satellite Communications and NTN for Embedded Linux Engineers](wireless-protocols-and-connectivity/satcom-ntn/satcom-ntn_v1_2026-11-24.md)
 - [LoRa and LoRaWAN for Embedded Linux Engineers](wireless-protocols-and-connectivity/lora/lora_v1_2026-11-22.md)
 - [Bluetooth for Embedded Linux Engineers](wireless-protocols-and-connectivity/bluetooth/bluetooth_v1_2026-11-21.md)

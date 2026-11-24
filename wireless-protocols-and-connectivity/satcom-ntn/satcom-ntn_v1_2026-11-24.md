@@ -739,3 +739,143 @@ Terrestrial timing relations ("the PUSCH scheduled by a DCI in slot n is sent in
 
 **IoT-NTN specifics.** NB-IoT and LTE-M keep their small HARQ process counts (NB-IoT has one or two) and their repetitions, which can last seconds. A long repeated uplink is split into **segments** at whose boundaries the UE updates its timing and frequency pre-compensation, because the satellite has moved meanwhile. Low-cost IoT modems often can't run GNSS and the cellular radio at the same time: they take a fix, then connect, and Rel-18 lets the network give the UE a gap to refresh GNSS during a long connection.
 
+---
+
+## 12. Getting and keeping service: system information, access, mobility and discontinuous coverage
+
+### System information
+
+An NTN cell broadcasts what the UE needs to compute its delay and Doppler, in **SIB19** (NR, TS 38.331) or **SIB31** (IoT-NTN, TS 36.331):
+
+| Field (NR names) | Content |
+|---|---|
+| `epochTime` | The time the ephemeris and common TA refer to |
+| `ephemerisInfo` | The serving satellite's orbit: a position and velocity state vector, or orbital elements (semi-major axis, eccentricity, periapsis, longitude of the ascending node, inclination, mean anomaly) |
+| `ta-Info` | Common TA and its drift and drift variation (section 11) |
+| `cellSpecificKoffset`, `kmac` | Scheduling offsets (section 11) |
+| `ntn-UlSyncValidityDuration` | How long the above may be used after the epoch |
+| `t-Service` | When the cell stops serving the current area (quasi-earth-fixed cells) |
+| `referenceLocation`, `distanceThresh` | The cell's reference point on the ground and a distance beyond which the UE should measure neighbors |
+| `ntn-NeighCellConfigList` | Ephemeris and parameters of neighbor cells on other satellites |
+
+IoT-NTN adds **SIB32** with the ephemeris and coverage information of **other satellites**, so a device can predict when the next one will serve it (discontinuous coverage below).
+
+### Getting on a cell
+
+```mermaid
+sequenceDiagram
+    participant G as GNSS
+    participant U as UE (modem)
+    participant N as NTN cell (via satellite)
+    U->>G: get a fix (cold start: tens of seconds)
+    G-->>U: position, time
+    N-->>U: MIB, SIB1 (NTN band, PLMN, cell barred for non-NTN UEs)
+    N-->>U: SIB19 / SIB31: ephemeris, common TA, K_offset, validity
+    Note over U: compute TA and Doppler,<br/>pre-compensate
+    U->>N: PRACH preamble (pre-compensated)
+    N-->>U: random access response (window offset by the round trip)
+    U->>N: RRC setup request ... registration / attach (as in the cellular note)
+```
+
+A terrestrial-only UE ignores NTN cells: they are in NTN bands, and the cell indicates that it is an NTN cell so that UEs without NTN support treat it as barred. After that, registration, attach, security, PDU sessions and PDN connections are the procedures of the [cellular note](../cellular/cellular_v1_2026-11-02.md#11-getting-service-network-selection-rrc-connection-attach-and-registration), with longer timers.
+
+### Cells that move
+
+| Cell type | What happens on the ground | Consequence for the UE |
+|---|---|---|
+| Earth-fixed | The satellite (or the constellation) steers beams to keep the same cell over the same area | Like a terrestrial cell, with a change of satellite behind it from time to time |
+| Quasi-earth-fixed | A beam covers an area for a while, then switches to the next satellite | The UE knows from `t-Service` when its cell will stop and reselects or is handed over before that |
+| Earth-moving | Beams sweep the ground with the satellite | Cell changes every few seconds to minutes; tracking areas need special handling (section 13) |
+
+GEO cells are earth-fixed by nature. In a LEO cell the radio quality varies little between the center and the edge of a beam (all the ground is about the same distance from the satellite), so the terrestrial "measure and hand over when the neighbor is stronger" logic doesn't work well. Rel-17 adds **time** and **location** to mobility:
+
+- **Idle mode:** time-based reselection (start measuring before `t-Service`) and location-based reselection (start measuring when the UE is farther than `distanceThresh` from the cell's reference location).
+- **Connected mode:** conditional handover with conditions on **time** (event T1: within a time window) and **distance** (event D1: farther than a threshold from the serving cell's reference location and closer than another to the candidate's), plus a distance-based measurement report event.
+- **Rel-18:** RACH-less handover (the UE computes its timing to the target satellite instead of doing a random access), satellite switch with resynchronization (same cell and PCI served by the next satellite, the UE only resynchronizes), and mobility between NTN and terrestrial networks.
+
+### Discontinuous coverage and power saving
+
+A device under a sparse LEO constellation sees a satellite for a few minutes, then nothing for an hour. Rel-17 and Rel-18 make that a normal state instead of an endless failure loop:
+
+- The UE learns from **SIB32** (IoT-NTN) when satellites will cover it next and can switch off its radio until then, instead of scanning.
+- The core network can be told the **coverage availability** pattern at the device's location and set **periodic registration**, **mobile reachable** and **PSM/eDRX** timers to match (TS 23.401 and TS 23.501, Rel-18), so that the device isn't detached as unreachable between passes.
+- A UE can report an **unavailability period** before it goes out of coverage (Rel-18), and the network holds downlink data and doesn't page it meanwhile.
+- **Store and forward** (Rel-19, IoT-NTN) lets a regenerative satellite accept data from devices while no ground station is in view and deliver it later.
+
+On GEO the coverage is continuous and the IoT power saving tools are the terrestrial ones: **PSM** and **eDRX** ([cellular note](../cellular/cellular_v1_2026-11-02.md#15-power-saving-drx-edrx-and-psm)). What changes is the energy: a GNSS fix after each long sleep, a longer and more repeated transmission, and a radio that stays on through the long round trips of the procedures.
+
+---
+
+## 13. The core network, UE location and regulation in NTN
+
+### Satellite RAT types
+
+The core network distinguishes satellite access from terrestrial access with separate **RAT types**: NR(LEO), NR(MEO), NR(GEO) and NR(OTHERSAT) in the 5GC, and the equivalent satellite types for WB-E-UTRAN (LTE-M) and NB-IoT (TS 23.501, TS 23.401). The AMF or MME uses them to stretch **NAS timers** (a registration over GEO takes several round trips of over half a second), to set QoS and charging, and to allow or bar satellite access per subscription. The USIM's PLMN and access technology lists have entries for satellite access, so an operator can steer devices to terrestrial access first and satellite second.
+
+Satellite also appears in the 5GC as **backhaul**: a terrestrial gNB connected to the core over a satellite link. The device sees a terrestrial cell; the core knows the backhaul is a satellite and adapts QoS and timers.
+
+### Tracking areas
+
+Tracking areas stay **fixed on the ground** even when cells move. An earth-moving cell broadcasts the tracking area code(s) of the area it currently covers and changes them as it moves; the network maps the UE's registration to the tracking areas under its position. Paging is sent to the cells currently covering the UE's tracking areas.
+
+### Where is the UE?
+
+One beam can cover several countries. Regulation follows the **user's** country, not the satellite's: which PLMN may serve the user, emergency call routing, lawful interception, data retention, charging. So the network must know which country the UE is in:
+
+- The UE may report its location (from GNSS) to the network, which uses it to select the serving PLMN and to route emergency calls.
+- Rel-18 adds **network-verified UE location** for NR-NTN: the network checks the reported position with its own measurements, because a reported position can be spoofed.
+- A PLMN that may not serve the UE where it is rejects its registration with **cause #78, "PLMN not allowed to operate at the present UE location"** (5GMM and EMM, Rel-17). The UE stores the PLMN as not allowed **at that location** and tries again elsewhere or later.
+
+### Direct to device with unmodified phones
+
+Direct-to-device (D2D, direct to cell) services serve **ordinary** LTE phones in the partner operator's terrestrial spectrum. The satellite (regenerative, with a large phased array) does what an NTN UE would do: it shapes beams small enough to look like cells and compensates delay and Doppler per beam, so that the phone sees an LTE cell at a strange distance. The phone needs no NTN support; the satellite cell appears as a roaming or partner network.
+
+| | 3GPP NTN | Direct to device in terrestrial bands |
+|---|---|---|
+| Phone or device | Must support NTN bands and features (Rel-17 or later) | Any recent LTE phone |
+| Spectrum | MSS bands (n255, n256...) | The partner mobile operator's bands |
+| Who compensates delay and Doppler | The UE | The satellite |
+| Typical satellite | GEO or LEO, transparent or regenerative | LEO, regenerative, very large antenna |
+| Services (2026) | IoT messaging, emergency and text messaging on phones, low-rate data | Texts first, then low-rate data and voice in some markets |
+
+Proprietary emergency messaging on phones (Apple's with Globalstar since 2022) is a third model, using the satellite operator's own band and protocol with phone hardware built for it.
+
+---
+
+## 14. The landscape: satellite IoT, NTN operators, direct to device and broadband
+
+Names and status as of November 2026. Operators merge, rename and close services; check current coverage maps, module lists and terms before choosing.
+
+### Satellite IoT with proprietary systems
+
+| Service | Orbit | Band | What a device gets | Notes |
+|---|---|---|---|---|
+| Iridium SBD | LEO, 66 satellites, polar, ISLs | L | Uplinks up to 340 bytes, downlinks up to 270 bytes (9603-class modules), session in tens of seconds, global including poles | The reference for global messaging; Iridium Messaging Transport (IMT) carries larger messages on newer modules (section 17) |
+| Iridium Certus | Same | L | IP, about 22 kb/s (Certus 100) to about 700 kb/s | Small terminals and modules |
+| Viasat (former Inmarsat) IoT and BGAN | GEO | L | Messages; IP up to about 500 kb/s on BGAN | No coverage near the poles |
+| Globalstar | LEO, bent pipe | L/S | Simplex: uplink-only short messages from low-cost transmitters; duplex services | Coverage limited to areas near its gateways |
+| ORBCOMM | LEO and GEO partner services | VHF, L | Short messages | |
+| Argos / Kinéis | LEO | UHF 401 MHz | Very low power messages, positioning by Doppler | Wildlife, buoys, science |
+| Myriota, Astrocast and other nanosatellite operators | LEO, sparse | VHF, L | Small uplinks with store and forward, latency of minutes to hours | Low power, low cost per message |
+
+### 3GPP NTN operators
+
+IoT-NTN services launched first, mostly on GEO L-band and S-band capacity, with roaming agreements to terrestrial mobile operators so that a SIM uses terrestrial NB-IoT or LTE-M when available and NTN elsewhere. Examples: **Skylo** (on partners' GEO L-band and S-band satellites, also behind emergency satellite messaging on some Android phones), **Sateliot** and **OQ Technology** (LEO NB-IoT constellations), and Iridium's announced **NTN Direct** NB-IoT service on its LEO constellation. Modules with NB-IoT NTN support come from the usual cellular module makers (Quectel, u-blox, Nordic Semiconductor, Sequans, Murata with Sony Altair, Telit Cinterion and others), often as variants of terrestrial modules: check the exact part number, firmware version and the operator's certification list.
+
+### Direct to device
+
+**Starlink Direct to Cell** with partner operators (T-Mobile's T-Satellite in the US, and others), **AST SpaceMobile** with AT&T, Verizon, Vodafone and others, **Lynk**, and the NTN smartphone messaging of the phone makers. For devices, D2D promises IoT on unmodified terrestrial modules wherever the partner operator has rights; check whether a given service accepts IoT traffic and modules.
+
+### Broadband
+
+| System | Orbit | User band | Terminal |
+|---|---|---|---|
+| Starlink | LEO, about 340 to 570 km, laser ISLs | Ku (Ka for gateways) | Phased array, tens of watts |
+| Eutelsat OneWeb | LEO, 1,200 km | Ku | Phased array or tracking dishes, through service partners |
+| Amazon Leo (Project Kuiper until 2025) | LEO, about 590 to 630 km | Ka | Phased array, service starting |
+| SES O3b mPOWER | MEO, 8,062 km | Ka | Tracking dishes, enterprise and maritime |
+| GEO HTS (Viasat, Hughes, Eutelsat, SES and others) | GEO | Ka, Ku | Fixed dish, PEPs |
+| Iridium Certus, Viasat BGAN | LEO, GEO | L | Small terminals, hundreds of kb/s |
+
+Planned systems include the EU's **IRIS²** and Chinese constellations (Guowang, Qianfan). For an embedded product, a broadband terminal is a box with Ethernet and a power supply: what matters is the IP service behind it (sections 9 and 19), the terminal's power and the plan's terms.
+

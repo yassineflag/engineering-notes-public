@@ -1219,3 +1219,252 @@ stateDiagram-v2
 
 Keep counters for each transition (fix time, attach time, failures by cause) and send them in the reports: they are the only view of the field link (section 24).
 
+---
+
+## 19. A Linux router behind a broadband terminal
+
+### The terminal
+
+A LEO broadband terminal is a phased array with its own power supply and, usually, its own Wi-Fi router. For a Linux router, put the terminal's router in **bypass mode** (or use an Ethernet adapter on the terminal) so that `eth1` of the site router gets the WAN address directly. Budget **tens of watts** continuously, more when heating snow off the antenna: on solar sites the terminal dominates the power budget (section 22). Mount it with the sky view the operator's app asks for; obstructions show up as periodic outages of seconds.
+
+### Addresses and inbound access
+
+The WAN typically gets a CGNAT IPv4 address and, with IPv6, a delegated prefix (section 9). With systemd-networkd (systemd 250 or later) (**Illustrative**):
+
+```
+# /etc/systemd/network/10-wan.network
+[Match]
+Name=eth1
+
+[Network]
+DHCP=yes
+IPv6AcceptRA=yes
+
+[DHCPv6]
+PrefixDelegationHint=::/56
+```
+
+```
+# /etc/systemd/network/20-lan.network
+[Match]
+Name=eth0
+
+[Network]
+Address=192.168.30.1/24
+DHCPPrefixDelegation=yes
+IPv6SendRA=yes
+```
+
+For maintenance access, don't depend on inbound connections: the site router keeps a **WireGuard** tunnel up to the application server, and you reach the site through the server.
+
+```
+# /etc/wireguard/wg0.conf on the site router (Illustrative)
+[Interface]
+PrivateKey = <site private key>
+Address = 10.99.0.2/24
+
+[Peer]
+PublicKey = <server public key>
+Endpoint = 203.0.113.10:51820
+AllowedIPs = 10.99.0.0/24
+PersistentKeepalive = 25          # keeps the CGNAT mapping alive
+```
+
+WireGuard hides TCP from any PEP; on LEO that costs nothing, on GEO it does (section 9). The tunnel adds 60 bytes (IPv4) or 80 bytes (IPv6) of overhead: set its MTU accordingly (1420 or lower, 1280 for safety on unknown paths).
+
+### TCP and MTU
+
+Defaults are fine for LEO. For GEO, or for transfers between a server and the site over a long path, raise the buffer maximums and use BBR (**Illustrative**):
+
+```
+# /etc/sysctl.d/90-satellite.conf
+net.core.default_qdisc = fq
+net.ipv4.tcp_congestion_control = bbr
+net.core.rmem_max = 33554432
+net.core.wmem_max = 33554432
+net.ipv4.tcp_rmem = 4096 131072 33554432
+net.ipv4.tcp_wmem = 4096 65536 33554432
+net.ipv4.tcp_slow_start_after_idle = 0     # don't restart slow start after a pause
+net.ipv4.tcp_mtu_probing = 1               # recover from PMTUD black holes
+```
+
+These apply to connections the router itself terminates (and to the board if set there); forwarded connections follow the endpoints' settings. Clamp the MSS of forwarded TCP to the path MTU (nftables):
+
+```
+table inet mangle {
+    chain forward {
+        type filter hook forward priority mangle; policy accept;
+        oifname { "eth1", "wg0" } tcp flags syn tcp option maxseg size set rt mtu
+    }
+}
+```
+
+### Queues and bufferbloat
+
+Satellite terminals often buffer deeply: under load, latency climbs from 40 ms to hundreds. Shape slightly below the link rate with CAKE so the queue builds on the router, where it is managed:
+
+```
+# tc qdisc replace dev eth1 root cake bandwidth 15mbit           # upload
+# ip link add ifb0 type ifb && ip link set ifb0 up               # download through an IFB
+# tc qdisc add dev eth1 handle ffff: ingress
+# tc filter add dev eth1 parent ffff: matchall action mirred egress redirect dev ifb0
+# tc qdisc replace dev ifb0 root cake bandwidth 120mbit ingress
+```
+
+LEO capacity varies with the satellite, the cell load and the weather, so a fixed rate is either too low or too high part of the time. Community scripts adjust CAKE's rate from measured latency (cake-autorate); otherwise, choose a rate that the link sustains most of the time.
+
+### Failover
+
+A site with cellular and satellite uses both as default routes with different metrics, and a health check that moves traffic when a link fails (the [gateway note](../../os-and-firmware/networking/gateway/gateway_v1_2026-10-26.md) shows multi-WAN setups). Check the satellite link with probes to a server you control, not to the terminal: the terminal answers while its satellite link is down.
+
+### Monitoring
+
+`ping` and `mtr` to the application server show latency and loss over time; log them every minute. Some terminals expose status (obstructions, outages, pointing, firmware) on their local network; for Starlink, the unofficial community tool `starlink-grpc-tools` reads it from the dish's local gRPC API (unofficial: it can break with firmware updates).
+
+---
+
+## 20. Pass prediction and emulating satellite links on the bench
+
+### Predicting passes
+
+For LEO systems without continuous coverage, or to understand why a site gets better service at some hours, compute passes from public orbits. With Python and Skyfield, using TLEs from CelesTrak (**Illustrative**):
+
+```python
+#!/usr/bin/env python3
+"""List the next passes of a constellation over a site (illustrative)."""
+from skyfield.api import load, wgs84
+
+URL = "https://celestrak.org/NORAD/elements/gp.php?GROUP=iridium-NEXT&FORMAT=tle"
+SITE = wgs84.latlon(45.000, 6.000, elevation_m=1500)
+MIN_ELEVATION = 20.0
+C = 299_792.458          # km/s
+F = 1.6e9                # carrier, Hz
+
+ts = load.timescale()
+sats = load.tle_file(URL, filename="iridium.tle", reload=False)   # refresh daily
+t0 = ts.now()
+t1 = t0 + 2 / 24         # next two hours
+
+for sat in sats:
+    times, events = sat.find_events(SITE, t0, t1, altitude_degrees=MIN_ELEVATION)
+    for t, event in zip(times, events):
+        topo = (sat - SITE).at(t)
+        alt, az, dist = topo.altaz()
+        *_, range_rate = topo.frame_latlon_and_rates(SITE)
+        doppler = -range_rate.km_per_s / C * F
+        name = ("rise", "culminate", "set")[event]
+        print(f"{t.utc_strftime('%H:%M:%S')} {sat.name:16} {name:9} "
+              f"el {alt.degrees:5.1f} az {az.degrees:5.1f} "
+              f"range {dist.km:7.0f} km doppler {doppler / 1e3:+6.1f} kHz")
+```
+
+- TLE accuracy is fine for predicting passes and pointing; refresh the file daily, since errors grow by kilometers a day.
+- Download TLEs politely: CelesTrak asks clients not to fetch the same data more often than it changes (a few times a day at most).
+- Use the site's real **horizon** (terrain, buildings) instead of a single minimum elevation where it matters.
+
+**Pointing at a GEO satellite.** For a site at latitude φ and a satellite at Δλ = satellite longitude − site longitude (east positive), elevation and azimuth follow from the geometry (r = R/(R + h) ≈ 0.151 for GEO):
+
+```
+cos γ   = cos φ · cos Δλ                         γ: central angle between site and sub-satellite point
+el      = atan((cos γ − r) / sin γ)
+az      = 180° − atan(tan Δλ / sin φ)            northern hemisphere: satellite east of the site → az < 180°
+```
+
+At 45° N with Δλ = 0, γ = 45° and el ≈ 38°, due south. Installers use apps and signal meters; the formula tells you whether a mountain is in the way before you go.
+
+### Emulating a link with netem
+
+Test the application against the delay, loss and rate of the target link before deploying. The dev laptop or a small router between the board and the server applies `netem` in both directions (**Illustrative**; `eth0` faces the board):
+
+```
+# GEO-like: 280 ms each way, some jitter, 2 Mb/s up, 10 Mb/s down, 0.5 % loss down
+# modprobe ifb && ip link add ifb0 type ifb && ip link set ifb0 up
+# tc qdisc add dev eth0 handle ffff: ingress
+# tc filter add dev eth0 parent ffff: matchall action mirred egress redirect dev ifb0
+# tc qdisc add dev ifb0 root netem delay 280ms 10ms rate 2mbit              # board → server
+# tc qdisc add dev eth0 root netem delay 280ms 10ms rate 10mbit loss 0.5%   # server → board
+```
+
+A LEO-like link with a short disruption every 15 seconds, and a coverage gap scenario:
+
+```bash
+#!/bin/sh
+# LEO-like emulation (illustrative): 20 ms towards the board, a 100 ms outage every 15 s
+# (apply the same to ifb0 for the other direction)
+tc qdisc replace dev eth0 root netem delay 20ms 5ms
+while true; do
+    sleep 15
+    tc qdisc change dev eth0 root netem delay 20ms 5ms loss 100%
+    sleep 0.1
+    tc qdisc change dev eth0 root netem delay 20ms 5ms
+done
+```
+
+```
+# tc qdisc change dev eth0 root netem loss 100%    # no satellite for the next pass gap
+# tc qdisc change dev eth0 root netem delay 280ms  # satellite back
+# tc qdisc del dev eth0 root; tc qdisc del dev eth0 ingress   # clean up
+```
+
+An NB-IoT NTN link can't be emulated by delay alone: what dominates is registration time, GNSS fix time and the per-message cost. For those, use the module itself on a terrestrial NB-IoT network for the protocol logic, and a test plan on the real NTN service for timing and energy.
+
+---
+
+## 21. Application design for slow, expensive, intermittent links
+
+### Count bytes and round trips
+
+| Path | Per-message overhead (rule of thumb) |
+|---|---|
+| Iridium SBD | None inside the 340 bytes; billing granularity (often 50 bytes) and per-message fees |
+| NB-IoT NTN, non-IP data | A few bytes of NAS and radio overhead per message |
+| NB-IoT NTN, UDP over IPv4 | 28 bytes of headers per datagram (header compression is optional and operator-dependent) |
+| CoAP over UDP | 4-byte header plus options: 10 to 20 bytes |
+| DTLS 1.2 handshake | Several kB and two round trips: once per session, so keep sessions long and resume them |
+| TCP + TLS 1.3 + MQTT connection | 5 to 10 kB and several round trips before the first byte of data |
+
+**Prefer** compact binary payloads, UDP or non-IP data, one message per report, and long-lived security contexts. Avoid TCP, TLS handshakes per message, JSON, and protocols that poll.
+
+### A compact, protected report
+
+The operator delivers payloads through its own systems (e-mail, web APIs, its core network): treat that path as untrusted and protect payloads **end to end**. A report of the reservoir in 22 bytes (9 bytes of data, 13 bytes of header and tag), with AES-CCM and an 8-byte tag (**Illustrative**, Python `cryptography`):
+
+```python
+import struct
+from cryptography.hazmat.primitives.ciphers.aead import AESCCM
+
+DEVICE_ID = bytes.fromhex("0000a001")          # placeholder, also known by the server
+
+
+def report(key: bytes, seq: int, t: int, level_mm: int, temp_c10: int, flags: int) -> bytes:
+    """version(1) seq(4) | encrypted: time(4) level(2) temp(2) flags(1) | tag(8)"""
+    header = struct.pack(">BI", 1, seq)
+    plain = struct.pack(">IHhB", t, level_mm, temp_c10, flags)
+    nonce = DEVICE_ID + seq.to_bytes(4, "big") + bytes(5)      # 13 bytes, never reused
+    return header + AESCCM(key, tag_length=8).encrypt(nonce, plain, header)
+```
+
+- The **sequence number** is the nonce's unique part: persist it before every send and never reuse it with the same key. The server rejects old or repeated numbers (replay protection) and uses them to detect losses.
+- The **time** is the measurement time, not the reception time: a message may arrive hours later.
+- Standard alternatives with the same properties: COSE (RFC 9052) objects, OSCORE (RFC 8613) for CoAP, DTLS 1.2 with connection IDs (RFC 9146) so that sessions survive address changes.
+
+### Queue, deduplicate, prioritize
+
+- Keep an on-device **persistent queue** (a small SQLite database survives power loss) and delete a message only when the link confirms delivery: an SBDIX success, a CoAP ACK, an MQTT PUBACK.
+- **Retries create duplicates** (an SBD session that succeeds but whose answer is lost, a CoAP ACK lost on the way back): deduplicate on the server by device and sequence number.
+- **Prioritize**: alarms first, then the latest state, then history. When the queue holds a day of history, send a summary instead of every sample.
+- **Downlinks** wait for the device: an SBD MT message waits until the next session, an NB-IoT downlink until the device leaves PSM. Design configuration changes as idempotent "desired state" messages with a version number, and let the device report the version it applies.
+
+### Choosing the bearer
+
+A policy on the example board (**Illustrative**):
+
+| Condition | Bearer |
+|---|---|
+| Wi-Fi or site router reachable | Everything over IP (MQTT over TLS on a long-lived connection) |
+| No IP, NTN registered | Periodic reports and alarms over NB-IoT NTN (CoAP or non-IP) |
+| No IP, no NTN, alarm pending | Iridium SBD, alarms and the latest state only |
+| Nothing available | Queue, retry on the next pass, keep the newest and the alarms if the queue fills |
+
+Log which bearer carried each message, with its cost, so that monthly bills can be explained.
+

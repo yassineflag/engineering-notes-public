@@ -196,3 +196,101 @@ flowchart LR
 
 Placeholders: IPv4 addresses come from the documentation ranges (`203.0.113.0/24`, RFC 5737), the CGNAT range is the shared address space of RFC 6598, IPv6 prefixes from `2001:db8::/32` (RFC 3849). The site coordinates are round numbers in the Alps. IMEIs, SIM details and APNs are written `<IMEI>`, `ntn.example`; never put a real IMEI, SIM credential or key in a note or a repository.
 
+---
+
+## 3. Orbits and constellations: GEO, MEO, LEO, HEO
+
+A satellite in a circular orbit at altitude *h* above an Earth of radius *R* ≈ 6,371 km moves at *v* = √(μ / (R + h)) and goes around in *T* = 2π √((R + h)³ / μ), with μ = 398,600 km³/s². Higher means slower, longer to go around, longer to reach, and a bigger footprint:
+
+| Orbit | Altitude | Period | One-way delay ground to satellite, overhead to 10° elevation | Time in view at a site | Examples |
+|---|---|---|---|---|---|
+| **LEO** | 300 to 2,000 km | 90 to 127 min | 550 km: 1.8 to 6.1 ms; 1,200 km: 4.0 to 10.4 ms | A few minutes per pass (see below) | Starlink (shells around 340 to 570 km), Iridium (780 km), Eutelsat OneWeb (1,200 km), Globalstar (1,414 km), Amazon Leo, most IoT nanosatellites (500 to 600 km) |
+| **MEO** | 2,000 to 35,786 km | 2 to 24 h | 8,062 km: 27 to 40 ms | Hours | SES O3b mPOWER (8,062 km, 4.8 h period); GNSS (GPS 20,200 km, Galileo 23,222 km, about 12 to 14 h) |
+| **GEO** | 35,786 km over the equator | 23 h 56 min (one sidereal day) | 119 to 135 ms | Always, from a fixed direction | Inmarsat/Viasat, Thuraya, TV satellites, GEO VSAT and HTS, most NTN IoT services in 2026 |
+| **HEO** | Elliptical: perigee a few hundred km, apogee tens of thousands | 12 h (Molniya), 24 h (Tundra) | Varies along the orbit | Hours around apogee | High-latitude coverage (Russia, polar regions), some broadband and satellite radio |
+
+Values computed with the formulas above and the slant range of section 6. A delay through a **transparent** satellite adds the service link and the feeder link; a round trip doubles that again (section 6).
+
+### GEO: fixed in the sky
+
+A satellite at 35,786 km over the equator turns with the Earth and stays at a fixed azimuth and elevation, so a dish can be pointed once and left. Three satellites see almost all inhabited land; nobody sees them beyond about 81° latitude, and in practice above 70 to 75° the elevation is too low. From 45° N, a GEO at the same longitude is due south at about 38° elevation; from 60° N, at about 22°. Low elevations mean longer paths, more atmosphere, more obstacles.
+
+What still moves: station keeping holds a satellite in a box of about ±0.05 to 0.1°, enough to matter for large dishes; old satellites run in **inclined orbit** to save fuel and wander north and south in a daily figure eight, which needs tracking antennas. Twice a year, around the equinoxes, the **sun passes behind the satellite** seen from a given site for a few minutes a day over several days, and the sun's noise drowns the signal (sun outage). The satellite also goes through **eclipses** around the equinoxes, on batteries.
+
+### LEO: close, fast and many
+
+A LEO satellite at 550 km goes around in about 95 minutes at 7.6 km/s. Seen from a site:
+
+| Altitude | Footprint radius at 10° minimum elevation | Longest pass above 10° | Longest pass above 25° |
+|---|---|---|---|
+| 550 km | about 1,670 km | about 8 min | about 4.5 min |
+| 780 km (Iridium) | about 2,080 km | about 10 min | |
+| 1,200 km | about 2,670 km | about 15 min | |
+
+Longest passes are directly overhead; most passes are lower and shorter. The Earth's rotation under the orbit is ignored (it changes the values by a few percent).
+
+**Continuous coverage needs many satellites.** Iridium flies 66 active satellites in 6 polar planes; broadband constellations fly thousands, in several shells and inclinations. A constellation's **inclination** sets the latitudes it serves: polar orbits (Iridium 86.4°, OneWeb about 88°) cover the whole Earth and crowd over the poles; inclined shells (Starlink's 53° and 43° shells) concentrate capacity at mid-latitudes. A **sparse** constellation (a few to a few tens of IoT satellites) gives passes every few hours at a site: the device stores its messages and sends them during the next pass (**store and forward**, section 12).
+
+LEO orbits decay through atmospheric drag: below about 600 km a dead satellite reenters within a few years, which is good for debris and means constellations are replaced continuously.
+
+### MEO and HEO
+
+MEO trades fewer satellites for more delay: O3b mPOWER serves maritime, cellular backhaul and enterprise links with round trips around 130 to 150 ms (rule of thumb), with tracking antennas. GNSS uses MEO because a few dozen satellites cover the Earth with several in view everywhere. HEO orbits (inclination 63.4° so that the ellipse doesn't rotate) hang for hours near apogee over high latitudes, where GEO is too low in the sky.
+
+### Knowing where a satellite is
+
+A satellite's orbit is described by an **ephemeris**: either a state vector (position and velocity at an epoch) or orbital elements (semi-major axis, eccentricity, inclination, right ascension of the ascending node, argument of perigee, mean anomaly at an epoch). Propagating it forward gives the position at any time.
+
+- **Public orbits:** CelesTrak and Space-Track publish **TLEs** and **OMM** records for tracked objects, propagated with the SGP4 model. Accuracy is about a kilometer at epoch, degrading by kilometers per day: good for pass predictions and antenna pointing, not for timing advance (section 20).
+- **Operator orbits:** operators know their satellites' positions to meters. In 3GPP NTN, the network broadcasts the serving satellite's ephemeris in system information for the device to compute delay and Doppler (section 12).
+- **GNSS** gives the device its own position and accurate time. Both are needed to compute anything about the geometry; NTN devices need GNSS for this reason (sections 11 and 16).
+
+---
+
+## 4. Frequency bands, services and regulation
+
+### Bands
+
+Satellite bands use the old radar letters. Each band trades antenna size, rain sensitivity and available bandwidth:
+
+| Band | Range (approximate) | Main satellite uses | Notes |
+|---|---|---|---|
+| VHF, UHF | 137 to 470 MHz | ORBCOMM (137 to 150 MHz), Argos/Kinéis (401 MHz), weather satellites (137 MHz), military UHF, amateur satellites | Simple antennas, little bandwidth, crowded |
+| **L** | 1 to 2 GHz | GNSS (1,164 to 1,610 MHz), MSS: Inmarsat/Viasat (downlink 1,525 to 1,559, uplink 1,626.5 to 1,660.5 MHz), Iridium (1,616 to 1,626.5 MHz, both directions), Globalstar uplink (1,610 to 1,618.725 MHz), Thuraya, Ligado. NTN band n255 / B255 | Small omnidirectional or patch antennas work, little rain effect, narrow allocations: the band of handhelds and IoT |
+| **S** | 2 to 4 GHz | MSS 2 GHz (uplink 1,980 to 2,010, downlink 2,170 to 2,200 MHz), Globalstar downlink (2,483.5 to 2,500 MHz), satellite radio (2.3 GHz). NTN band n256 / B256 | Similar to L-band, slightly more path loss for the same antenna gain |
+| **C** | 4 to 8 GHz | FSS: downlink 3.4 to 4.2, uplink 5.85 to 6.725 GHz | Rain-robust, large dishes (1.8 to 3.7 m). Part of the downlink band was cleared for 5G (3.7 to 3.98 GHz in the US) |
+| X | 8 to 12 GHz | Government and military satellite communications, Earth observation downlinks (8.025 to 8.4 GHz) | |
+| **Ku** | 12 to 18 GHz | FSS and BSS: downlink 10.7 to 12.75, uplink 12.75 to 14.5 GHz. TV broadcasting, VSAT, user links of Starlink and OneWeb | Small dishes (45 to 120 cm) and flat panels, a few dB of rain fade |
+| **Ka** | 26.5 to 40 GHz (satcom: downlink 17.3 to 21.2, uplink 27.5 to 31 GHz) | High-throughput satellites, gateways, ESIM, NR-NTN bands n510 to n512 | Wide bandwidth, small spot beams, strong rain fade |
+| Q/V, W | 37 to 52 GHz, 75 to 110 GHz | Gateway feeder links of new constellations | Very strong rain and gas attenuation, site diversity |
+| Optical | | Inter-satellite links, some feeder links | Clouds block ground links |
+
+The **user link** of IoT and handheld systems lives in L and S because a small, unpointed antenna works there. **Broadband** lives in Ku and Ka because that is where hundreds of MHz are available, at the price of a pointed or electronically steered antenna. **Feeder links** move up to Ka, Q/V and optical, to free spectrum for users.
+
+**Polarization:** L-band and S-band mobile systems use circular polarization, because the ionosphere rotates linear polarization (Faraday rotation) and a handheld has no fixed orientation. Ku-band broadcasting in Europe uses horizontal and vertical linear polarization, selected by the LNB (section 8). A linearly polarized device antenna receiving a circular signal loses 3 dB.
+
+### Services
+
+The ITU Radio Regulations allocate bands to **services**, and a system must operate in a band allocated to its service:
+
+| Service | Meaning | Examples |
+|---|---|---|
+| FSS (fixed-satellite service) | Between earth stations at fixed points (and, by later decisions, ESIMs) | VSAT, broadband terminals, gateways |
+| MSS (mobile-satellite service) | Mobile earth stations, handhelds, vehicles | Iridium, Inmarsat, Globalstar, Thuraya, 3GPP NTN in L and S bands |
+| BSS (broadcasting-satellite service) | Direct reception by the public | Satellite TV and radio |
+| RNSS | Radionavigation-satellite | GNSS |
+| EESS, SRS | Earth exploration, space research | Earth observation, science |
+| Amateur-satellite | Licensed amateurs, non-commercial | Amateur satellites and CubeSats in amateur bands |
+
+### Regulation
+
+Three layers of permission apply to a satellite link:
+
+- **The satellite system.** An administration (the national regulator of the operator's country) files the system with the ITU, coordinates it with other systems and notifies it. Non-geostationary systems must keep their interference into GEO systems below the **EPFD** limits of the Radio Regulations. This is the operator's business, but it explains why a system can't simply change bands.
+- **Market access.** An operator needs authorization ("landing rights") in each country where it provides service; coverage maps follow these authorizations as much as the orbits. Some countries restrict or forbid satellite terminals, or require their registration, and customs may hold them: check before shipping devices abroad.
+- **The terminal.** A terminal transmits, so it needs a radio authorization. In the EU, CEPT ECC decisions exempt many MSS and FSS/ESIM terminals from individual licensing and allow their free circulation, and the device must comply with the Radio Equipment Directive (section 23). In the US, terminals operate under **FCC Part 25**, usually under a blanket license held by the operator. A device integrating a satellite modem inherits obligations from both the regulation and the operator's terms.
+
+**Satellites in mobile operators' bands.** Direct-to-device services that reach ordinary phones use terrestrial mobile spectrum from space with the partner operator's agreement. The FCC adopted a framework for this, **Supplemental Coverage from Space** (SCS), in 2024; elsewhere it is authorized case by case, and the international rules for mobile-satellite use of terrestrial mobile bands are on the agenda of the World Radiocommunication Conference of 2027 (WRC-27).
+
+**Radio astronomy and GNSS** are protected neighbors: the 1,610.6 to 1,613.8 MHz radio astronomy band sits inside the MSS L-band, and GNSS receivers listen just below the L-band MSS uplinks. A device that transmits in the L-band must not deafen its own GNSS receiver (section 22).
+

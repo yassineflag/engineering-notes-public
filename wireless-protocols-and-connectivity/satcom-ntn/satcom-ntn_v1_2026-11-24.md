@@ -294,3 +294,172 @@ Three layers of permission apply to a satellite link:
 
 **Radio astronomy and GNSS** are protected neighbors: the 1,610.6 to 1,613.8 MHz radio astronomy band sits inside the MSS L-band, and GNSS receivers listen just below the L-band MSS uplinks. A device that transmits in the L-band must not deafen its own GNSS receiver (section 22).
 
+---
+
+## 5. The link budget: path loss, EIRP, G/T, C/N0 and rain
+
+### The equation
+
+A satellite link budget is written per Hz of noise, because the noise is thermal and the bandwidth is a design choice:
+
+```
+C/N0 [dB-Hz] = EIRP [dBW] − FSPL [dB] − L_other [dB] + G/T [dB/K] − k [dBW/K/Hz]
+
+    FSPL = 92.45 + 20·log10(d in km) + 20·log10(f in GHz)        free-space path loss
+    k    = −228.6 dBW/K/Hz                                         Boltzmann's constant
+    C/N  = C/N0 − 10·log10(bandwidth in Hz)
+    Es/N0 = C/N0 − 10·log10(symbol rate),   Eb/N0 = C/N0 − 10·log10(bit rate)
+```
+
+- **EIRP** is what the transmitter puts out in the direction of the receiver: power in dBW (0 dBW = 1 W = 30 dBm) plus antenna gain, minus feed losses.
+- **G/T** is the receiver's figure of merit: antenna gain minus 10·log10 of the system noise temperature. The noise temperature includes the sky the antenna sees (cold sky 10 to 50 K at Ku, the warm Earth 290 K seen by a satellite), losses before the first amplifier, and the amplifier's noise figure (T = 290·(10^(NF/10) − 1)).
+- **L_other** collects everything else: atmospheric gases, rain, scintillation, polarization mismatch, pointing error, shadowing and body loss.
+- **The margin** is what is left over the C/N0 (or Es/N0) that the modulation and coding need (section 8), and must cover what the budget didn't model.
+
+**Antennas.** A dish of diameter *D* at wavelength λ has a gain G = η·(π·D/λ)² with efficiency η of 0.55 to 0.7, and a 3 dB beamwidth of about 70·λ/D degrees. A 1.2 m dish at 12 GHz: 41.7 dBi and a 1.5° beam. A pointing error of θ costs about 12·(θ / beamwidth)² dB: 0.3° on that dish costs 0.5 dB. The narrow beam is also what lets GEO satellites sit 2° apart without the terminal hearing (or jamming) the neighbors; small dishes and flat panels have wider beams and are limited in power to protect adjacent satellites. An L-band patch or helix has 0 to 5 dBi and needs no pointing.
+
+### Three budgets
+
+**A GEO Ku-band VSAT downlink** (rule of thumb):
+
+| Item | Value | Notes |
+|---|---|---|
+| Satellite EIRP | 52 dBW | Spot beam, depends on the position in the beam |
+| Slant range, frequency | 38,000 km, 12 GHz | Mid-latitude site |
+| FSPL | 205.6 dB | |
+| Gases, clouds (clear sky), pointing | 1.0 dB | |
+| Terminal G/T | 20.9 dB/K | 1.2 m dish (41.7 dBi), system noise temperature 120 K |
+| **C/N0 (downlink)** | **94.9 dB-Hz** | |
+| Es/N0 at 30 Mbaud | 20.1 dB | 10·log10(30×10⁶) = 74.8 |
+| With the uplink and interference (C/N up 20 dB, C/I 20 dB) | about 15.3 dB | 1/(C/N)total = 1/(C/N)up + 1/(C/N)down + 1/(C/I), in linear units |
+
+15 dB carries 32APSK 4/5 (about 4 bit/s/Hz, section 8) in clear sky. Rain takes it down a few MODCODs; adaptive coding and modulation (ACM) follows the weather.
+
+**A LEO S-band handheld uplink**, in the style of the calibration cases of 3GPP TR 38.821 (rule of thumb):
+
+| Item | Value | Notes |
+|---|---|---|
+| UE EIRP | −7 dBW | 23 dBm (power class 3), 0 dBi antenna |
+| Slant range, frequency | 1,075 km (600 km orbit, 30° elevation), 2 GHz | |
+| FSPL | 159.1 dB | |
+| Gases, scintillation, shadowing margin, polarization | 8.3 dB | 0.1 + 2.2 + 3 + 3 |
+| Satellite G/T | 1.1 dB/K | A LEO satellite's receive antenna sees the warm Earth |
+| **C/N0** | **55.3 dB-Hz** | |
+| SNR in 360 kHz (2 resource blocks at 15 kHz) | −0.3 dB | |
+| SNR in one 15 kHz subcarrier | 13.5 dB | |
+
+The same power spread over less bandwidth gives more SNR: a handheld or IoT device can only close a satellite uplink at **low bandwidth**, so narrowband allocations, single-tone NB-IoT transmissions and repetitions are the tools (sections 10 and 11).
+
+**A GEO L-band NB-IoT uplink** (rule of thumb):
+
+| Item | Value | Notes |
+|---|---|---|
+| UE EIRP | −7 dBW | 23 dBm, 0 dBi patch |
+| Slant range, frequency | 38,000 km, 1.64 GHz | |
+| FSPL | 188.4 dB | 29 dB more than the LEO case |
+| Scintillation, polarization, shadowing margin | 4.5 dB | Circularly polarized patch with a clear sky |
+| Satellite G/T | +10 dB/K | Large deployable L-band reflector, many narrow beams |
+| **C/N0** | **38.7 dB-Hz** | |
+| SNR in a 3.75 kHz single tone | 3.0 dB | |
+| SNR in a 15 kHz single tone | −3.1 dB | Needs repetitions |
+
+At 38.7 dB-Hz, Shannon and good coding allow a few kb/s at most; with the overhead of NB-IoT and repetitions, expect **hundreds of b/s to about a kb/s** of useful uplink. A GEO IoT service works because the satellite's huge antenna makes up for the device's tiny one.
+
+### Rain, gases and the ionosphere
+
+| Effect | Bands it matters for | Size (rule of thumb) | ITU-R model |
+|---|---|---|---|
+| Rain attenuation | Ku and above | Ku: 1 to 4 dB, Ka: 3 to 10 dB and more, for 99.5 to 99.9 % availability in Western Europe; much more in the tropics | P.618, P.837 (rain rates) |
+| Rain noise | Ku and above, downlinks | A rain fade of A dB also adds Tm·(1 − 10^(−A/10)) kelvin of noise (Tm ≈ 275 K): 3 dB of rain adds about 140 K | P.618 |
+| Atmospheric gases | Above 10 GHz, strong near 22 GHz (water vapor) and 60 GHz (oxygen) | 0.1 to 1 dB at Ku/Ka at medium elevation | P.676 |
+| Clouds | Ka and above | Up to a few dB | P.840 |
+| Tropospheric scintillation | Ku/Ka at low elevation | Fast fluctuations of a dB or more | P.618 |
+| Ionospheric scintillation | L and S bands, near the geomagnetic equator after sunset and at high latitudes | Fades of 10 dB or more during strong events, peaks with the solar cycle | P.531 |
+| Shadowing and multipath | All, mostly L and S for mobile terminals | Trees 5 to 20 dB, buildings block | P.681 (land mobile satellite channel) |
+
+The noise matters as much as the attenuation on a downlink: with the VSAT above (120 K), 3 dB of rain raises the noise to about 260 K, so the C/N0 drops by about 6.3 dB, not 3.
+
+**Availability** is quoted as the percentage of an average year the link stays above threshold: 99.5 % allows 44 hours of outage a year, 99.9 % allows 8.8 hours, 99.99 % allows 53 minutes. Each extra nine at Ka-band costs many dB.
+
+### Interference and the satellite's amplifier
+
+A bent-pipe transponder amplifies everything in its band, including noise and other carriers. Its amplifier (a traveling-wave tube or solid state) is driven a few dB below saturation (**back-off**) when it carries many carriers, to limit intermodulation. Adjacent satellites, the other polarization and other beams reusing the same frequency add interference, counted as C/I. The overall link is limited by whichever of uplink C/N, downlink C/N and C/I is worst.
+
+---
+
+## 6. Delay, Doppler and visibility
+
+### Geometry
+
+The slant range from a site to a satellite at altitude *h*, seen at elevation *e*:
+
+```
+d = √((R + h)² − (R·cos e)²) − R·sin e          R ≈ 6,371 km
+```
+
+| Orbit | Overhead (90°) | 30° elevation | 10° elevation |
+|---|---|---|---|
+| LEO 550 km | 550 km, 1.8 ms | 993 km, 3.3 ms | 1,815 km, 6.1 ms |
+| LEO 1,200 km | 1,200 km, 4.0 ms | 1,999 km, 6.7 ms | 3,131 km, 10.4 ms |
+| GEO 35,786 km | 35,786 km, 119.4 ms | 38,609 km, 128.8 ms | 40,581 km, 135.4 ms |
+
+### Delay
+
+A message through a **transparent** satellite crosses the service link and the feeder link; through a **regenerative** satellite with the base station on board, only the service link counts for the radio protocol. The maximum round trips of 3GPP TR 38.821 (both links at 10° minimum elevation) set the design limits of NTN:
+
+| Scenario | Max round trip, transparent | Max round trip, regenerative (UE to satellite) |
+|---|---|---|
+| GEO | 541.46 ms | 270.73 ms |
+| LEO 1,200 km | 41.77 ms | 20.89 ms |
+| LEO 600 km | 25.77 ms | 12.89 ms |
+
+What an application measures adds scheduling, processing, ground routing to the operator's point of presence and the internet (rule of thumb):
+
+| System | Typical application round trip |
+|---|---|
+| GEO VSAT, GEO NTN | 550 to 750 ms, seconds when the return link is congested or needs capacity requests |
+| MEO (O3b mPOWER) | 130 to 150 ms |
+| LEO broadband (Starlink-class) | 25 to 60 ms median, spikes at satellite changes |
+| Iridium SBD | 10 to 30 s for a session: the time is the protocol and registration, not the propagation |
+| Sparse LEO store and forward | Minutes to hours: the time until a satellite passes over the device, then over a ground station |
+
+**The delay moves.** A LEO satellite's distance changes by up to about 7 km per second, so the one-way delay drifts by up to about 23 µs every second, and jumps when the device or the gateway changes satellite. A cellular uplink must arrive aligned to within a fraction of a symbol (a few µs at 15 kHz subcarrier spacing): NTN devices must recompute their timing advance continuously (section 11).
+
+### Doppler
+
+A carrier at *f* from a source approaching at radial velocity *v_r* is received at *f·(1 + v_r/c)*. For a LEO satellite at 600 km moving at 7.56 km/s, the radial velocity peaks at about ±6.8 km/s near the horizon, about ±23 ppm of the carrier:
+
+| Carrier | Max Doppler, LEO 600 km | Max Doppler rate (overhead pass) |
+|---|---|---|
+| 1.6 GHz (L) | ±36 kHz | about 0.46 kHz/s |
+| 2 GHz (S) | ±45 kHz | about 0.58 kHz/s |
+| 12 GHz (Ku) | ±270 kHz | about 3.5 kHz/s |
+| 20 GHz (Ka) | ±450 kHz | about 5.8 kHz/s |
+
+Computed from the orbit; the Earth's rotation adds or subtracts a few percent. The rate peaks overhead, when the Doppler crosses zero: the radial acceleration there is v²·R / ((R + h)·h), about 87 m/s² at 600 km.
+
+For comparison, an LTE subcarrier is 15 kHz wide and a terrestrial modem tracks about 1 kHz (a high-speed train). **±45 kHz is three subcarriers**: a LEO NTN device must pre-compensate its uplink frequency from the satellite's ephemeris and its own position, and track the downlink (section 11).
+
+GEO satellites barely move: their Doppler is a few Hz to tens of Hz from station keeping and inclination. The **terminal's** motion dominates: an aircraft at 250 m/s shifts an L-band carrier by about 1.3 kHz, a car at 30 m/s by about 160 Hz.
+
+### Visibility and handovers
+
+```
+ Elevation     ▲                     ┌──── overhead pass, LEO 550 km ────┐
+      90°      │                    ╱╲
+               │                  ╱    ╲
+      25°  ────┼────────────────╱────────╲──────── service mask (example)
+      10°  ────┼─────────────╱──────────────╲───── horizon mask
+               └──────────────┬─────┬─────┬──────────▶ time
+ Range           1,800 km    ...  550 km  ...  1,800 km
+ Doppler (2 GHz) +45 kHz     ...   0 Hz   ...  −45 kHz
+ One-way delay   6.1 ms      ...  1.8 ms  ...  6.1 ms
+                  └────── about 8 min above 10° ──────┘
+```
+
+- **Masks.** Terrain, buildings and trees raise the practical horizon. A system that needs 25° of elevation in a valley gets much shorter passes than the table of section 3 promises. Measure or model the site's horizon.
+- **Dense constellations** keep several satellites in view and hand the terminal from one to the next. Broadband terminals change satellites every few tens of seconds; measurement studies of Starlink report reallocations on a 15 s schedule with short latency spikes and losses at each change (rule of thumb, operator-dependent). Iridium hands a call between the 48 beams of a satellite about every minute and between satellites every several minutes.
+- **NTN cells** may be fixed on the ground (the satellite steers its beams to the same area while it passes) or move with the satellite (the device changes cell every few seconds to minutes). Section 12 describes how 3GPP handles both.
+- **Sparse constellations** leave gaps of minutes to hours between passes: the device waits, stores and sends at the next pass (section 12).
+- **GEO** is always in view if it is in view at all; outages come from rain, obstacles, sun outages and the satellite's own events.
+

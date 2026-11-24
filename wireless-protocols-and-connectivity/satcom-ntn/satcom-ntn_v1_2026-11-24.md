@@ -463,3 +463,154 @@ GEO satellites barely move: their Doppler is a few Hz to tens of Hz from station
 - **Sparse constellations** leave gaps of minutes to hours between passes: the device waits, stores and sends at the next pass (section 12).
 - **GEO** is always in view if it is in view at all; outages come from rain, obstacles, sun outages and the satellite's own events.
 
+---
+
+## 7. System architecture: payloads, beams, gateways and inter-satellite links
+
+A satellite system has three segments: the **space segment** (satellites, their payloads and buses), the **ground segment** (gateways, the network operations center, satellite control with its telemetry, tracking and command links), and the **user segment** (terminals).
+
+```mermaid
+flowchart LR
+    ue["Terminal / UE"] -.-|"service link<br/>L/S/Ku"| satA(["Satellite A"])
+    satA ===|"inter-satellite link<br/>optical or Ka"| satB(["Satellite B"])
+    satA -.-|"feeder link<br/>Ka, Q/V"| gw1["Gateway 1"]
+    satB -.-|"feeder link"| gw2["Gateway 2"]
+    gw1 --- noc["Network operations,<br/>core network,<br/>points of presence"]
+    gw2 --- noc
+    noc --- inet["Internet,<br/>your server"]
+```
+
+### Payloads: transparent or regenerative
+
+| | Transparent (bent pipe) | Regenerative |
+|---|---|---|
+| What the satellite does | Filters, shifts the frequency, amplifies | Demodulates and decodes; switches, routes, or runs a base station (gNB) on board |
+| Where the protocol ends | At the gateway: the satellite is part of the radio channel | On the satellite |
+| Feeder link | Carries the user signals, so the satellite must see a gateway (or relay through ISLs) | Carries packets, can use a different air interface |
+| Uplink and downlink noise | Add up (section 5) | Separate: each hop is decoded on its own |
+| Flexibility | Any waveform, upgradeable on the ground | Fixed by the on-board processor, or software-defined |
+| Examples | Most GEO TV and VSAT satellites, 3GPP Rel-17 NTN | Iridium, Starlink, many new constellations, 3GPP Rel-19 NTN with a gNB on board |
+
+**Store and forward** is a regenerative mode for sparse constellations: the satellite receives messages while it passes over devices, stores them and delivers them when it passes over a ground station (section 12).
+
+### Beams and frequency reuse
+
+A satellite covers its footprint with one wide beam or many **spot beams**. Spot beams have more gain (so smaller terminals) and reuse the same spectrum in non-adjacent beams, usually with a four-color pattern (two frequency halves times two polarizations). **High-throughput satellites** (HTS) use tens to hundreds of Ka-band spot beams and reach hundreds of Gb/s; very high-throughput satellites reach about 1 Tb/s. **Beam hopping** moves capacity between beams in time to follow demand.
+
+Beams can be formed by a reflector with many feeds or by a **phased array** that steers beams electronically. LEO satellites with phased arrays can keep a beam on a fixed area of the ground while they pass (**earth-fixed** beams), or let beams sweep the ground with the satellite (**earth-moving** beams).
+
+### Gateways and inter-satellite links
+
+A transparent LEO satellite must see a gateway and a user at the same time, which needs gateways every 1,000 to 2,000 km over land, and leaves the oceans uncovered. **Inter-satellite links** remove that constraint: Iridium links its satellites with Ka-band crosslinks; Starlink with lasers. Traffic then flies across the constellation to a gateway near its destination. ISLs also allow a system to land traffic in a chosen country, which matters for regulation and lawful interception.
+
+### Terminals
+
+| Terminal antenna | Gain | Pointing | Typical use |
+|---|---|---|---|
+| Patch, helix, quadrifilar helix | 0 to 5 dBi | None, needs sky view | L/S-band IoT, handhelds, NTN devices |
+| Fixed dish (offset parabolic) with an LNB and a BUC | 30 to 45 dBi | Installed once (GEO) | VSAT, TV reception |
+| Tracking dish | 30 to 45 dBi | Motorized: ships, inclined-orbit GEO, MEO | Maritime VSAT, MEO |
+| Flat phased array | 30 to 35 dBi | Electronic, follows LEO satellites | LEO broadband (Starlink, OneWeb, Amazon Leo), ESIM |
+
+A VSAT outdoor unit has an **LNB** (low-noise block downconverter: the receive amplifier and a downconversion to an intermediate frequency of about 950 to 2,150 MHz on the coax) and a **BUC** (block upconverter: the transmit side). The indoor unit is the modem.
+
+---
+
+## 8. Air interfaces: DVB-S2, DVB-S2X, DVB-RCS2 and proprietary systems
+
+### DVB-S2 and DVB-S2X: the forward link
+
+**DVB-S2** (ETSI EN 302 307-1) is the forward link (gateway to terminals) of almost every TV satellite and most VSAT networks. It sends a continuous carrier of **frames** each protected by LDPC and BCH codes (normal frames of 64,800 bits, short frames of 16,200), with QPSK, 8PSK, 16APSK or 32APSK modulation, roll-off 0.35, 0.25 or 0.20, and optional pilots for phase tracking. Each frame can use its own MODCOD:
+
+- **CCM** (constant coding and modulation): one MODCOD for everyone, as in TV broadcasting.
+- **VCM** (variable): a MODCOD per service.
+- **ACM** (adaptive): a MODCOD per frame, chosen from the reports of each terminal, so terminals in clear sky get dense MODCODs while those in rain get robust ones.
+
+Ideal thresholds from the standard's performance table (AWGN, normal frames, quasi error-free); real modems need 0.5 to 1 dB more:
+
+| MODCOD | Spectral efficiency (bit/s/Hz) | Es/N0 needed |
+|---|---|---|
+| QPSK 1/4 | 0.49 | −2.4 dB |
+| QPSK 1/2 | 0.99 | 1.0 dB |
+| QPSK 3/4 | 1.49 | 4.0 dB |
+| 8PSK 2/3 | 1.98 | 6.6 dB |
+| 8PSK 3/4 | 2.23 | 7.9 dB |
+| 16APSK 3/4 | 2.97 | 10.2 dB |
+| 16APSK 5/6 | 3.30 | 11.6 dB |
+| 32APSK 4/5 | 3.95 | 13.6 dB |
+
+Throughput = symbol rate × spectral efficiency: 30 Mbaud of 32APSK 4/5 carries about 118 Mb/s.
+
+**DVB-S2X** (EN 302 307-2) extends it: finer MODCOD steps up to 256APSK, roll-offs of 0.15, 0.10 and 0.05, **very low SNR** MODCODs down to about −10 dB Es/N0 for mobile and small terminals, channel bonding and a **superframe** structure that supports beam hopping.
+
+IP over DVB-S2 travels either in MPEG transport streams (MPE or ULE encapsulation, inherited from TV) or, more efficiently, in **GSE** (Generic Stream Encapsulation, ETSI TS 102 606).
+
+### DVB-RCS2: the return link
+
+**DVB-RCS2** (ETSI EN 301 545) is the standard return link (terminals to gateway) of interactive VSAT networks: **MF-TDMA**, a set of carriers divided into time slots. A terminal logs on, is synchronized by the hub, and requests capacity: constant rate assignment (CRA) for steady traffic, rate-based (RBDC) and volume-based (VBDC) dynamic capacity for bursts, plus random access slots for small packets. Each request and grant costs a round trip, so the first packet of a burst on a GEO return link can wait a second or more: a reason for PEPs and for keeping a little CRA.
+
+Many VSAT vendors use proprietary return links (and sometimes forward links) instead; the system works the same way.
+
+### Proprietary systems
+
+Most mobile, IoT and LEO broadband systems use their own air interfaces, documented only to partners:
+
+| System | Air interface (public outline) |
+|---|---|
+| Iridium | L-band, TDMA/FDMA with time-division duplex in 1,616 to 1,626.5 MHz, 48 beams per satellite, Ka-band crosslinks. SBD for messages, Certus for IP up to about 700 kb/s |
+| Inmarsat/Viasat L-band | GEO, BGAN shared-channel IP up to about 500 kb/s, IoT message services |
+| Globalstar | CDMA, bent-pipe LEO; simplex devices only transmit (STX3-type modules) |
+| Starlink | Ku-band OFDM user links with phased arrays, Ka gateways, laser ISLs; details unpublished |
+| Argos/Kinéis | 401 MHz uplinks, simple low-power messages received by LEO satellites |
+
+From a device's point of view these are black boxes behind a modem or a terminal; what matters is the service they expose (section 14).
+
+### Receiving DVB-S2 on Linux
+
+Linux has a DVB subsystem (`/dev/dvb/adapterN/{frontend0,demux0,dvr0,net0}`) driving PCIe and USB satellite tuners. It is used for TV, for receiving IP data broadcast over satellite, and for lab work. With a **universal LNB** (local oscillators at 9.75 and 10.6 GHz), the receiver selects the polarization by the LNB supply voltage (13 V vertical, 18 V horizontal) and the band with a 22 kHz tone, and switches between dishes or LNBs with DiSEqC commands on the coax (**Illustrative**, v4l-utils tools):
+
+```
+# dvb-fe-tool -a 0                                # frontend capabilities: delivery systems, symbol rates
+# dvbv5-scan -l UNIVERSAL -o channels.conf initial-transponders.conf
+# dvbv5-zap -l UNIVERSAL -c channels.conf -m "SOME CHANNEL"   # tune, show lock, signal and C/N
+```
+
+For IP data, `dvbnet` creates a `dvbN_0` network interface fed by MPE or ULE on a given PID. GSE needs user-space tools. Satellite TV reception isn't otherwise the subject of this note.
+
+---
+
+## 9. IP over satellite: TCP, PEPs, QUIC and addressing
+
+### Delay and TCP
+
+A sender can only have one window of unacknowledged data in flight per round trip, so a single TCP flow needs a window of at least the **bandwidth-delay product**:
+
+| Link | Rate | Round trip | BDP |
+|---|---|---|---|
+| GEO VSAT | 50 Mb/s | 600 ms | 3.75 MB |
+| GEO HTS | 200 Mb/s | 650 ms | 16 MB |
+| LEO broadband | 200 Mb/s | 40 ms | 1 MB |
+| NB-IoT NTN, GEO | 1 kb/s | 1 to 3 s | A few hundred bytes |
+
+- **Windows.** Linux autotunes receive and send buffers up to `tcp_rmem` and `tcp_wmem` maximums (6 MB and 4 MB by default): enough for a LEO link, short of a fast GEO link (section 19).
+- **Slow start** doubles the window every round trip from 10 segments. Reaching 3.75 MB takes about 8 round trips: 5 seconds on GEO. Short transfers never leave slow start.
+- **Handshakes cost round trips:** TCP (1), TLS 1.3 (1 more), an HTTP request (1 more). Fetching one small resource over a fresh connection takes about 3 round trips, close to 2 seconds on GEO. TLS 1.2 adds another; DNS adds one per lookup.
+- **Loss** is read as congestion by loss-based congestion control (CUBIC, the Linux default), which halves its window. LEO links lose packets in bursts at satellite changes; measurement studies find **BBR** keeps more throughput there (rule of thumb).
+
+### Performance-enhancing proxies
+
+GEO VSAT systems hide the delay with **PEPs** (RFC 3135): the terminal and the gateway terminate TCP locally, acknowledge immediately, and carry the data between them with a protocol tuned for the satellite. Web acceleration adds prefetching. PEPs only work on TCP they can see:
+
+- **Encrypted tunnels** (IPsec, WireGuard, OpenVPN) hide TCP from the PEP: a site VPN over GEO runs at raw TCP speed unless the PEP runs inside the tunnel, or the VPN carries little traffic.
+- **QUIC** (RFC 9000) is encrypted, so PEPs can't split it. QUIC saves the handshake round trips itself (one round trip, zero with resumption) but its congestion control still faces the BDP. Some VSAT networks rate-limit or block QUIC to push browsers back to TCP.
+
+LEO broadband needs no PEP: the delay is terrestrial.
+
+### MTU, NAT and addresses
+
+- **MTU.** Some satellite terminals and tunnels have an MTU below 1500; path MTU discovery fails when ICMP is filtered (connections hang after the handshake). Clamp TCP MSS on the router and enable `tcp_mtu_probing` (section 19).
+- **CGNAT.** Consumer satellite broadband usually gives a private IPv4 address behind carrier-grade NAT (Starlink residential: an address in `100.64.0.0/10`), so nothing can connect in over IPv4. Either use IPv6 (Starlink delegates a `/56` with DHCPv6 prefix delegation, at the time of writing), a static-IP business plan, or an outbound tunnel to a server you control (section 19).
+- **NAT timeouts.** UDP mappings in CGNAT expire after tens of seconds to minutes; MQTT, WireGuard and CoAP observers need keepalives shorter than the timeout.
+- **DNS.** Each lookup costs a round trip: run a caching resolver on the site router.
+- **IoT over NTN** carries small IP packets (UDP, CoAP) or non-IP data; the IP and transport headers alone (28 bytes for IPv4 and UDP) can be larger than the payload (section 21).
+

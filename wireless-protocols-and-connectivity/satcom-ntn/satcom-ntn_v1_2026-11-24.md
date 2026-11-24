@@ -614,3 +614,128 @@ LEO broadband needs no PEP: the delay is terrestrial.
 - **DNS.** Each lookup costs a round trip: run a caching resolver on the site router.
 - **IoT over NTN** carries small IP packets (UDP, CoAP) or non-IP data; the IP and transport headers alone (28 bytes for IPv4 and UDP) can be larger than the payload (section 21).
 
+---
+
+## 10. NTN in 3GPP: releases, NR-NTN and IoT-NTN, bands
+
+### From studies to features
+
+3GPP studied satellites for several releases before specifying them:
+
+| Release | Document or feature | Content |
+|---|---|---|
+| Rel-15 | TR 38.811 | Study: NTN scenarios, orbits, channel models (delay, Doppler, path loss, shadowing) |
+| Rel-16 | TR 38.821 | Study: solutions for NR over NTN (timing advance, Doppler, HARQ, mobility) and the calibration cases used in section 5 |
+| Rel-17 | TR 23.737, TR 36.763 | Studies: core network aspects of satellite access; NB-IoT and LTE-M over NTN |
+| **Rel-17** (2022) | **NR-NTN** and **IoT-NTN** | First normative features: transparent payloads, GEO and LEO (MEO implicitly), FDD in the L and S bands, UEs with GNSS, earth-fixed tracking areas |
+| Rel-18 (2024) | NR-NTN and IoT-NTN enhancements | NR: Ka-band bands for VSAT-like and moving terminals, coverage enhancements, network-verified UE location, NTN-terrestrial mobility, RACH-less handover and satellite switch with resynchronization. IoT: HARQ feedback disabling, improved GNSS operation during long connections, mobility enhancements, discontinuous coverage |
+| Rel-19 (2025) | NTN evolution | Regenerative payloads with a gNB on board, RedCap devices over NTN, downlink coverage and uplink capacity enhancements, store and forward for IoT-NTN |
+| Rel-20 | 5G-Advanced and the 6G study | NTN is part of the 6G design from the start |
+
+**Two flavors.** **NR-NTN** adapts NR for smartphones, vehicles and VSAT-like terminals. **IoT-NTN** adapts NB-IoT and LTE-M (eMTC), connected to the EPC (and 5GC through the usual CIoT options): the first commercial NTN services, mostly over GEO L-band satellites, are IoT-NTN. Both keep the protocol stack of the [cellular note](../cellular/cellular_v1_2026-11-02.md#4-architecture-and-protocol-stacks-eps-5gs-nsa-and-sa); what changes is timing, frequency, timers, mobility, and how the network knows where the device is.
+
+### Architecture
+
+In Rel-17, the satellite is **transparent**: the gNB (or eNB) is on the ground behind a gateway, and the satellite with its gateway is a radio repeater called the **NTN payload**; the gateway, the feeder link, the satellite and the service link together form the **satellite access node** in RF specifications. The base station sees UEs at hundreds of milliseconds and serves cells that are satellite beams.
+
+```
+ UE ── service link ── satellite (transparent) ── feeder link ── NTN gateway ── gNB/eNB ── 5GC/EPC
+       Doppler and delay                          Doppler and delay
+       compensated by the UE                      compensated by the network
+```
+
+From Rel-19, the gNB can be on the satellite (**regenerative**): the radio protocol ends in space and the feeder link carries the N2/N3 or Xn interfaces.
+
+### UE types
+
+| UE type | Antenna and power | Bands | Notes |
+|---|---|---|---|
+| Handheld, IoT | 0 dBi omnidirectional, 23 dBm (power class 3) | L, S (FR1) | Smartphones, trackers, sensors. Closes the link only at low bandwidth (section 5) |
+| VSAT, ESIM | Directional, pointed or phased array | Ka (Rel-18 FR2-NTN) | Fixed and moving platforms: buildings, vehicles, ships, aircraft |
+
+### Bands
+
+NTN bands are numbered from 256 downwards for FR1 (LTE band numbers for IoT-NTN mirror NR's) and from 510 upwards for Ka-band:
+
+| Band | Uplink | Downlink | Release | Notes |
+|---|---|---|---|---|
+| n255 / B255 | 1,626.5 to 1,660.5 MHz | 1,525 to 1,559 MHz | Rel-17 | L-band MSS (Inmarsat/Viasat, Ligado) |
+| n256 / B256 | 1,980 to 2,010 MHz | 2,170 to 2,200 MHz | Rel-17 | S-band 2 GHz MSS |
+| n254 | 1,610 to 1,626.5 MHz | 2,483.5 to 2,500 MHz | Rel-18 | Big LEO L/S-band (Globalstar's allocation) |
+| n510 to n512 | Around 27.5 to 30 GHz | Around 17.3 to 20.2 GHz | Rel-18 | Ka-band for VSAT and ESIM UEs, split by region (FR2-NTN, TS 38.101-5) |
+
+All Rel-17 NTN bands are **FDD**. Terrestrial bands used from space by direct-to-device services are not NTN bands: they are terrestrial bands with the satellite pretending to be a tower (section 13).
+
+### Where it is specified
+
+| Topic | NR-NTN | IoT-NTN |
+|---|---|---|
+| Overall description | TS 38.300 (NTN clause) | TS 36.300 (NTN clause) |
+| UE radio requirements | TS 38.101-5 | TS 36.102 |
+| Satellite access node radio requirements | TS 38.108 | TS 36.108 |
+| Physical layer timing and procedures | TS 38.211, 38.213, 38.214 | TS 36.211, 36.213 |
+| MAC, RLC, PDCP | TS 38.321, 38.322, 38.323 | TS 36.321, 36.322, 36.323 |
+| RRC, system information | TS 38.331 (SIB19) | TS 36.331 (SIB31, SIB32) |
+| Idle mode | TS 38.304 | TS 36.304 |
+| Architecture, NAS | TS 23.501, TS 24.501 | TS 23.401, TS 24.301 |
+| Service requirements | TS 22.261 | TS 22.261, TS 22.368 |
+
+---
+
+## 11. Radio adaptations: timing advance, Doppler, scheduling offsets and HARQ
+
+A cellular uplink is scheduled to the slot and must arrive aligned at the base station to within a fraction of the cyclic prefix. On a terrestrial cell the round trip is under a millisecond and the base station measures each UE's timing advance during random access. Through a satellite, the round trip is up to 541 ms and drifts by tens of µs per second: the UE must **know** most of its delay and Doppler before it transmits anything. NTN does it with **GNSS + ephemeris**.
+
+### What the UE computes
+
+```
+                         ephemeris (SIB19 / SIB31) + epoch time
+                                        │
+ GNSS: UE position, time ──▶ satellite position and velocity at time t
+                                        │
+              ┌─────────────────────────┼─────────────────────────┐
+              ▼                                                   ▼
+ service link delay ──▶ UE-specific TA               radial velocity ──▶ service-link Doppler
+              +                                                   │
+ common TA (ta-Common, drift, drift variation)                    ▼
+ broadcast by the network: the feeder link part      pre-compensate the uplink carrier,
+              │                                      track the downlink
+              ▼
+ total timing advance applied to every uplink, updated continuously
+```
+
+**Timing advance.** In NR-NTN the UE applies (TS 38.211, TS 38.213):
+
+```
+T_TA = (N_TA + N_TA,offset + N_TA,adj^common + N_TA,adj^UE) × Tc
+```
+
+- `N_TA,adj^UE`: the **UE-specific** part, the round trip of the service link, computed from the UE's GNSS position and the satellite's position from the ephemeris.
+- `N_TA,adj^common`: the **common** part, broadcast by the network as `ta-Common` with its first and second derivatives (`ta-CommonDrift`, `ta-CommonDriftVariation`). It covers the delay between the satellite and the **reference point** where the network aligns uplink timing (often the gNB, so the feeder link).
+- `N_TA`: the usual closed-loop part, corrected by timing advance commands from the network.
+- The UE updates the open-loop parts continuously as the satellite moves, without waiting for commands.
+
+**Frequency.** The UE pre-compensates the **service-link** Doppler on its uplink and tracks the downlink; the network handles the feeder link. After pre-compensation the residual offset at the base station is within what a terrestrial receiver handles.
+
+**Validity.** The broadcast ephemeris and common TA are valid for `ntn-UlSyncValidityDuration` (seconds to minutes) after their epoch. When the validity expires, the UE must reread the system information before transmitting again; in connected mode it considers uplink synchronization lost. IoT devices also hold a **GNSS position validity**: a device that has moved or whose fix is too old must take a new fix (section 12).
+
+### Scheduling offsets: K_offset and K_mac
+
+Terrestrial timing relations ("the PUSCH scheduled by a DCI in slot n is sent in slot n + k2", "HARQ feedback for a PDSCH in slot n is sent in slot n + k1") assume a short round trip. NTN adds a **cell-specific offset `K_offset`** (`cellSpecificKoffset`, up to over a thousand slots) to these relations, so that the UE's uplink, sent early by its large timing advance, still lands in the slot the base station expects. A UE-specific value can refine it in connected mode. **`K_mac`** delays when MAC CE commands take effect where the uplink and downlink frame timings aren't aligned at the base station.
+
+### HARQ, random access and timers
+
+| Mechanism | Terrestrial | NTN |
+|---|---|---|
+| HARQ processes | NR: up to 16 | NR-NTN: up to 32, to keep the pipe full over a long round trip |
+| HARQ feedback | Always on | Can be **disabled** per HARQ process (NR-NTN Rel-17, IoT-NTN Rel-18): the base station retransmits blindly or relies on RLC ARQ, since waiting a GEO round trip per transport block wastes the channel |
+| HARQ RTT timers (DRX) | A few ms | Extended by the UE-to-base-station round trip |
+| Random access response window | Starts right after the preamble | Starts after the UE-to-base-station round trip |
+| Contention resolution timer, SR prohibit | Short | Started later or extended by the round trip |
+| RLC t-Reassembly, PDCP t-Reordering and discard timers | Tens of ms | Longer values allowed |
+| Measurement timing (SMTC) | One per frequency | Several, since neighbor satellites are at different delays |
+
+**Random access** keeps the terrestrial preamble formats: the UE pre-compensates timing and frequency, so the residual error fits the terrestrial preamble design.
+
+**IoT-NTN specifics.** NB-IoT and LTE-M keep their small HARQ process counts (NB-IoT has one or two) and their repetitions, which can last seconds. A long repeated uplink is split into **segments** at whose boundaries the UE updates its timing and frequency pre-compensation, because the satellite has moved meanwhile. Low-cost IoT modems often can't run GNSS and the cellular radio at the same time: they take a fix, then connect, and Rel-18 lets the network give the UE a gap to refresh GNSS during a long connection.
+

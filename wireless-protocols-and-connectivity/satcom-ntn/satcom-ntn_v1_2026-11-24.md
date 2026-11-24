@@ -1468,3 +1468,235 @@ A policy on the example board (**Illustrative**):
 
 Log which bearer carried each message, with its cost, so that monthly bills can be explained.
 
+---
+
+## 22. Antennas, sky view, coexistence and power
+
+### Sky view
+
+- **L/S-band devices** (Iridium, NB-IoT NTN, GNSS) need a clear view of most of the sky for LEO, or of the satellite's direction for GEO (south and up at mid-northern latitudes). Indoors they rarely work; near a window they work some of the time. Put the antenna on the roof, above the enclosure, away from walls and metal, horizontal and facing up.
+- **Trees** cost 5 to 20 dB at L-band and more when wet: a device under a canopy may only get through on some passes.
+- **Vehicles and boats:** the roof is the ground plane of a patch; masts and superstructures shadow parts of the sky.
+- **Broadband terminals** need an unobstructed cone of sky (the operator's app maps obstructions); a GEO dish needs one clear line to its satellite.
+
+Survey the site: record the horizon (a photo with a compass and inclinometer, or the operator's app), and run the device for a day on site while logging signal, sessions and passes before committing to an installation.
+
+### Device antennas
+
+| Antenna | Pattern | Use |
+|---|---|---|
+| Ceramic patch, right-hand circular | Upward hemisphere, weaker near the horizon | GNSS, Iridium and NTN L-band on a ground plane |
+| Quadrifilar helix | Hemispherical, good to low elevations, no ground plane needed | Iridium, Argos, demanding mobile use |
+| Combined GNSS and L-band antennas | Two elements or one wideband element with filters | Saves space; check the isolation |
+
+Most satellite systems use **right-hand circular polarization**; a linear antenna loses 3 dB, a left-hand one much more. Cable loss at 1.6 GHz is significant (several dB in a few meters of thin coax): keep cables short or use low-loss cable, and remember that the uplink loses it too.
+
+### Coexistence with GNSS
+
+GNSS signals arrive at about −130 dBm around 1,559 to 1,610 MHz; an L-band satellite transmitter next to the receiver sends watts at 1,610 to 1,660 MHz, a few tens of MHz away:
+
+- The transmitter **desensitizes** or saturates the GNSS front end while it transmits, and can damage it if isolation is poor.
+- Its **noise** falls into the GNSS band unless filtered.
+- Mitigations: antenna separation and isolation (20 to 30 dB or more), a GNSS front-end filter with steep rejection above 1,610 MHz, a transmit filter, and **time sharing**: many NTN modules do it internally (fix, then transmit), and Iridium modules provide a signal to blank the GNSS receiver during bursts.
+
+The same applies to terrestrial cellular modems on the same board (LTE band 13 and 14 harmonics fall near GNSS L1) and to Wi-Fi and Bluetooth near the antennas: test with everything transmitting.
+
+### Power
+
+Energy per message dominates battery life. An example budget for the reservoir (**Illustrative**: assumed values, measure your own modules):
+
+| Activity | Assumed power and duration | Energy |
+|---|---|---|
+| GNSS warm fix | 0.1 W for 30 s | 3 J |
+| NB-IoT NTN wake, attach or resume, send 22 bytes, release (GEO) | 0.5 W average for 20 s, with 23 dBm bursts | 10 J |
+| Iridium SBD session | 1 W average for 20 s | 20 J |
+| PSM and board sleep | 1 mW for the rest of the day | 86 J per day |
+
+Four NTN reports a day and one Iridium alarm a week come to about 140 J a day, about 14 Wh a year: a few lithium D cells last years, if the sleep current really is 1 mW. Retries in bad conditions multiply the per-message energy: budget for the worst month, not for the average.
+
+A **broadband terminal** is another scale: tens of watts continuously, so 1 kWh a day or more. On a solar site in winter at 45° N with one to two peak sun hours, that means a kilowatt of panels and a large battery; or power the terminal on a schedule (a maintenance window a day) and keep telemetry on the IoT bearers.
+
+Supply design: satellite transmitters draw bursts of an ampere or more (section 17); a supply or battery with high internal resistance at low temperature browns out the board during bursts. Hold up the rail with capacitors or supercapacitors, and test at the coldest temperature the site sees.
+
+---
+
+## 23. Production: regulation, certification, operators and fleets
+
+### Radio regulation
+
+- **EU:** a device with a satellite transmitter is radio equipment under the **Radio Equipment Directive** (2014/53/EU): it needs a conformity assessment against harmonised standards for each radio (for example ETSI EN 301 441 and EN 301 444 for mobile earth stations in the MSS bands, EN 303 413 for GNSS receivers, the EN 301 489 series for EMC, EN 62368-1 for safety, EN 62311 or similar for exposure), the CE marking, a declaration of conformity and technical documentation. A pre-certified module helps but doesn't certify the product: antennas, enclosure and coexistence change the results.
+- **US:** satellite earth stations fall under **FCC Part 25**, with equipment authorization of the device or of a module used within its grant conditions, and Part 15 for unintentional emissions.
+- **Elsewhere:** national type approval, import permits, and in some countries restrictions or bans on satellite terminals. Check each country of deployment and of transit.
+- **Export controls:** some satellite equipment and cryptography fall under dual-use export rules (EU Regulation 2021/821, US EAR). Check classifications before shipping abroad.
+
+### Operator and industry certification
+
+- **Proprietary systems:** satellite operators certify devices that integrate their modules (Iridium's partner programs, for example) and may require tests of the antenna installation and the software's behavior (retry rates, power-on sequences).
+- **3GPP NTN:** cellular certification (GCF, PTCRB) and operator acceptance programs extend to NTN as test cases are added; NTN operators publish their own lists of approved modules and firmware versions.
+- **Retry behavior** is part of every certification: a fleet that retries in lockstep after an outage looks like an attack. Use randomized exponential backoff and caps.
+
+### Subscriptions and identities
+
+- **Iridium:** each modem is activated by IMEI through a service provider, with a plan and a delivery destination (e-mail, DirectIP address). Plan the activation and deactivation process for production and returns.
+- **NTN:** a SIM or eSIM profile with NTN access in its subscription, often from an IoT connectivity provider combining terrestrial and NTN roaming. Check the PLMN lists, the APN, NIDD or IP delivery, and the per-country availability.
+- **Broadband:** a terminal account per site, sometimes with restrictions on use in motion or across borders.
+- Keep identities (IMEIs, ICCIDs, terminal IDs) and the keys of section 21 in the factory database, never in source code.
+
+### Fleet operations
+
+- **Telemetry about the link** in every report (section 18): fix times, attach times, signal, failures by cause, bearer used, retries, battery voltage during bursts.
+- **Costs:** alarms on unexpected message rates per device: a firmware bug that retries in a loop over satellite costs real money in hours.
+- **Firmware updates** don't fit through satellite IoT bearers (a 1 MB image over 270-byte SBD downlinks is about 3,700 billed sessions). Update over local links, Wi-Fi, terrestrial cellular or the broadband terminal, and keep only configuration changes on the satellite IoT downlink.
+- **Time and position** from GNSS in every log line; logs only make sense with a correct clock.
+
+---
+
+## 24. Troubleshooting
+
+### Method
+
+Work along the path of a message and don't go further until a step passes:
+
+```mermaid
+flowchart TD
+    A{"Power and antenna OK?<br/>supply holds during bursts,<br/>antenna connected, sky view"} -->|no| PWR["Supply, brownouts, cable,<br/>connector, obstruction"]
+    A -->|yes| B{"GNSS fix?<br/>3D, recent, plausible"}
+    B -->|no| GNSS["Antenna, sky view, coexistence,<br/>backup supply, jamming"]
+    B -->|yes| C{"Satellite or cell seen?<br/>CSQ, network available,<br/>CEREG searching vs registered"}
+    C -->|no| SAT["Coverage at this time, horizon,<br/>bands and RAT configured,<br/>module firmware"]
+    C -->|yes| D{"Session or registration<br/>accepted?"}
+    D -->|no| SUB["Subscription, activation,<br/>reject cause, location (cause 78),<br/>PLMN and APN"]
+    D -->|yes| E{"Data reaches<br/>the server?"}
+    E -->|no| DEL["Delivery config (DirectIP,<br/>APN, NIDD), firewall, server logs,<br/>payload decoding"]
+    E -->|yes| F{"Reliable, cheap,<br/>battery as expected?"}
+    F -->|no| Q["Retries, passes and timing,<br/>message sizes, PSM, GNSS time,<br/>current profile"]
+```
+
+| Fault domain | Evidence | Tools |
+|---|---|---|
+| Power and RF hardware | Resets during sessions, sessions failing at the transmit step | Oscilloscope on the rail, current probe, antenna and cable checks |
+| GNSS | No fix, long fixes, position jumps | `cgps`, `gpspipe -w`, `chronyc sources`, the receiver's own status messages |
+| Satellite visibility | Weak signal, sessions working only at some hours | `AT+CSQ`, network-available pin, pass predictions (section 20), the site's horizon |
+| Network access | Registration denied, sessions rejected | `+CEREG` with causes, `+SBDIX` statuses, the operator's portal |
+| Delivery | Sent according to the device, missing on the server | Operator portal and delivery logs, server logs, firewall counters |
+| IP over broadband | Slow, stalls, hangs after connect | `ping`, `mtr`, `ss -ti` (RTT, cwnd, retransmissions), `tcpdump`, MTU tests (`ping -M do -s 1372`) |
+
+**Look at both ends:** the device's log with GNSS time, the operator's view (portal, CDRs, delivery logs) and the server's log for the same minutes.
+
+### Symptoms
+
+| Symptom | Where to look first |
+|---|---|
+| Works on the bench by the window, fails in the enclosure | Antenna inside or under metal, cable loss, polarization, enclosure detuning the antenna; move the antenna outside |
+| Iridium sessions fail with status 32 or 18 at some hours | Obstructed horizon in the direction of the passes; retry later and record success by time of day |
+| Iridium session succeeds but the server gets nothing | Delivery destination not configured for the IMEI, DirectIP firewall, server closed the connection early; check the provider's delivery log |
+| NTN module stays at `+CEREG: 2` | No GNSS fix (or GNSS not enabled for NTN), NTN RAT or bands not selected, no NTN coverage at this location, firmware without NTN, antenna for the wrong band |
+| NTN registration denied | The reject cause: subscription without NTN, PLMN not allowed at this location (cause 78), roaming not allowed, wrong APN |
+| NTN works, then fails after hours of sleep | Stale GNSS position or ephemeris, PSM timers granted shorter than expected, periodic TAU missed in a coverage gap |
+| Each report takes minutes and drains the battery | Cold GNSS starts (backup supply missing), full attach instead of resume, no release assistance, retries |
+| Duplicates on the server | Lost acknowledgments followed by retries: deduplicate by sequence number (section 21) |
+| Broadband site: web pages slow, ping fine | Bufferbloat (latency under load), DNS without a local cache, PMTUD black hole |
+| Connections through the tunnel hang after the handshake | MTU too large for the path: lower the WireGuard MTU, clamp MSS |
+| Inbound connections to the site never work | CGNAT: use IPv6 with firewall rules or the outbound tunnel (section 19) |
+| Periodic outages of a few seconds on LEO broadband | Obstructions (check the terminal's obstruction map), satellite changes, or the terminal rebooting for updates |
+| GNSS position wrong by kilometers | Jamming or spoofing, multipath at a bad antenna location; compare with the known position |
+
+### Messages and what they mean
+
+| Message | Meaning |
+|---|---|
+| `+SBDIX:` MO status 0 to 4 | Session succeeded (1: MT message too big, 2: location update rejected) |
+| MO status 10, 13 | The gateway reported the session did not complete in time or was incomplete: weak link, retry |
+| MO status 15 | Access denied: the IMEI is not activated or the account is suspended |
+| MO status 17, 18, 19 | Gateway not responding, RF connection lost, link failure: mostly sky view and signal |
+| MO status 32 | No network service: no satellite in view at the moment |
+| MO status 33, 34 | Antenna fault, radio disabled |
+| MO status 35, 36, 38 | Modem busy, or try later (registration and traffic management back-off) |
+| `+CEREG: 0` | Not registered, not searching: radio off, RAT or bands not enabled, or given up |
+| `+CEREG: 2` | Searching: no suitable cell yet (GNSS, coverage, bands) |
+| `+CEREG: 3` with cause 11, 12, 13, 15 | PLMN not allowed, tracking area not allowed, roaming not allowed in this tracking area, no suitable cells in tracking area: subscription and roaming agreements |
+| Cause 78 | PLMN not allowed to operate at the present UE location (NTN, section 13) |
+| `+CEREG: 1` or `5` | Registered (home or roaming): look further along the path |
+
+### A useful bug report
+
+The system and service (Iridium SBD, NTN operator and plan, broadband operator), module or terminal model and firmware version, the site's position and horizon, the antenna and cable, the device's log for the period with GNSS time (fix times, signal, CEREG and SBDIX lines, retries), the operator's view of the same period (portal, delivery logs), the server's log, and the current profile of a failing attempt if power is suspected.
+
+---
+
+## 25. Not covered here
+
+Topics for separate notes:
+
+- **Driving cellular modems from Linux in depth:** USB composition, QMI and MBIM, ModemManager and NetworkManager, firmware updates of modules, eSIM management.
+- **GNSS in depth:** constellations and signals, RTK and precise positioning, timing receivers, holdover, interference detection.
+- **Receiving satellites with an SDR:** weather satellites, Iridium and Inmarsat signals, amateur satellites, SatNOGS ground stations ([SDR note](../../hardware/sdr/sdr_v1_2026-11-12.md)).
+- **Spacecraft and CubeSat engineering:** CCSDS protocols, TT&C, on-board computers and Linux in space.
+- **RF and antenna design:** patches, helices and phased arrays, filters and coexistence ([hardware/rf/](../../hardware/rf/)); modulation and coding ([hardware/baseband/](../../hardware/baseband/)).
+- **Satellite TV** and DVB reception beyond the basics of section 8.
+- **High-altitude platforms** (HAPS) and drones as base stations, part of NTN in 3GPP but not of this note.
+- **LoRa from space** ([LoRa and LoRaWAN for Embedded Linux Engineers](../lora/lora_v1_2026-11-22.md#satellites)), **cellular** in general ([Cellular Protocols](../cellular/cellular_v1_2026-11-02.md)), **Wi-Fi** ([Wi-Fi note](../wifi/wifi_v1_2026-11-01.md)) and **Bluetooth** ([Bluetooth note](../bluetooth/bluetooth_v1_2026-11-21.md)).
+
+---
+
+## References
+
+3GPP specifications and reports (<https://www.3gpp.org/specifications>):
+
+| Topic | Document |
+|---|---|
+| NTN scenarios and channel models | TR 38.811 |
+| Solutions for NR over NTN, calibration link budgets, round trips | TR 38.821 |
+| NB-IoT and LTE-M over NTN | TR 36.763 |
+| Architecture aspects of satellite access | TR 23.737 |
+| Overall descriptions, NTN clauses | TS 38.300, TS 36.300 |
+| UE and satellite access node radio requirements | TS 38.101-5, TS 38.108, TS 36.102, TS 36.108 |
+| Physical layer timing (TA, K_offset) | TS 38.211, TS 38.213, TS 38.214, TS 36.211, TS 36.213 |
+| MAC and RRC (SIB19, SIB31, SIB32) | TS 38.321, TS 38.331, TS 36.321, TS 36.331 |
+| Idle mode procedures | TS 38.304, TS 36.304 |
+| Satellite RAT types, discontinuous coverage | TS 23.501, TS 23.401 |
+| NAS, reject causes | TS 24.501, TS 24.301 |
+| AT commands | TS 27.007 |
+| Overview article | Xingqin Lin and coauthors, *5G from Space: An Overview of 3GPP Non-Terrestrial Networks*, IEEE Communications Standards Magazine, 2021 |
+
+ETSI (<https://www.etsi.org>) and DVB (<https://dvb.org>):
+
+- DVB-S2: EN 302 307-1; DVB-S2X: EN 302 307-2; DVB-RCS2: EN 301 545; GSE: TS 102 606
+- Mobile earth station harmonised standards: EN 301 441, EN 301 444; GNSS receivers: EN 303 413
+
+ITU (<https://www.itu.int>):
+
+- Radio Regulations (allocations, EPFD limits, coordination)
+- ITU-R P.618 (earth-space propagation, rain), P.676 (gases), P.840 (clouds), P.531 (ionosphere), P.681 (land mobile satellite channel), P.837 (rain rates)
+
+IETF:
+
+- RFC 3135 (performance-enhancing proxies), RFC 2488 (TCP over satellite channels), RFC 9000 (QUIC)
+- RFC 7252 (CoAP), RFC 9146 (DTLS connection IDs), RFC 8613 (OSCORE), RFC 9052 (COSE)
+- Documentation and special addresses: RFC 5737, RFC 3849, RFC 6598 (shared address space for CGNAT)
+
+Iridium:
+
+- ISU AT Command Reference, the 9603 developer's guide, the SBD DirectIP guide: from Iridium and its service providers (some providers, such as RockBLOCK's maker, publish developer documentation openly)
+
+Software:
+
+- gpsd: <https://gpsd.io>; chrony: <https://chrony-project.org>; pps-tools
+- Skyfield: <https://rhodesmill.org/skyfield/>; CelesTrak: <https://celestrak.org> (GP data and its usage guidance)
+- LinuxTV DVB API and v4l-utils (`dvbv5-*` tools): <https://www.linuxtv.org>
+- CAKE and `tc-cake(8)`; netem and `tc-netem(8)`; WireGuard: <https://www.wireguard.com>
+- Python `cryptography` (AES-CCM): <https://cryptography.io>; pyserial
+
+Books:
+
+- Gérard Maral, Michel Bousquet, Zhili Sun, *Satellite Communications Systems*, Wiley (6th edition, 2020)
+- Timothy Pratt, Jeremy Allnutt, *Satellite Communications*, Wiley (3rd edition, 2019)
+
+Research:
+
+- François Michel, Martino Trevisan, Danilo Giordano, Olivier Bonaventure, *A First Look at Starlink Performance* (IMC 2022)
+- Mohamed M. Kassem and coauthors, *A Browser-side View of Starlink Connectivity* (IMC 2022)
+
+---
+
+Version 1 · 2026-11-24

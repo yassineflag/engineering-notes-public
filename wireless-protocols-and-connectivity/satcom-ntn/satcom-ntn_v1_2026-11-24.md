@@ -879,3 +879,343 @@ IoT-NTN services launched first, mostly on GEO L-band and S-band capacity, with 
 
 Planned systems include the EU's **IRIS²** and Chinese constellations (Guowang, Qianfan). For an embedded product, a broadband terminal is a box with Ethernet and a power supply: what matters is the IP service behind it (sections 9 and 19), the terminal's power and the plan's terms.
 
+---
+
+## 15. Satellite and Linux: four roles
+
+Linux has no satellite subsystem. A satellite link reaches a Linux system in one of four ways, and each uses ordinary kernel interfaces:
+
+| Role | What Linux sees | Kernel interfaces | Sections |
+|---|---|---|---|
+| **A satellite IoT modem** (Iridium SBD, other message modems) | A UART speaking AT commands; messages, not IP | `serial`/`tty`, GPIOs for power and status | 17 |
+| **An NTN cellular module** | A cellular modem: AT ports, maybe a network interface for IP | USB serial (`option`, `cdc_acm`), `cdc_ether`, `qmi_wwan`, `cdc_mbim`, or a UART; ModemManager | 18 |
+| **A broadband terminal** | An Ethernet link with an IP service behind it | Ethernet, routing, firewall, traffic control | 19 |
+| **A receiver or ground station** | IQ samples or demodulated data from an SDR or a DVB tuner | USB, DVB subsystem, user-space tools | 8, 20 and the [SDR note](../../hardware/sdr/sdr_v1_2026-11-12.md) |
+
+All four need **GNSS** for position and time: NTN modules for timing advance, applications for timestamps and pass predictions, terminals for pointing and regulation (section 16).
+
+**Several bearers on one board.** The example board has Wi-Fi, an NTN module and an Iridium modem, and the site has a broadband terminal. The application decides which bearer carries what, from the cheapest available to the most expensive, and keeps a queue for what can't be sent yet (section 21). IP routing (route metrics, policy routing) handles the IP bearers; message modems are driven by the application itself.
+
+---
+
+## 16. GNSS and time on Linux: gpsd, PPS and chrony
+
+### Hardware and device tree
+
+A GNSS receiver module talks NMEA (and often a binary protocol) on a UART and outputs a **PPS** (pulse per second) whose rising edge marks the start of each UTC second to within tens of nanoseconds. Wire the PPS to a GPIO and describe it in the device tree (**Illustrative**, pins depend on the board):
+
+```dts
+/ {
+    pps {
+        compatible = "pps-gpio";
+        pinctrl-names = "default";
+        pinctrl-0 = <&pinctrl_gnss_pps>;
+        gpios = <&gpio1 18 GPIO_ACTIVE_HIGH>;
+    };
+};
+
+&uart2 {                       /* /dev/ttymxc1 */
+    pinctrl-names = "default";
+    pinctrl-0 = <&pinctrl_uart2>;
+    status = "okay";
+};
+```
+
+Kernel options: `CONFIG_PPS`, `CONFIG_PPS_CLIENT_GPIO`. Check the pulses (from `pps-tools`):
+
+```
+# ppstest /dev/pps0
+source 0 - assert 1795948800.000000312, sequence: 2041 - clear 0.000000000, sequence: 0
+```
+
+Keep the receiver's **backup supply** (`V_BCKP` on many modules) powered from a small battery or supercapacitor: with the almanac, ephemeris, last position and time kept, the next start is a hot start.
+
+### gpsd
+
+`gpsd` reads the receiver and serves the fixes to clients over a socket (and to chrony through shared memory):
+
+```
+# /etc/default/gpsd   (Debian; other distributions use a systemd drop-in)
+DEVICES="/dev/ttymxc1 /dev/pps0"
+GPSD_OPTIONS="-n"          # poll the receiver even without clients, so time stays fresh
+USBAUTO="false"
+```
+
+```
+# systemctl enable --now gpsd
+# cgps -s                                       # interactive view: fix, satellites, DOP
+# gpspipe -w -n 10 | grep TPV                   # JSON position-time-velocity reports
+{"class":"TPV","device":"/dev/ttymxc1","mode":3,"time":"2026-11-24T10:15:00.000Z","lat":45.000012,"lon":6.000034,"altHAE":1512.3,"eph":4.1,...}
+```
+
+`mode` 3 is a 3D fix, 2 a 2D fix, 1 no fix. `eph` is the estimated horizontal error in meters.
+
+### chrony
+
+With gpsd feeding NMEA time into shared memory segment 0, chrony uses it only to number the seconds and takes the precise edge from the PPS:
+
+```
+# /etc/chrony/conf.d/gnss.conf
+refclock SHM 0 refid NMEA offset 0.2 delay 0.2 noselect
+refclock PPS /dev/pps0 lock NMEA refid PPS prefer
+```
+
+```
+# chronyc sources -v
+MS Name/IP address         Stratum Poll Reach LastRx Last sample
+===============================================================================
+#? NMEA                          0   4   377    12   +151ms[ +151ms] +/-  100ms
+#* PPS                           0   4   377    13   -210ns[ -340ns] +/-  150ns
+```
+
+The NMEA `offset` compensates the delay of the sentences after the second starts (tens to hundreds of ms, receiver-dependent); measure it against PPS and adjust. A board without network time at a remote site gets its time from GNSS this way: TLS certificates, logs and pass predictions all depend on it.
+
+### Time to first fix and energy
+
+| Start | Receiver knows | Time to first fix (open sky, rule of thumb) |
+|---|---|---|
+| Cold | Nothing | 25 to 40 s; minutes with weak signals |
+| Warm | Almanac, approximate time and position | 25 to 35 s (must still download ephemeris) |
+| Hot | Valid ephemeris (broadcast ephemeris is valid for about 2 to 4 hours) | 1 to 5 s |
+| Assisted | Ephemeris from the network (A-GNSS) or predicted ephemeris | A few seconds |
+
+An NTN IoT device that sleeps for hours wakes up with stale ephemeris and no network to assist it: each report costs a warm-start fix of tens of seconds of receiver current, often more energy than the transmission. Use predicted-ephemeris features of the receiver where available, skip the fix when the device is known not to have moved (an accelerometer helps), and budget it (section 22).
+
+**Jamming and spoofing.** GNSS interference is common near conflict zones and some borders, and cheap jammers exist. A spoofed position gives an NTN modem a wrong timing advance and Doppler (no access) and the network a wrong country (section 13). Log the fix quality, compare with the last known position, and alarm on jumps.
+
+---
+
+## 17. An Iridium SBD modem on a UART
+
+### Short Burst Data
+
+**SBD** sends a message from the modem's mobile-originated (MO) buffer to the Iridium gateway and, in the same session, picks up a queued mobile-terminated (MT) message. With a 9603-class transceiver: MO up to **340 bytes**, MT up to **270 bytes**, a session of typically 10 to 30 seconds with sky view. The gateway delivers MO messages to your server by e-mail or by **DirectIP** (a TCP connection to your server), and accepts MT messages the same ways. Resellers often add their own web APIs and webhooks. Billing is per message or per block of bytes (often 50-byte units), operator- and plan-dependent.
+
+**Iridium Messaging Transport** (IMT) on newer modules and Certus carries larger messages (up to tens of kB) with a topic-based API; the principles below still apply.
+
+### Wiring
+
+TX, RX, and preferably RTS/CTS, at 3.3 V logic; an **on/off** (enable) pin on a GPIO; the **network available** output to a GPIO (high when a satellite is visible); optionally **ring indicator** for MT alerts. The supply must deliver short transmit bursts of the order of an ampere: many designs use a supercapacitor charged at a limited current. Read the module's developer guide for levels and timing. No kernel driver is needed beyond the UART (`/dev/ttymxc2`).
+
+### A session by hand
+
+Default 19200 baud, commands end in CR (**Illustrative**, from the ISU AT command reference):
+
+```
+# picocom -b 19200 --omap crlf --echo /dev/ttymxc2
+AT
+OK
+ATE0                         echo off (scripts)
+AT&K0                        no RTS/CTS flow control (three-wire UART only; AT&K3 with RTS/CTS)
+AT+CGSN                      IMEI
+<IMEI>
+AT+CSQ                       signal quality 0 to 5 (takes seconds; AT+CSQF returns the last value)
++CSQ:4
+AT+SBDWT=pump ok lvl 73      write a text message to the MO buffer
+OK
+AT+SBDIX                     start a session: send MO, check for MT
++SBDIX: 0, 17, 0, 0, 0, 0
+AT+SBDD0                     clear the MO buffer
+0
+```
+
+`+SBDIX: <MO status>, <MOMSN>, <MT status>, <MTMSN>, <MT length>, <MT queued>`:
+
+| Field | Meaning |
+|---|---|
+| MO status | 0 to 4: success (1: an MT message was too big to deliver, 2: location update rejected). 5 and above: failure (table in section 24) |
+| MOMSN | MO message sequence number, incremented by every session that sends: use it to deduplicate on the server |
+| MT status | 0: no MT message, 1: an MT message was received (read it with `AT+SBDRB`), 2: error checking the mailbox |
+| MTMSN, MT length | Sequence number and length of the received MT message |
+| MT queued | How many more MT messages wait at the gateway: start another session to get them |
+
+Binary messages use `AT+SBDWB=<length>`: the modem answers `READY`, then expects the bytes followed by a **2-byte checksum** (the least significant 16 bits of the sum of the bytes, most significant byte first), and answers `0` (ok), `1` (timeout), `2` (wrong checksum) or `3` (wrong size). `AT+SBDRB` returns a 2-byte length, the MT message and its checksum.
+
+### From a program
+
+A sender that writes one binary message, runs a session and retries with backoff (**Illustrative**):
+
+```python
+#!/usr/bin/env python3
+"""Send one binary message through an Iridium 9603-class SBD modem (illustrative)."""
+import re
+import sys
+import time
+
+import serial
+
+PORT = "/dev/ttymxc2"
+SBDIX = re.compile(rb"\+SBDIX:\s*(\d+),\s*(\d+),\s*(\d+),\s*(\d+),\s*(\d+),\s*(\d+)")
+
+
+def read_until(ser, tokens, timeout):
+    buf, end = b"", time.monotonic() + timeout
+    while time.monotonic() < end:
+        buf += ser.read(ser.in_waiting or 1)
+        if any(t in buf for t in tokens):
+            return buf
+    raise TimeoutError(buf)
+
+
+def at(ser, cmd, tokens=(b"OK\r\n", b"ERROR"), timeout=5):
+    ser.reset_input_buffer()
+    ser.write(cmd.encode() + b"\r")
+    return read_until(ser, tokens, timeout)
+
+
+def write_mo(ser, data):
+    if len(data) > 340:
+        raise ValueError("SBD MO messages are limited to 340 bytes")
+    if b"READY" not in at(ser, f"AT+SBDWB={len(data)}", (b"READY", b"ERROR")):
+        raise RuntimeError("modem not ready for binary data")
+    checksum = (sum(data) & 0xFFFF).to_bytes(2, "big")
+    ser.write(data + checksum)
+    reply = read_until(ser, (b"OK\r\n", b"ERROR"), 5)
+    if not reply.strip().startswith(b"0"):
+        raise RuntimeError(f"SBDWB failed: {reply!r}")
+
+
+def session(ser):
+    reply = at(ser, "AT+SBDIX", (b"OK\r\n", b"ERROR"), timeout=90)
+    m = SBDIX.search(reply)
+    if not m:
+        raise RuntimeError(f"no +SBDIX in {reply!r}")
+    return tuple(int(x) for x in m.groups())
+
+
+def main():
+    payload = bytes.fromhex(sys.argv[1])
+    with serial.Serial(PORT, 19200, timeout=0.2) as ser:
+        at(ser, "ATE0")
+        at(ser, "AT&K0")
+        write_mo(ser, payload)
+        delay = 20
+        for attempt in range(6):
+            mo, momsn, mt, mtmsn, mtlen, queued = session(ser)
+            if mo <= 4:
+                print(f"sent, MOMSN {momsn}, MT status {mt}, {queued} queued")
+                at(ser, "AT+SBDD0")
+                return
+            print(f"attempt {attempt}: MO status {mo}, retry in {delay} s")
+            time.sleep(delay)
+            delay = min(delay * 2, 300)
+        sys.exit("giving up, message kept in the MO buffer")
+
+
+if __name__ == "__main__":
+    main()
+```
+
+In a real service: keep the modem **off** between sessions to save power and switch it on a few seconds before sending; start a session only when the network-available pin is high (or `AT+CIER` reports service); keep the message in the application queue until a success status; read any MT message (`AT+SBDRB`) and start more sessions while `MT queued` is non-zero; and flush the modem's settings before power-off as its manual says.
+
+### Receiving on the server: DirectIP
+
+The Iridium gateway opens a TCP connection to your server and sends one MO message as a sequence of information elements: a 3-byte header (protocol revision 1, total length), then elements of `id (1 byte), length (2 bytes), value`. Element `0x01` is the MO header (CDR reference, IMEI, session status, MOMSN, MTMSN, session time), `0x02` the payload, `0x03` the device's approximate location. A minimal receiver (**Illustrative**; check the DirectIP guide of your provider):
+
+```python
+#!/usr/bin/env python3
+"""Minimal Iridium SBD DirectIP MO receiver (illustrative)."""
+import asyncio
+import datetime
+import struct
+
+
+def parse(body):
+    msg, i = {}, 0
+    while i < len(body):
+        iei, length = struct.unpack_from(">BH", body, i)
+        value = body[i + 3:i + 3 + length]
+        i += 3 + length
+        if iei == 0x01:
+            cdr, imei, status, momsn, mtmsn, t = struct.unpack(">I15sBHHI", value)
+            msg.update(imei=imei.decode(), status=status, momsn=momsn,
+                       time=datetime.datetime.fromtimestamp(t, datetime.timezone.utc))
+        elif iei == 0x02:
+            msg["payload"] = value
+    return msg
+
+
+async def handle(reader, writer):
+    try:
+        rev, length = struct.unpack(">BH", await reader.readexactly(3))
+        msg = parse(await reader.readexactly(length))
+        print(msg)                      # store it, deduplicate on (imei, momsn)
+    finally:
+        writer.close()
+
+
+async def main():
+    server = await asyncio.start_server(handle, "0.0.0.0", 10801)
+    async with server:
+        await server.serve_forever()
+
+
+asyncio.run(main())
+```
+
+Allow port 10801 only from the provider's published gateway addresses, and acknowledge nothing you haven't stored: the gateway retries failed deliveries.
+
+---
+
+## 18. An NB-IoT NTN module
+
+### What changes compared with a terrestrial module
+
+An NB-IoT NTN module is a cellular module (the [cellular note](../cellular/cellular_v1_2026-11-02.md) applies) with the NTN bands, the Rel-17 NTN features, and an integrated or attached GNSS receiver. On Linux it appears like any other module: USB serial AT ports through the `option` driver (`/dev/ttyUSB*`) or a UART, sometimes a network interface. Differences that matter for the host software:
+
+- **Configuration:** selecting terrestrial, NTN or both, the NTN bands, and the GNSS behavior are **vendor AT commands**. Standard 27.007 commands cover the rest.
+- **GNSS first:** the module needs a valid fix before it can access an NTN cell. Many modules can't run GNSS and the cellular radio together: the host (or the module firmware) sequences "fix, then connect".
+- **Slow everything:** registration over GEO takes tens of seconds, a small uplink seconds. Host timeouts tuned for terrestrial modems fire too early.
+- **Tiny data:** hundreds of bytes per report, a few reports per day on most plans. Use UDP/CoAP or non-IP data, not TCP and TLS (section 21).
+
+### ModemManager or not
+
+ModemManager drives many NB-IoT modules for IP data and reports registration and signal; it doesn't know the vendor NTN settings, and its probing and periodic queries cost energy and airtime on a module that should sleep. Two common choices: let ModemManager manage the module and send vendor commands through `mmcli --command` (ModemManager started with `--debug`), or tell it to ignore the module (udev property `ID_MM_DEVICE_IGNORE=1`) and drive the AT port from the application. For a battery or solar device sending a few messages a day, the second is simpler.
+
+### A session by hand
+
+Standard TS 27.007 commands, with the vendor steps marked (**Illustrative**):
+
+```
+# picocom -b 115200 --omap crlf --echo /dev/ttyUSB2
+ATI                                  model
+AT+CGMR                              firmware: NTN support depends on both
+AT+CFUN=0                            radio off while configuring
+AT+<vendor NTN RAT and band setting> select NTN (or terrestrial + NTN) and bands B255/B256
+AT+<vendor GNSS setting>             how and when the module gets its fix
+AT+CGDCONT=1,"Non-IP","ntn.example"  PDN type: "IP" for UDP/CoAP, "Non-IP" for NIDD
+AT+CEREG=5                           registration reports with reject causes and PSM timers
+AT+CPSMS=1,,,"00100110","00000101"   request PSM: periodic TAU 6 h, active time 10 s
+AT+CFUN=1
+OK
++CEREG: 2                            searching (GNSS fix, then cell search, then attach)
++CEREG: 5,"1A2B","0123ABCD",<AcT>,,,"00000101","00100110"
+AT+CSODCP=1,6,"0102A1B2C3D4",1       send 6 bytes of non-IP data, RAI 1: nothing more expected
+OK
+                                     the connection is released at once, then PSM after the active time
+```
+
+- `+CEREG` `<stat>`: 1 registered home, 5 registered roaming (NTN service is often a partner network), 2 searching, 3 denied (see the cause), 0 not searching. `<AcT>` reports the access technology: Rel-17 adds satellite values to TS 27.007, and some modules report vendor values; check the AT manual.
+- `AT+CPSMS` timers use the 3GPP timer encodings: for T3412 extended, the 3 high bits are the unit (`001` = 1 hour) and the 5 low bits the value (`00110` = 6); for T3324, `000` = 2 seconds and `00101` = 5, so 10 s. The network decides the values it grants: read them from `+CEREG`.
+- **Non-IP data** over the control plane (`AT+CSODCP` to send, `+CRTDCP` reports for received data) needs the operator to support NIDD or SCEF/NEF delivery to your server. With a PDN type `IP`, use the module's socket commands (vendor-specific) or a PPP or network interface.
+- **Release assistance** (RAI) tells the network that no more data follows, so the radio connection ends at once instead of waiting for an inactivity timer: it saves seconds of receiver current per message.
+
+### The host's state machine
+
+```mermaid
+stateDiagram-v2
+    [*] --> Sleep
+    Sleep --> Wake: report due or alarm
+    Wake --> Fix: position stale or moved
+    Wake --> Attach: position still valid
+    Fix --> Attach: 3D fix
+    Fix --> Backoff: no fix within budget
+    Attach --> Send: CEREG 1 or 5
+    Attach --> Backoff: denied or timeout
+    Send --> Sleep: sent, PSM
+    Send --> Backoff: error
+    Backoff --> Sleep: keep messages queued
+```
+
+Keep counters for each transition (fix time, attach time, failures by cause) and send them in the reports: they are the only view of the field link (section 24).
+

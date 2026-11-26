@@ -1617,7 +1617,7 @@ Topics for separate notes:
 - **Bluetooth on microcontrollers:** Zephyr's Bluetooth stack, NimBLE, nRF Connect SDK, ESP-IDF; writing the sensor's firmware; running such a chip as an HCI controller for Linux.
 - **Mesh in depth:** provisioning, models, `bluetooth-meshd`, mesh gateways.
 - **LE Audio in depth:** BAP configuration, Auracast broadcast sources and assistants, hearing aid profiles.
-- **Positioning:** AoA/AoD direction finding systems, Channel Sounding ranging.
+- **Positioning:** AoA/AoD direction finding systems, Channel Sounding ranging. UWB, which car keys and precision finding use together with BLE, is in [Ultra-Wideband (UWB) for Embedded Linux Engineers](../uwb/uwb_v1_2026-11-26.md).
 - **Matter and Thread:** Matter uses BLE only for commissioning; Thread is an 802.15.4 network ([wireless-protocols-and-connectivity/](../)).
 - **Bluetooth driver development:** writing an `hci_uart` protocol or a vendor setup routine ([linux-kernel-device-driver-development/](../../os-and-firmware/embedded-linux/linux-kernel-device-driver-development/)).
 - **RF design and measurements:** antenna design, matching, conducted and radiated tests ([hardware/rf/](../../hardware/rf/)).
